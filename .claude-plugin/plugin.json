@@ -1,0 +1,20 @@
+{
+  "name": "@cyanheads/met-museum-mcp-server",
+  "version": "0.1.0",
+  "description": "MCP server for The Metropolitan Museum of Art collection — 470K+ artworks with metadata, provenance, and open-access high-res images.",
+  "author": {
+    "name": "cyanheads"
+  },
+  "homepage": "https://github.com/cyanheads/met-museum-mcp-server#readme",
+  "repository": "https://github.com/cyanheads/met-museum-mcp-server",
+  "license": "Apache-2.0",
+  "mcpServers": {
+    "met-museum-mcp-server": {
+      "command": "npx",
+      "args": ["-y", "@cyanheads/met-museum-mcp-server"],
+      "env": {
+        "MCP_TRANSPORT_TYPE": "stdio"
+      }
+    }
+  }
+}
