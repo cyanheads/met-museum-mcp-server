@@ -50,7 +50,11 @@ const ObjectSchema = z
       .describe(
         'True when the object is released under CC0 open access. Only true objects return usable image URLs.',
       ),
-    hasImages: z.boolean().describe('True when primaryImage is non-empty.'),
+    hasCC0Image: z
+      .boolean()
+      .describe(
+        "True when a CC0 open-access image URL is available (primaryImage is non-empty). Distinct from met_search's hasImages filter, which matches objects that have any image including copyrighted works.",
+      ),
     primaryImage: z
       .string()
       .describe(
@@ -181,9 +185,15 @@ export const metGetObject = tool('met_get_object', {
   }),
   errors: [
     {
+      reason: 'all_not_found',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'Every requested objectID returned a 404 — all IDs are stale or invalid.',
+      recovery: 'Verify the IDs with met_search — they may be stale search-index entries.',
+    },
+    {
       reason: 'all_failed',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'Every requested objectID failed — network errors or API downtime.',
+      when: 'Every requested objectID failed due to network errors or API downtime.',
       recovery: 'Retry after a brief delay. If one ID fails repeatedly, verify it with met_search.',
     },
   ],
@@ -199,7 +209,7 @@ export const metGetObject = tool('met_get_object', {
       objectID: number;
       record: NonNullable<Awaited<ReturnType<typeof service.getObject>>>;
     };
-    type FailItem = { ok: false; objectID: number; error: string };
+    type FailItem = { ok: false; objectID: number; error: string; kind: 'not_found' | 'error' };
     const results: Array<SuccessItem | FailItem> = [];
 
     const queue = [...input.objectIDs];
@@ -214,6 +224,7 @@ export const metGetObject = tool('met_get_object', {
             results.push({
               ok: false,
               objectID,
+              kind: 'not_found',
               error: `Object ${objectID} not found in the Met collection. Verify the ID with met_search.`,
             });
           } else {
@@ -223,6 +234,7 @@ export const metGetObject = tool('met_get_object', {
           results.push({
             ok: false,
             objectID,
+            kind: 'error',
             error: `Failed to fetch object ${objectID}: ${err instanceof Error ? err.message : String(err)}. Retry after a brief delay.`,
           });
         }
@@ -236,11 +248,18 @@ export const metGetObject = tool('met_get_object', {
     await Promise.all(workers);
 
     const objects = results.filter((r): r is SuccessItem => r.ok).map((r) => r.record);
-    const failed = results
-      .filter((r): r is FailItem => !r.ok)
-      .map((r) => ({ objectID: r.objectID, error: r.error }));
+    const failItems = results.filter((r): r is FailItem => !r.ok);
+    const failed = failItems.map((r) => ({ objectID: r.objectID, error: r.error }));
 
     if (objects.length === 0) {
+      const allNotFound = failItems.every((f) => f.kind === 'not_found');
+      if (allNotFound) {
+        throw ctx.fail(
+          'all_not_found',
+          `All ${input.objectIDs.length} requested object ${input.objectIDs.length === 1 ? 'ID' : 'IDs'} not found.`,
+          ctx.recoveryFor('all_not_found'),
+        );
+      }
       throw ctx.fail(
         'all_failed',
         `All ${input.objectIDs.length} object fetches failed.`,
@@ -258,7 +277,7 @@ export const metGetObject = tool('met_get_object', {
     for (const obj of result.objects) {
       lines.push(`## ${obj.title || '(Untitled)'} — Object ${obj.objectID}`);
       lines.push(
-        `**isPublicDomain:** ${obj.isPublicDomain ? 'Yes (CC0)' : 'No'} | **hasImages:** ${obj.hasImages ? 'Yes' : 'No'} | **isHighlight:** ${obj.isHighlight ? 'Yes' : 'No'} | **isTimelineWork:** ${obj.isTimelineWork ? 'Yes' : 'No'}`,
+        `**isPublicDomain:** ${obj.isPublicDomain ? 'Yes (CC0)' : 'No'} | **hasCC0Image:** ${obj.hasCC0Image ? 'Yes' : 'No'} | **isHighlight:** ${obj.isHighlight ? 'Yes' : 'No'} | **isTimelineWork:** ${obj.isTimelineWork ? 'Yes' : 'No'}`,
       );
       if (obj.artistDisplayName) {
         lines.push(

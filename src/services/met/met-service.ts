@@ -59,7 +59,7 @@ export interface ObjectRecord {
   dimensions: string;
   dynasty: string;
   GalleryNumber: string;
-  hasImages: boolean;
+  hasCC0Image: boolean;
   isHighlight: boolean;
   isPublicDomain: boolean;
   isTimelineWork: boolean;
@@ -234,7 +234,6 @@ export class MetService {
       objectID: raw.objectID,
       title: raw.title ?? '',
       isPublicDomain: raw.isPublicDomain ?? false,
-      hasImages: Boolean(raw.primaryImage),
       primaryImage: raw.primaryImage ?? '',
       primaryImageSmall: raw.primaryImageSmall ?? '',
       additionalImages: raw.additionalImages ?? [],
@@ -242,6 +241,7 @@ export class MetService {
       department: raw.department ?? '',
       objectName: raw.objectName ?? '',
       classification: raw.classification ?? '',
+      hasCC0Image: Boolean(raw.primaryImage),
       isHighlight: raw.isHighlight ?? false,
       isTimelineWork: raw.isTimelineWork ?? false,
       artistDisplayName: raw.artistDisplayName ?? '',

@@ -24,7 +24,7 @@ const sampleRecord = {
   objectID: 437980,
   title: 'Wheat Field with Cypresses',
   isPublicDomain: true,
-  hasImages: true,
+  hasCC0Image: true,
   primaryImage: 'https://example.com/full.jpg',
   primaryImageSmall: 'https://example.com/small.jpg',
   additionalImages: ['https://example.com/alt.jpg'],
@@ -99,11 +99,35 @@ describe('metGetObject', () => {
     expect(result.failed[0].objectID).toBe(999999);
   });
 
-  it('throws all_failed when every fetch fails', async () => {
+  it('throws all_not_found when every fetch returns 404', async () => {
     mockGetObject.mockResolvedValue(null);
 
     const ctx = createMockContext({ errors: metGetObject.errors });
     const input = metGetObject.input.parse({ objectIDs: [999999] });
+    await expect(metGetObject.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'all_not_found' },
+    });
+  });
+
+  it('throws all_failed when every fetch throws a network error', async () => {
+    mockGetObject.mockRejectedValue(new Error('network error'));
+
+    const ctx = createMockContext({ errors: metGetObject.errors });
+    const input = metGetObject.input.parse({ objectIDs: [999999] });
+    await expect(metGetObject.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      data: { reason: 'all_failed' },
+    });
+  });
+
+  it('throws all_failed when failures are a mix of 404 and network errors', async () => {
+    mockGetObject
+      .mockResolvedValueOnce(null) // first ID is 404
+      .mockRejectedValue(new Error('network error')); // second ID throws
+
+    const ctx = createMockContext({ errors: metGetObject.errors });
+    const input = metGetObject.input.parse({ objectIDs: [888888, 999999] });
     await expect(metGetObject.handler(input, ctx)).rejects.toMatchObject({
       code: JsonRpcErrorCode.ServiceUnavailable,
       data: { reason: 'all_failed' },
@@ -129,6 +153,7 @@ describe('metGetObject', () => {
     const text = blocks[0].text as string;
     expect(text).toContain('Wheat Field with Cypresses');
     expect(text).toContain('isPublicDomain');
+    expect(text).toContain('hasCC0Image');
     expect(text).toContain('constituentID');
     expect(text).toContain('437980');
     expect(text).toContain('Vincent van Gogh');

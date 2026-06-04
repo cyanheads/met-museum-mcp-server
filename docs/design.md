@@ -300,7 +300,7 @@ errors: [
 - Use `Promise.allSettled` over all IDs (not `Promise.all`) so one 404 doesn't fail the batch.
 - Apply a concurrency pool (default 5, configurable via `MET_BATCH_CONCURRENCY`) to avoid hammering the API.
 - A 404 from the API returns `{"message":"ObjectID not found"}` with HTTP 404 — classify as a per-item failure in `failed[]`, not a tool-level throw.
-- Non-public-domain objects (`isPublicDomain: false`) return empty strings for `primaryImage`, `primaryImageSmall`, and `additionalImages` — normalize and derive `hasImages: primaryImage !== ''`.
+- Non-public-domain objects (`isPublicDomain: false`) return empty strings for `primaryImage`, `primaryImageSmall`, and `additionalImages` — normalize and derive `hasCC0Image: Boolean(primaryImage)`.
 - `constituents` and `tags` are `null` on the wire for anonymous/untagged objects — pass through as nullable; don't coerce to `[]`.
 - The full object record has many geography fields (`city`, `state`, `county`, `locus`, `excavation`, `river`, etc.) that are almost universally empty. These are excluded from the output schema — the meaningful geographic fields (`country`, `region`) are retained. This keeps the output focused.
 - `GalleryNumber` is `""` (not null) when off display — preserve as-is; an empty string is meaningful ("not on display").
