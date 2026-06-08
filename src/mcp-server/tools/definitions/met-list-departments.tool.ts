@@ -10,7 +10,7 @@ export const metListDepartments = tool('met_list_departments', {
   title: 'List Met Departments',
   description:
     'Return the 19 curatorial departments at The Metropolitan Museum of Art with their numeric IDs and display names. ' +
-    'Use before calling met_search to discover valid departmentId values. ' +
+    'Use before calling met_search_collections to discover valid departmentId values. ' +
     'The department list is fetched live on each call to remain accurate if the Met reorganizes.',
   annotations: { readOnlyHint: true, idempotentHint: true },
   input: z.object({}),
@@ -22,7 +22,9 @@ export const metListDepartments = tool('met_list_departments', {
             departmentId: z
               .number()
               .int()
-              .describe('Numeric department ID for use in the met_search departmentId parameter.'),
+              .describe(
+                'Numeric department ID for use in the met_search_collections departmentId parameter.',
+              ),
             displayName: z
               .string()
               .describe(

@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.0](changelog/0.2.x/0.2.0.md) — 2026-06-08 · ⚠️ Breaking
+
+BREAKING: met_search renamed to met_search_collections; adds isOnView filter to restrict results to works currently on display
+
 ## [0.1.3](changelog/0.1.x/0.1.3.md) — 2026-06-04 · ⚠️ Breaking
 
 BREAKING: met_get_object renames hasImages → hasCC0Image; adds all_not_found error distinguishing 404s from network failures

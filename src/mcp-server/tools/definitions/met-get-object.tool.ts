@@ -53,7 +53,7 @@ const ObjectSchema = z
     hasCC0Image: z
       .boolean()
       .describe(
-        "True when a CC0 open-access image URL is available (primaryImage is non-empty). Distinct from met_search's hasImages filter, which matches objects that have any image including copyrighted works.",
+        "True when a CC0 open-access image URL is available (primaryImage is non-empty). Distinct from met_search_collections's hasImages filter, which matches objects that have any image including copyrighted works.",
       ),
     primaryImage: z
       .string()
@@ -157,16 +157,16 @@ export const metGetObject = tool('met_get_object', {
   title: 'Get Met Objects',
   description:
     'Fetch full records for one or more Met Museum object IDs. Accepts up to 20 IDs per call, fetches in parallel (concurrency-limited), and returns partial-success — a single 404 does not fail the whole batch. ' +
-    'Object IDs come from met_search. Non-public-domain objects return empty image URLs. ' +
+    'Object IDs come from met_search_collections. Non-public-domain objects return empty image URLs. ' +
     'The constituents array is null for anonymous or unattributed works; tags is null for untagged objects.',
   annotations: { readOnlyHint: true, idempotentHint: true },
   input: z.object({
     objectIDs: z
-      .array(z.number().int().positive().describe('A Met object ID from met_search.'))
+      .array(z.number().int().positive().describe('A Met object ID from met_search_collections.'))
       .min(1)
       .max(20)
       .describe(
-        'One or more Met object IDs to fetch. Maximum 20 per call. IDs come from met_search. ' +
+        'One or more Met object IDs to fetch. Maximum 20 per call. IDs come from met_search_collections. ' +
           'Fetches run in parallel (concurrency-limited); partial failures are reported per ID rather than failing the whole batch.',
       ),
   }),
@@ -188,13 +188,15 @@ export const metGetObject = tool('met_get_object', {
       reason: 'all_not_found',
       code: JsonRpcErrorCode.NotFound,
       when: 'Every requested objectID returned a 404 — all IDs are stale or invalid.',
-      recovery: 'Verify the IDs with met_search — they may be stale search-index entries.',
+      recovery:
+        'Verify the IDs with met_search_collections — they may be stale search-index entries.',
     },
     {
       reason: 'all_failed',
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'Every requested objectID failed due to network errors or API downtime.',
-      recovery: 'Retry after a brief delay. If one ID fails repeatedly, verify it with met_search.',
+      recovery:
+        'Retry after a brief delay. If one ID fails repeatedly, verify it with met_search_collections.',
     },
   ],
 
@@ -225,7 +227,7 @@ export const metGetObject = tool('met_get_object', {
               ok: false,
               objectID,
               kind: 'not_found',
-              error: `Object ${objectID} not found in the Met collection. Verify the ID with met_search.`,
+              error: `Object ${objectID} not found in the Met collection. Verify the ID with met_search_collections.`,
             });
           } else {
             results.push({ ok: true, objectID, record });

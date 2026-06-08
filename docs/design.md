@@ -6,7 +6,7 @@
 
 | Name | Description | Key Inputs | Annotations |
 |:-----|:------------|:-----------|:------------|
-| `met_search` | Search the Met collection by keyword and filters; returns total count and matched object IDs | `q`, `hasImages`, `isPublicDomain`, `isHighlight`, `medium`, `departmentId`, `geoLocation`, `dateBegin`, `dateEnd`, `limit` | `readOnlyHint: true` |
+| `met_search_collections` | Search the Met collection by keyword and filters; returns total count and matched object IDs | `q`, `hasImages`, `isPublicDomain`, `isHighlight`, `isOnView`, `medium`, `departmentId`, `geoLocation`, `dateBegin`, `dateEnd`, `limit` | `readOnlyHint: true` |
 | `met_get_object` | Fetch full records for one or more object IDs (batch, concurrency-limited, partial-success) | `objectIDs` (array, max 20) | `readOnlyHint: true`, `idempotentHint: true` |
 | `met_list_departments` | Return the 19 curatorial departments with their IDs and display names | — | `readOnlyHint: true`, `idempotentHint: true` |
 
@@ -65,7 +65,7 @@ No API keys. The server needs no auth env vars for normal operation.
 1. Config (`src/config/server-config.ts`) — three optional env vars with defaults
 2. `MetService` (`src/services/met/met-service.ts`) — `search()`, `getObject()`, `getDepartments()` methods with retry, timeout, concurrency pooling
 3. `met_list_departments` — trivial; validates the service layer works end-to-end
-4. `met_search` — exercises the search endpoint and output shaping
+4. `met_search_collections` — exercises the search endpoint and output shaping
 5. `met_get_object` — batch path, partial-success output, concurrency gate
 6. Tests (`tests/`)
 
@@ -73,7 +73,7 @@ No API keys. The server needs no auth env vars for normal operation.
 
 ## Tool Specifications
 
-### `met_search`
+### `met_search_collections`
 
 **Purpose:** Search the Met collection and return matching object IDs. Always chain to `met_get_object` to get full records.
 
@@ -164,7 +164,7 @@ errors: [
 
 ### `met_get_object`
 
-**Purpose:** Fetch full records for one or more object IDs. Batch-fetches up to 20 at a time with concurrency limiting and partial-success — the intended follow-on to `met_search`.
+**Purpose:** Fetch full records for one or more object IDs. Batch-fetches up to 20 at a time with concurrency limiting and partial-success — the intended follow-on to `met_search_collections`.
 
 **Upstream endpoint:** `GET /objects/{id}` (per ID)
 
@@ -173,7 +173,7 @@ errors: [
 ```ts
 z.object({
   objectIDs: z.array(z.number().int().positive()).min(1).max(20)
-    .describe('One or more Met object IDs to fetch. Maximum 20 per call. IDs come from met_search. Fetches run in parallel (concurrency-limited); partial failures are reported per ID rather than failing the whole batch.'),
+    .describe('One or more Met object IDs to fetch. Maximum 20 per call. IDs come from met_search_collections. Fetches run in parallel (concurrency-limited); partial failures are reported per ID rather than failing the whole batch.'),
 })
 ```
 
@@ -289,7 +289,7 @@ errors: [
     reason: 'all_failed',
     code: JsonRpcErrorCode.ServiceUnavailable,
     when: 'Every requested objectID failed (network errors, API downtime)',
-    recovery: 'Retry after a brief delay. If one ID fails repeatedly, verify it with met_search.',
+    recovery: 'Retry after a brief delay. If one ID fails repeatedly, verify it with met_search_collections.',
   },
 ]
 ```
@@ -309,7 +309,7 @@ errors: [
 
 ### `met_list_departments`
 
-**Purpose:** Return the 19 curatorial departments with their numeric IDs and display names. Use to discover valid `departmentId` values before calling `met_search`.
+**Purpose:** Return the 19 curatorial departments with their numeric IDs and display names. Use to discover valid `departmentId` values before calling `met_search_collections`.
 
 **Upstream endpoint:** `GET /departments`
 
@@ -321,7 +321,7 @@ errors: [
 z.object({
   departments: z.array(z.object({
     departmentId: z.number().int()
-      .describe('Numeric department ID for use in met_search departmentId parameter.'),
+      .describe('Numeric department ID for use in met_search_collections departmentId parameter.'),
     displayName: z.string()
       .describe('Human-readable department name (e.g., "European Paintings", "Egyptian Art", "Arms and Armor").'),
   })).describe('All 19 curatorial departments at The Metropolitan Museum of Art.'),
@@ -366,7 +366,7 @@ Note: ID 20 does not exist — the sequence is not contiguous.
 
 | Noun | Operations | API Endpoint | Tool |
 |:-----|:-----------|:-------------|:-----|
-| Object | search by keyword + filters | `GET /search` | `met_search` |
+| Object | search by keyword + filters | `GET /search` | `met_search_collections` |
 | Object | fetch by ID (single or batch) | `GET /objects/{id}` | `met_get_object` |
 | Department | list all | `GET /departments` | `met_list_departments` |
 | Object corpus | enumerate all IDs | `GET /objects` | — (excluded; see Decisions Log) |
@@ -375,7 +375,7 @@ Note: ID 20 does not exist — the sequence is not contiguous.
 
 ## Workflow Analysis
 
-**Common chain:** `met_list_departments` (once, to get ID) → `met_search` (get IDs) → `met_get_object` (get records)
+**Common chain:** `met_list_departments` (once, to get ID) → `met_search_collections` (get IDs) → `met_get_object` (get records)
 
 The object fetch is the only multi-upstream-call tool. For a batch of N IDs:
 
@@ -391,11 +391,11 @@ The object fetch is the only multi-upstream-call tool. For a batch of N IDs:
 
 ### 1. Exclude `artistOrCulture` search filter
 
-The Met API documents `artistOrCulture=true` as a flag that restricts keyword matching to artist name and culture fields. Live probing (2026-06-01) showed it returns `{ total: 0, objectIDs: null }` for every tested query — including `Rembrandt`, `Japanese`, `Dutch`, `Egyptian` — regardless of whether those terms clearly match artist or culture records. The baseline `q` query without the flag does return results for the same terms. Conclusion: the parameter is either broken or requires an undocumented query syntax. Excluded from the tool surface to prevent agents from hitting a dead end. If the Met fixes it in a future API version, adding it to `met_search` input is a non-breaking addition.
+The Met API documents `artistOrCulture=true` as a flag that restricts keyword matching to artist name and culture fields. Live probing (2026-06-01) showed it returns `{ total: 0, objectIDs: null }` for every tested query — including `Rembrandt`, `Japanese`, `Dutch`, `Egyptian` — regardless of whether those terms clearly match artist or culture records. The baseline `q` query without the flag does return results for the same terms. Conclusion: the parameter is either broken or requires an undocumented query syntax. Excluded from the tool surface to prevent agents from hitting a dead end. If the Met fixes it in a future API version, adding it to `met_search_collections` input is a non-breaking addition. Re-confirmed returning zero results for all tested queries on 2026-06-08.
 
 ### 2. Expose `medium` as a classification filter, not a materials filter
 
-The Met API documents `medium` as a search filter parameter. Live probing showed that passing actual material descriptions ("Oil on canvas", "Watercolor") returns 0 results, but passing classification category names ("Paintings", "Drawings", "Prints", "Ceramics", "Sculpture", "Photographs", "Textiles") returns results correctly. The `medium` parameter maps to the `classification` field on the object, not the `medium` (materials/technique) text field — a naming mismatch in the API. The filter is included in `met_search` with documentation that explains classification values are required.
+The Met API documents `medium` as a search filter parameter. Live probing showed that passing actual material descriptions ("Oil on canvas", "Watercolor") returns 0 results, but passing classification category names ("Paintings", "Drawings", "Prints", "Ceramics", "Sculpture", "Photographs", "Textiles") returns results correctly. The `medium` parameter maps to the `classification` field on the object, not the `medium` (materials/technique) text field — a naming mismatch in the API. The filter is included in `met_search_collections` with documentation that explains classification values are required.
 
 ### 3. `isPublicDomain + departmentId` interaction
 
@@ -403,7 +403,7 @@ These two filters can be combined, but the combination returns far fewer results
 
 ### 4. Exclude `title` search filter
 
-The Met API documents `title=true` as a flag that restricts keyword matching to the title field. Live probing showed it returns `{ total: 0, objectIDs: null }` for every tested query including "Portrait", "Self-Portrait", "Madonna", "Vase" — queries that clearly return results without the flag. Same behavior as `artistOrCulture`. Excluded from the tool surface until confirmed functional.
+The Met API documents `title=true` as a flag that restricts keyword matching to the title field. Live probing showed it returns `{ total: 0, objectIDs: null }` for every tested query including "Portrait", "Self-Portrait", "Madonna", "Vase" — queries that clearly return results without the flag. Same behavior as `artistOrCulture`. Excluded from the tool surface until confirmed functional. Re-confirmed broken on 2026-06-08.
 
 ### 5. Batch input on `met_get_object` (max 20)
 
@@ -411,7 +411,7 @@ The API has no batch endpoint — each object ID requires its own HTTP GET. The 
 
 ### 6. Exclude `/objects` (full corpus enumeration) from the tool surface
 
-The endpoint returns all 501,731 object IDs. There is no practical agent workflow that needs to enumerate the full collection — it's too large to consume and produces no useful output on its own. Search + department filtering covers all real use cases. The `/objects?departmentIds=&metadataDate=` variant (filtering by department and update date) is marginally useful but also excluded — an agent wanting "all Egyptian Art objects" should use `met_search` with `departmentId=10`.
+The endpoint returns all 501,731 object IDs. There is no practical agent workflow that needs to enumerate the full collection — it's too large to consume and produces no useful output on its own. Search + department filtering covers all real use cases. The `/objects?departmentIds=&metadataDate=` variant (filtering by department and update date) is marginally useful but also excluded — an agent wanting "all Egyptian Art objects" should use `met_search_collections` with `departmentId=10`.
 
 ### 7. Exclude sparse geography fields from `met_get_object` output
 

@@ -1,7 +1,7 @@
 # Developer Protocol
 
 **Server:** met-museum-mcp-server
-**Version:** 0.1.3
+**Version:** 0.2.0
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.9.19`
 **Engines:** Bun ≥1.3.0, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/sdk` ^1.29.0
@@ -30,7 +30,7 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { getMetService } from '@/services/met/met-service.js';
 
-export const metSearch = tool('met_search', {
+export const metSearchCollections = tool('met_search_collections', {
   description: 'Search the Metropolitan Museum of Art collection by keyword and optional filters.',
   annotations: { readOnlyHint: true, idempotentHint: true },
   input: z.object({
@@ -168,7 +168,7 @@ src/
   mcp-server/
     tools/definitions/
       met-list-departments.tool.ts      # met_list_departments
-      met-search.tool.ts                # met_search
+      met-search-collections.tool.ts    # met_search_collections
       met-get-object.tool.ts            # met_get_object
 ```
 

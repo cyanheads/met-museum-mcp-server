@@ -1,20 +1,21 @@
 /**
- * @fileoverview Tool: met_search — search the Met collection by keyword and filters.
- * @module mcp-server/tools/definitions/met-search
+ * @fileoverview Tool: met_search_collections — search the Met collection by keyword and filters.
+ * @module mcp-server/tools/definitions/met-search-collections
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getMetService } from '@/services/met/met-service.js';
 
-export const metSearch = tool('met_search', {
+export const metSearchCollections = tool('met_search_collections', {
   title: 'Search Met Collection',
   description:
     'Search the Metropolitan Museum of Art collection by keyword and optional filters; returns total match count and a page of object IDs. ' +
     'Always chain the returned IDs to met_get_object (up to 20 at a time) to retrieve full records. ' +
     'Search relevance is keyword-based, not semantic — use concise terms and apply departmentId or geoLocation filters to sharpen results. ' +
     'The medium parameter maps to the classification field (pass "Paintings", "Drawings", etc., not material descriptions like "Oil on canvas"). ' +
-    'isPublicDomain guarantees CC0-licensed images; hasImages also includes copyrighted works.',
+    'isPublicDomain guarantees CC0-licensed images; hasImages also includes copyrighted works. ' +
+    'isOnView restricts results to works currently on display in a Met gallery.',
   annotations: { readOnlyHint: true, idempotentHint: true },
   input: z.object({
     q: z
@@ -47,6 +48,14 @@ export const metSearch = tool('met_search', {
       .describe(
         'When true, restricts to objects the Met has designated as highlights — major works central to the collection. ' +
           'Use to surface iconic pieces rather than browsing the full corpus.',
+      ),
+    isOnView: z
+      .boolean()
+      .optional()
+      .describe(
+        'When true, restricts results to objects currently on display in a Met gallery. ' +
+          'The GalleryNumber field on the met_get_object record identifies the specific gallery. ' +
+          'Combine with a keyword to answer "what is on display right now?" — pairs well with isHighlight for must-see works.',
       ),
     medium: z
       .string()
@@ -178,6 +187,7 @@ export const metSearch = tool('met_search', {
         hasImages: input.hasImages,
         isPublicDomain: input.isPublicDomain,
         isHighlight: input.isHighlight,
+        isOnView: input.isOnView,
         medium: input.medium,
         departmentId: input.departmentId,
         geoLocation: input.geoLocation,

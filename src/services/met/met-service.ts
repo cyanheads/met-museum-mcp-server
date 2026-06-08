@@ -18,6 +18,7 @@ export interface SearchInput {
   geoLocation?: string[] | undefined;
   hasImages?: boolean | undefined;
   isHighlight?: boolean | undefined;
+  isOnView?: boolean | undefined;
   isPublicDomain?: boolean | undefined;
   limit: number;
   medium?: string | undefined;
@@ -216,6 +217,7 @@ export class MetService {
     if (input.isPublicDomain != null)
       url.searchParams.set('isPublicDomain', String(input.isPublicDomain));
     if (input.isHighlight != null) url.searchParams.set('isHighlight', String(input.isHighlight));
+    if (input.isOnView != null) url.searchParams.set('isOnView', String(input.isOnView));
     if (input.medium) url.searchParams.set('medium', input.medium);
     if (input.departmentId != null)
       url.searchParams.set('departmentId', String(input.departmentId));

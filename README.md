@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.1.3-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/met-museum-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/met-museum-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/met-museum-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^5.9.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.2.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/met-museum-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/met-museum-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/met-museum-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^5.9.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -34,7 +34,7 @@ Three tools for browsing and fetching Metropolitan Museum of Art collection data
 | Tool | Description |
 |:---|:---|
 | `met_list_departments` | Return all 19 curatorial departments with their numeric IDs and display names |
-| `met_search` | Search the collection by keyword with filters for department, date range, medium, geography, public-domain status, and highlight designation |
+| `met_search_collections` | Search the collection by keyword with filters for department, date range, medium, geography, on-view status, public-domain status, and highlight designation |
 | `met_get_object` | Fetch full records for one or more object IDs — metadata, provenance, artist info, CC0 image URLs, tags, and Wikidata links |
 
 ### `met_list_departments`
@@ -42,11 +42,11 @@ Three tools for browsing and fetching Metropolitan Museum of Art collection data
 Return the 19 curatorial departments at The Metropolitan Museum of Art with their numeric IDs and display names.
 
 - Live fetch — remains accurate if the Met reorganizes
-- Use before `met_search` to discover valid `departmentId` values
+- Use before `met_search_collections` to discover valid `departmentId` values
 
 ---
 
-### `met_search`
+### `met_search_collections`
 
 Search the Met collection by keyword and optional filters.
 
@@ -58,6 +58,7 @@ Search the Met collection by keyword and optional filters.
 - `isPublicDomain=true` restricts to CC0 open-access objects (guaranteed usable image URLs)
 - `hasImages=true` includes any object with images (includes copyrighted works without reusable URLs)
 - `isHighlight=true` restricts to collection highlights designated by the Met
+- `isOnView=true` restricts to objects currently on display in a Met gallery
 - Returns total match count, truncation indicator, and up to `limit` object IDs (default 20, max 500)
 - Chain returned IDs to `met_get_object` in batches of up to 20
 
@@ -99,7 +100,7 @@ Agent-friendly output:
 
 - Provenance on every record — `isPublicDomain` and `hasCC0Image` flags distinguish CC0 objects from works with inaccessible images, so agents can reason about what they can actually display
 - Partial failure reporting — `met_get_object` returns `objects` and `failed` arrays so callers receive successful records alongside structured per-ID error context
-- Truncation signaling — `met_search` returns `total`, `returned`, and `truncated` fields so agents know when to refine filters or increase `limit`
+- Truncation signaling — `met_search_collections` returns `total`, `returned`, and `truncated` fields so agents know when to refine filters or increase `limit`
 
 ## Getting started
 
@@ -270,7 +271,7 @@ The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `
 |:---|:---|
 | `src/index.ts` | `createApp()` entry point — registers tools and inits the Met service. |
 | `src/config` | Server-specific environment variable parsing and validation with Zod. |
-| `src/mcp-server/tools` | Tool definitions (`*.tool.ts`) — `met_list_departments`, `met_search`, `met_get_object`. |
+| `src/mcp-server/tools` | Tool definitions (`*.tool.ts`) — `met_list_departments`, `met_search_collections`, `met_get_object`. |
 | `src/services/met` | Met Collection API client — HTTP, request timeout, response normalization. |
 | `tests/` | Unit and integration tests mirroring `src/`. |
 
