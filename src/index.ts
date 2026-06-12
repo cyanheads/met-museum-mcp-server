@@ -11,6 +11,8 @@ import { metSearchCollections } from './mcp-server/tools/definitions/met-search-
 import { initMetService } from './services/met/met-service.js';
 
 await createApp({
+  name: 'met-museum-mcp-server',
+  title: 'met-museum-mcp-server',
   tools: [metListDepartments, metSearchCollections, metGetObject],
   resources: [],
   prompts: [],
