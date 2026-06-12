@@ -149,7 +149,7 @@ export const metSearchCollections = tool('met_search_collections', {
     },
     {
       reason: 'invalid_date_range',
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       when: 'dateBegin or dateEnd is provided without the other, or dateBegin > dateEnd.',
       recovery: 'Provide both dateBegin and dateEnd as integer years, with dateBegin ≤ dateEnd.',
     },

@@ -58,7 +58,7 @@ describe('metSearchCollections', () => {
     const ctx = createMockContext({ errors: metSearchCollections.errors });
     const input = metSearchCollections.input.parse({ q: 'test', limit: 20, dateBegin: 1800 });
     await expect(metSearchCollections.handler(input, ctx)).rejects.toMatchObject({
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       data: { reason: 'invalid_date_range' },
     });
   });
@@ -72,7 +72,7 @@ describe('metSearchCollections', () => {
       dateEnd: 1800,
     });
     await expect(metSearchCollections.handler(input, ctx)).rejects.toMatchObject({
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       data: { reason: 'invalid_date_range' },
     });
   });
