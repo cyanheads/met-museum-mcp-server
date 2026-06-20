@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.2](changelog/0.2.x/0.2.2.md) — 2026-06-20
+
+Maintenance: adopt @cyanheads/mcp-ts-core ^0.10.9 — re-sync vendored devcheck scripts and skills, enable plugin-manifest packaging checks
+
 ## [0.2.1](changelog/0.2.x/0.2.1.md) — 2026-06-12
 
 Maintenance: adopt @cyanheads/mcp-ts-core ^0.10.6, reclassify invalid_date_range as ValidationError, add Docker HEALTHCHECK and .mcpb cleanup
