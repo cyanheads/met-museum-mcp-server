@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: met-museum-mcp-server
+abstract: "MCP server for The Metropolitan Museum of Art collection — 500K+ artworks with metadata, provenance, and open-access high-res images."
+type: software
+authors:
+  - family-names: Hand
+    given-names: Casey
+    orcid: "https://orcid.org/0009-0009-3726-568X"
+repository-code: "https://github.com/cyanheads/met-museum-mcp-server"
+license: Apache-2.0
+keywords:
+  - mcp
+  - model-context-protocol
+  - metropolitan-museum
+  - art
+  - museum
+  - collection
