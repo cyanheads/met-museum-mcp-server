@@ -66,6 +66,25 @@ const sampleRecord = {
   GalleryNumber: '825',
 };
 
+/**
+ * Configure the service mock so fetches COMPLETE in the reverse of input order —
+ * the first input ID resolves last. This is the adversarial timing that a
+ * completion-ordered handler reorders; a synchronous mock resolves in input order
+ * and would pass even the buggy code, making the regression test vacuous. IDs in
+ * `notFound` resolve to null (a 404), landing them in failed[].
+ */
+function mockCompletionInReverseOrder(ids: number[], notFound = new Set<number>()): void {
+  mockGetObject.mockImplementation((objectID: number) => {
+    const delayMs = (ids.length - ids.indexOf(objectID)) * 5;
+    return new Promise((resolve) => {
+      setTimeout(
+        () => resolve(notFound.has(objectID) ? null : { ...sampleRecord, objectID }),
+        delayMs,
+      );
+    });
+  });
+}
+
 describe('metGetObject', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -143,6 +162,34 @@ describe('metGetObject', () => {
     expect(result.objects).toHaveLength(1);
     expect(result.failed).toHaveLength(1);
     expect(result.failed[0].objectID).toBe(999999);
+  });
+
+  it('returns objects[] in input order when fetches complete out of order', async () => {
+    // Non-monotonic IDs so the assertion locks to INPUT order, not a numeric sort.
+    const ids = [104, 100, 106, 102];
+    mockCompletionInReverseOrder(ids);
+
+    const ctx = createMockContext();
+    const input = metGetObject.input.parse({ objectIDs: ids });
+    const result = await metGetObject.handler(input, ctx);
+
+    // Completion order was [102, 106, 100, 104]; output must still mirror the input.
+    expect(result.objects.map((o) => o.objectID)).toEqual(ids);
+    expect(result.failed).toHaveLength(0);
+  });
+
+  it('keeps objects[] and failed[] in input order for an interleaved partial batch', async () => {
+    // 201 and 202 are interleaved 404s; the surviving successes and the failures must
+    // each preserve input order independently.
+    const ids = [100, 201, 102, 202, 104];
+    mockCompletionInReverseOrder(ids, new Set([201, 202]));
+
+    const ctx = createMockContext();
+    const input = metGetObject.input.parse({ objectIDs: ids });
+    const result = await metGetObject.handler(input, ctx);
+
+    expect(result.objects.map((o) => o.objectID)).toEqual([100, 102, 104]);
+    expect(result.failed.map((f) => f.objectID)).toEqual([201, 202]);
   });
 
   it('format renders key fields including boolean field names', () => {

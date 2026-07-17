@@ -212,38 +212,42 @@ export const metGetObject = tool('met_get_object', {
       record: NonNullable<Awaited<ReturnType<typeof service.getObject>>>;
     };
     type FailItem = { ok: false; objectID: number; error: string; kind: 'not_found' | 'error' };
-    const results: Array<SuccessItem | FailItem> = [];
-
-    const queue = [...input.objectIDs];
+    // Index-addressed, not push-ordered: each result is written at its input position so
+    // objects[] and failed[] follow the caller's objectIDs order regardless of the order
+    // fetches complete in under concurrency. A shared cursor claims positions; `nextIndex++`
+    // is atomic between awaits, so each index is taken by exactly one worker.
+    const results = new Array<SuccessItem | FailItem>(input.objectIDs.length);
+    let nextIndex = 0;
 
     const processNext = async (): Promise<void> => {
-      while (queue.length > 0) {
-        const objectID = queue.shift();
+      while (nextIndex < input.objectIDs.length) {
+        const index = nextIndex++;
+        const objectID = input.objectIDs[index];
         if (objectID == null) break;
         try {
           const record = await service.getObject(objectID, ctx);
           if (record == null) {
-            results.push({
+            results[index] = {
               ok: false,
               objectID,
               kind: 'not_found',
               error: `Object ${objectID} not found in the Met collection. Verify the ID with met_search_collections.`,
-            });
+            };
           } else {
-            results.push({ ok: true, objectID, record });
+            results[index] = { ok: true, objectID, record };
           }
         } catch (err) {
-          results.push({
+          results[index] = {
             ok: false,
             objectID,
             kind: 'error',
             error: `Failed to fetch object ${objectID}: ${err instanceof Error ? err.message : String(err)}. Retry after a brief delay.`,
-          });
+          };
         }
       }
     };
 
-    // Drain queue with concurrency limit
+    // Drain the input list with a fixed concurrency limit.
     const workers = Array.from({ length: Math.min(batchConcurrency, input.objectIDs.length) }, () =>
       processNext(),
     );
