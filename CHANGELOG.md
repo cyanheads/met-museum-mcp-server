@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.5](changelog/0.2.x/0.2.5.md) — 2026-07-16
+
+content[] now renders every met_get_object and met_search_collections output field with placeholders for empty/null/false values; tool descriptions tightened to descriptive voice across all three tools
+
 ## [0.2.4](changelog/0.2.x/0.2.4.md) — 2026-07-16
 
 met_search_collections: offset pagination, departmentId validation, and a fail-fast search timeout with recovery hints
