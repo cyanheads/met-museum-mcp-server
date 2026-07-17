@@ -5,6 +5,7 @@
 
 import type { Context } from '@cyanheads/mcp-ts-core';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
+import { timeout } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { type RequestContext, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
@@ -22,12 +23,17 @@ export interface SearchInput {
   isPublicDomain?: boolean | undefined;
   limit: number;
   medium?: string | undefined;
+  offset?: number | undefined;
   q: string;
 }
 
 /** Normalized search result. */
 export interface SearchResult {
+  /** The next `offset` to pass to continue paging, or `null` when the result set is exhausted. */
+  nextOffset: number | null;
   objectIDs: number[];
+  /** Matching IDs after this page (`total - (offset + returned)`), floored at 0. */
+  remaining: number;
   returned: number;
   total: number;
   truncated: boolean;
@@ -117,9 +123,31 @@ async function fetchWithManualTimeout(
   }
 }
 
+/**
+ * True when a thrown value is a fetch abort (deadline or cancellation). Matched by
+ * `name` rather than instanceof to tolerate the DOMException/Error variance across
+ * runtimes (Node, Bun, workerd).
+ */
+function isAbortError(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    (error as { name?: unknown }).name === 'AbortError'
+  );
+}
+
+/**
+ * How long a resolved department-ID set stays cached before a refetch. The Met's
+ * department roster is highly stable, so `departmentId` validation reads the cache
+ * after the first lookup instead of adding an upstream round-trip to every
+ * filtered search.
+ */
+const DEPARTMENT_IDS_CACHE_TTL_MS = 60 * 60 * 1000;
+
 export class MetService {
   private readonly baseUrl: string;
   private readonly timeoutMs: number;
+  private validDepartmentIdsCache?: { ids: Set<number>; expiresAt: number };
 
   constructor(_config: AppConfig, _storage: StorageService) {
     const serverConfig = getServerConfig();
@@ -127,25 +155,58 @@ export class MetService {
     this.timeoutMs = serverConfig.requestTimeoutMs;
   }
 
-  /** Search the Met collection. Returns normalized result with sliced IDs. */
+  /**
+   * Search the Met collection. Returns a normalized result: an offset-sliced page
+   * of IDs plus continuation metadata (`nextOffset`, `remaining`).
+   *
+   * The upstream `/search` returns the complete ID array in one response, so paging
+   * is a local slice — no extra upstream capability needed. A broad, unfiltered
+   * query can deterministically exceed the request timeout while that array
+   * downloads; because the same query times out identically on every attempt, the
+   * timeout is surfaced as a non-retryable `search_timeout` (fail-fast) instead of
+   * being retried through the full timeout three more times.
+   */
   search(input: SearchInput, ctx: Context): Promise<SearchResult> {
+    const offset = input.offset ?? 0;
     return withRetry(
       async () => {
         const url = this.buildSearchUrl(input);
         ctx.log.debug('Met search request', { url: url.toString() });
-        const response = await fetchWithManualTimeout(url.toString(), this.timeoutMs, ctx.signal);
+        let response: Response;
+        try {
+          response = await fetchWithManualTimeout(url.toString(), this.timeoutMs, ctx.signal);
+        } catch (error) {
+          // Our own deadline fired (the timer aborted the request) while the caller's
+          // signal is still live — a deterministic oversized-response timeout. Fail fast
+          // with `retryable: false` so withRetry does not burn the full timeout three more
+          // times, and carry the narrow-the-query recovery hint. A caller cancellation
+          // (ctx.signal aborted) is not ours to reclassify — let it bubble unchanged.
+          if (!ctx.signal.aborted && isAbortError(error)) {
+            throw timeout(
+              `Met search for "${input.q}" exceeded the ${this.timeoutMs}ms request timeout — the result set is too large to download in time.`,
+              { reason: 'search_timeout', retryable: false, ...ctx.recoveryFor('search_timeout') },
+              { cause: error },
+            );
+          }
+          throw error;
+        }
         if (!response.ok) {
           const body = await response.text().catch(() => '');
           throw new Error(`Met API returned HTTP ${response.status}: ${body.slice(0, 200)}`);
         }
         const raw = (await response.json()) as RawSearchResponse;
         const allIds = raw.objectIDs ?? [];
-        const sliced = allIds.slice(0, input.limit);
+        const sliced = allIds.slice(offset, offset + input.limit);
+        const consumed = offset + sliced.length;
+        const remaining = Math.max(0, raw.total - consumed);
+        const truncated = remaining > 0;
         return {
           total: raw.total,
           objectIDs: sliced,
           returned: sliced.length,
-          truncated: allIds.length > sliced.length || raw.total > allIds.length,
+          truncated,
+          remaining,
+          nextOffset: truncated ? consumed : null,
         };
       },
       {
@@ -208,6 +269,23 @@ export class MetService {
         signal: ctx.signal,
       },
     );
+  }
+
+  /**
+   * Valid department IDs as a set, for fast membership checks when validating a
+   * `departmentId` search filter. Derived from the live department list and cached
+   * with a TTL, so only the first check per window hits the upstream — filtered
+   * searches validate near-instantly without a fetch on every call.
+   */
+  async getValidDepartmentIds(ctx: Context): Promise<Set<number>> {
+    const cached = this.validDepartmentIdsCache;
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.ids;
+    }
+    const departments = await this.getDepartments(ctx);
+    const ids = new Set(departments.map((d) => d.departmentId));
+    this.validDepartmentIdsCache = { ids, expiresAt: Date.now() + DEPARTMENT_IDS_CACHE_TTL_MS };
+    return ids;
   }
 
   private buildSearchUrl(input: SearchInput): URL {

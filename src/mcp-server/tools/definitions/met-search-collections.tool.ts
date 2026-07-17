@@ -70,7 +70,7 @@ export const metSearchCollections = tool('met_search_collections', {
       .min(1)
       .optional()
       .describe(
-        'Restrict results to one curatorial department. Use met_list_departments to get valid IDs (1–21, not all integers are valid). ' +
+        'Restrict results to one curatorial department. Call met_list_departments to get valid IDs — the Met exposes a sparse set (roughly 1–21, with gaps), and an unrecognized ID is rejected with an invalid_department error rather than silently returning no matches. ' +
           'Can be combined with other filters; combining with isPublicDomain works but returns far fewer results than expected — ' +
           'use isPublicDomain alone when CC0 coverage is the goal.',
       ),
@@ -109,6 +109,16 @@ export const metSearchCollections = tool('met_search_collections', {
           'The API returns all matches (up to tens of thousands) — this caps what is handed back. ' +
           'Chain the returned IDs to met_get_object in batches of up to 20.',
       ),
+    offset: z
+      .number()
+      .int()
+      .min(0)
+      .default(0)
+      .describe(
+        'Zero-based index into the full result set to start from (default 0). ' +
+          'Paginate by passing the nextOffset returned by a previous call; each page re-runs the upstream search and applies the offset locally, so a broad query carries the same timeout risk on every page — narrow it with filters if paging times out. ' +
+          'An offset at or beyond total returns an empty page, not an error.',
+      ),
   }),
   output: z.object({
     total: z
@@ -136,7 +146,20 @@ export const metSearchCollections = tool('met_search_collections', {
     truncated: z
       .boolean()
       .describe(
-        'True when total > returned. Increase `limit`, refine filters, or add keywords to narrow results.',
+        'True when matching IDs remain beyond this page (offset + returned < total). Pass nextOffset as offset to fetch the next page, increase limit, or refine filters to narrow results.',
+      ),
+    remaining: z
+      .number()
+      .int()
+      .describe(
+        'Count of matching object IDs after this page: total − (offset + returned), floored at 0. 0 means this is the last page.',
+      ),
+    nextOffset: z
+      .number()
+      .int()
+      .nullable()
+      .describe(
+        'The offset to pass on the next call to continue paging, or null when the result set is exhausted (truncated is false).',
       ),
   }),
   errors: [
@@ -153,6 +176,20 @@ export const metSearchCollections = tool('met_search_collections', {
       when: 'dateBegin or dateEnd is provided without the other, or dateBegin > dateEnd.',
       recovery: 'Provide both dateBegin and dateEnd as integer years, with dateBegin ≤ dateEnd.',
     },
+    {
+      reason: 'invalid_department',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'departmentId is provided but is not one of the Met department IDs.',
+      recovery:
+        'Call met_list_departments to get valid department IDs, then retry with one of the returned IDs.',
+    },
+    {
+      reason: 'search_timeout',
+      code: JsonRpcErrorCode.Timeout,
+      when: 'The result set is too large to download within the request timeout — a broad, unfiltered query.',
+      recovery:
+        'Narrow the query or add filters (departmentId, geoLocation, medium, or dateBegin plus dateEnd) to shrink the result set, then retry.',
+    },
   ],
 
   async handler(input, ctx) {
@@ -163,13 +200,29 @@ export const metSearchCollections = tool('met_search_collections', {
       throw ctx.fail(
         'invalid_date_range',
         'dateBegin and dateEnd must both be provided or both omitted.',
+        ctx.recoveryFor('invalid_date_range'),
       );
     }
     if (hasBegin && hasEnd && (input.dateBegin ?? 0) > (input.dateEnd ?? 0)) {
       throw ctx.fail(
         'invalid_date_range',
         `dateBegin (${input.dateBegin}) must be ≤ dateEnd (${input.dateEnd}).`,
+        ctx.recoveryFor('invalid_date_range'),
       );
+    }
+
+    // Validate departmentId against the live (cached) Met department set so an
+    // unknown ID fails fast with actionable guidance instead of falling through to
+    // an ambiguous no_results.
+    if (input.departmentId != null) {
+      const validDepartmentIds = await getMetService().getValidDepartmentIds(ctx);
+      if (!validDepartmentIds.has(input.departmentId)) {
+        throw ctx.fail(
+          'invalid_department',
+          `departmentId ${input.departmentId} is not a valid Met department.`,
+          ctx.recoveryFor('invalid_department'),
+        );
+      }
     }
 
     ctx.log.info('Met search', {
@@ -178,12 +231,14 @@ export const metSearchCollections = tool('met_search_collections', {
       isPublicDomain: input.isPublicDomain,
       departmentId: input.departmentId,
       limit: input.limit,
+      offset: input.offset,
     });
 
     const result = await getMetService().search(
       {
         q: input.q,
         limit: input.limit,
+        offset: input.offset,
         hasImages: input.hasImages,
         isPublicDomain: input.isPublicDomain,
         isHighlight: input.isHighlight,
@@ -212,6 +267,8 @@ export const metSearchCollections = tool('met_search_collections', {
     const lines: string[] = [
       `**Total matches:** ${result.total}`,
       `**Returned IDs:** ${result.returned}${result.truncated ? ' (truncated)' : ''}`,
+      `**Remaining:** ${result.remaining}`,
+      `**Next offset:** ${result.nextOffset ?? 'none'}`,
       '',
       '**Object IDs:**',
       result.objectIDs.join(', '),
