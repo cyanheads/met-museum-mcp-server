@@ -1,8 +1,9 @@
 {
   "manifest_version": "0.3",
   "name": "met-museum-mcp-server",
-  "version": "0.2.2",
-  "description": "MCP server for The Metropolitan Museum of Art collection — 500K+ artworks with metadata, provenance, and open-access high-res images.",
+  "version": "0.2.3",
+  "license": "Apache-2.0",
+  "description": "Search the Metropolitan Museum of Art collection, fetch full artwork records and open-access images via MCP. STDIO or Streamable HTTP.",
   "author": { "name": "cyanheads" },
   "server": {
     "type": "node",
