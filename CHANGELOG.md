@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.4](changelog/0.2.x/0.2.4.md) — 2026-07-16
+
+met_search_collections: offset pagination, departmentId validation, and a fail-fast search timeout with recovery hints
+
 ## [0.2.3](changelog/0.2.x/0.2.3.md) — 2026-07-16
 
 Fix: met_get_object preserves requested objectID order; adopt mcp-ts-core ^0.10.14 with Socket install scanning and a release-age hold

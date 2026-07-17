@@ -1,6 +1,6 @@
 # met-museum-mcp-server - Directory Structure
 
-Generated on: 2026-07-16 23:53:36
+Generated on: 2026-07-17 01:29:07
 
 ```text
 met-museum-mcp-server/
@@ -149,6 +149,9 @@ met-museum-mcp-server/
 ├── tests/
 │   ├── prompts/
 │   ├── resources/
+│   ├── services/
+│   │   └── met/
+│   │       └── met-service.test.ts
 │   └── tools/
 │       ├── met-get-object.tool.test.ts
 │       ├── met-list-departments.tool.test.ts

@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.2.3-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/met-museum-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/met-museum-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/met-museum-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.14-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.2.4-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/met-museum-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/met-museum-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/met-museum-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.14-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -59,7 +59,8 @@ Search the Met collection by keyword and optional filters.
 - `hasImages=true` includes any object with images (includes copyrighted works without reusable URLs)
 - `isHighlight=true` restricts to collection highlights designated by the Met
 - `isOnView=true` restricts to objects currently on display in a Met gallery
-- Returns total match count, truncation indicator, and up to `limit` object IDs (default 20, max 500)
+- Paginate past `limit` with `offset` (default 0) — each page re-runs the upstream search and slices it locally, so a broad, unfiltered query carries the same timeout risk on every page as on the first
+- Returns total match count, truncation indicator, `remaining` count, `nextOffset` for the next page (`null` once exhausted), and up to `limit` object IDs (default 20, max 500)
 - Chain returned IDs to `met_get_object` in batches of up to 20
 
 ---
@@ -100,7 +101,7 @@ Agent-friendly output:
 
 - Provenance on every record — `isPublicDomain` and `hasCC0Image` flags distinguish CC0 objects from works with inaccessible images, so agents can reason about what they can actually display
 - Partial failure reporting — `met_get_object` returns `objects` and `failed` arrays so callers receive successful records alongside structured per-ID error context
-- Truncation signaling — `met_search_collections` returns `total`, `returned`, and `truncated` fields so agents know when to refine filters or increase `limit`
+- Truncation signaling — `met_search_collections` returns `total`, `returned`, `truncated`, `remaining`, and `nextOffset` fields so agents know when to refine filters, increase `limit`, or page further with `offset`
 
 ## Getting started
 
