@@ -444,7 +444,7 @@ The API provides flat `artistDisplayName`, `artistDisplayBio`, `artistNationalit
 - **`isPublicDomain + departmentId` severely restricts results** — the combination works but returns far fewer results than either filter alone due to partial search-index coverage. Use `isPublicDomain` alone and filter by department on the returned object records (see Decisions Log).
 - **Non-public-domain objects have no image URLs** — the Met restricts images for works still under copyright. `primaryImage` and `primaryImageSmall` are empty strings; agents cannot display images for these works.
 - **Search covers approximately 267,000 objects, not all 501,731** — the `/search` endpoint does not index every object in the collection. The `/objects` endpoint (full enumeration) covers 501,731 IDs, suggesting ~235K objects exist outside the search index (likely due to incomplete cataloguing).
-- **No pagination on search results** — the API returns all matching IDs in a single response (truncated by this server's `limit` parameter). There is no cursor or page token. Very broad searches may return tens of thousands of IDs.
+- **No cursor-based pagination** — the Met `/search` endpoint returns all matching IDs in a single response with no cursor or page token. This server layers `offset`/`limit` pagination over that full set, returning `nextOffset` to fetch the next page; each page re-runs the upstream search and slices locally, so a very broad search carries the same timeout risk on every page.
 
 ---
 

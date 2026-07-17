@@ -9,9 +9,7 @@ import { getMetService } from '@/services/met/met-service.js';
 export const metListDepartments = tool('met_list_departments', {
   title: 'List Met Departments',
   description:
-    'Return the 19 curatorial departments at The Metropolitan Museum of Art with their numeric IDs and display names. ' +
-    'Use before calling met_search_collections to discover valid departmentId values. ' +
-    'The department list is fetched live on each call to remain accurate if the Met reorganizes.',
+    'Return the 19 curatorial departments at The Metropolitan Museum of Art, each with its numeric departmentId and display name — the valid values for the met_search_collections departmentId filter.',
   annotations: { readOnlyHint: true, idempotentHint: true },
   input: z.object({}),
   output: z.object({

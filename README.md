@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.2.4-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/met-museum-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/met-museum-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/met-museum-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.14-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.2.5-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/met-museum-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/met-museum-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/met-museum-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.14-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -41,8 +41,7 @@ Three tools for browsing and fetching Metropolitan Museum of Art collection data
 
 Return the 19 curatorial departments at The Metropolitan Museum of Art with their numeric IDs and display names.
 
-- Live fetch — remains accurate if the Met reorganizes
-- Use before `met_search_collections` to discover valid `departmentId` values
+- `departmentId` values are the valid inputs for the `met_search_collections` department filter
 
 ---
 
@@ -51,7 +50,7 @@ Return the 19 curatorial departments at The Metropolitan Museum of Art with thei
 Search the Met collection by keyword and optional filters.
 
 - Keyword search across title, artist name, culture, medium, tags, and other text fields
-- Filter by department ID (use `met_list_departments` to get valid IDs)
+- Filter by department ID (valid IDs from `met_list_departments`)
 - Filter by date range (integer years, negative = BCE)
 - Filter by medium/classification (e.g., `"Paintings"`, `"Sculptures"`, `"Ceramics"`) — maps to the classification field, not material descriptions
 - Filter by geographic origin — country, region, or city; multiple values are AND-combined
@@ -59,9 +58,9 @@ Search the Met collection by keyword and optional filters.
 - `hasImages=true` includes any object with images (includes copyrighted works without reusable URLs)
 - `isHighlight=true` restricts to collection highlights designated by the Met
 - `isOnView=true` restricts to objects currently on display in a Met gallery
-- Paginate past `limit` with `offset` (default 0) — each page re-runs the upstream search and slices it locally, so a broad, unfiltered query carries the same timeout risk on every page as on the first
+- Paginate past `limit` with `offset` (default 0) — a broad, unfiltered query carries the same timeout risk on every page as on the first
 - Returns total match count, truncation indicator, `remaining` count, `nextOffset` for the next page (`null` once exhausted), and up to `limit` object IDs (default 20, max 500)
-- Chain returned IDs to `met_get_object` in batches of up to 20
+- Returned IDs resolve to full records via `met_get_object` (up to 20 per call)
 
 ---
 
@@ -69,7 +68,7 @@ Search the Met collection by keyword and optional filters.
 
 Fetch full records for one or more Met Museum object IDs.
 
-- Accepts 1–20 IDs per call; fetches run in parallel (concurrency-limited)
+- Accepts 1–20 IDs per call
 - Partial-success — a single 404 does not fail the whole batch; failed IDs are reported per-ID
 - Full metadata: title, department, classification, medium, dimensions, date, culture, period, dynasty, accession number, credit line, gallery number
 - Artist data: display name, biography, nationality, dates, Getty ULAN URL, Wikidata URL

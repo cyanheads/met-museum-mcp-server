@@ -111,9 +111,7 @@ const ObjectSchema = z
     objectBeginDate: z
       .number()
       .int()
-      .describe(
-        'Earliest date as an integer year (negative = BCE). Use for date range comparisons.',
-      ),
+      .describe('Earliest date as an integer year (negative = BCE).'),
     objectEndDate: z.number().int().describe('Latest date as an integer year (negative = BCE).'),
     medium: z
       .string()
@@ -156,7 +154,7 @@ const ObjectSchema = z
 export const metGetObject = tool('met_get_object', {
   title: 'Get Met Objects',
   description:
-    'Fetch full records for one or more Met Museum object IDs. Accepts up to 20 IDs per call, fetches in parallel (concurrency-limited), and returns partial-success — a single 404 does not fail the whole batch. ' +
+    'Fetch full records for one or more Met Museum object IDs. Accepts up to 20 IDs per call and returns partial success — a single 404 does not fail the whole batch; per-ID failures are reported separately. ' +
     'Object IDs come from met_search_collections. Non-public-domain objects return empty image URLs. ' +
     'The constituents array is null for anonymous or unattributed works; tags is null for untagged objects.',
   annotations: { readOnlyHint: true, idempotentHint: true },
@@ -167,7 +165,7 @@ export const metGetObject = tool('met_get_object', {
       .max(20)
       .describe(
         'One or more Met object IDs to fetch. Maximum 20 per call. IDs come from met_search_collections. ' +
-          'Fetches run in parallel (concurrency-limited); partial failures are reported per ID rather than failing the whole batch.',
+          'Partial failures are reported per ID rather than failing the whole batch.',
       ),
   }),
   output: z.object({
@@ -279,57 +277,56 @@ export const metGetObject = tool('met_get_object', {
 
   format: (result) => {
     const lines: string[] = [];
+    const orDash = (v: string) => v || '—';
 
     for (const obj of result.objects) {
       lines.push(`## ${obj.title || '(Untitled)'} — Object ${obj.objectID}`);
       lines.push(
         `**isPublicDomain:** ${obj.isPublicDomain ? 'Yes (CC0)' : 'No'} | **hasCC0Image:** ${obj.hasCC0Image ? 'Yes' : 'No'} | **isHighlight:** ${obj.isHighlight ? 'Yes' : 'No'} | **isTimelineWork:** ${obj.isTimelineWork ? 'Yes' : 'No'}`,
       );
-      if (obj.artistDisplayName) {
-        lines.push(
-          `**Artist:** ${obj.artistDisplayName}${obj.artistDisplayBio ? ` (${obj.artistDisplayBio})` : ''}`,
-        );
-      }
-      if (obj.artistNationality) lines.push(`**Nationality:** ${obj.artistNationality}`);
-      if (obj.artistBeginDate || obj.artistEndDate) {
-        lines.push(`**Artist dates:** ${obj.artistBeginDate}–${obj.artistEndDate}`);
-      }
       lines.push(
-        `**Department:** ${obj.department} | **Object name:** ${obj.objectName} | **Classification:** ${obj.classification}`,
+        `**Artist:** ${orDash(obj.artistDisplayName)}${obj.artistDisplayBio ? ` (${obj.artistDisplayBio})` : ''}`,
       );
-      lines.push(`**Date:** ${obj.objectDate} (${obj.objectBeginDate}–${obj.objectEndDate})`);
-      if (obj.medium) lines.push(`**Medium:** ${obj.medium}`);
-      if (obj.dimensions) lines.push(`**Dimensions:** ${obj.dimensions}`);
-      if (obj.culture) lines.push(`**Culture:** ${obj.culture}`);
-      if (obj.period) lines.push(`**Period:** ${obj.period}`);
-      if (obj.dynasty) lines.push(`**Dynasty:** ${obj.dynasty}`);
-      if (obj.country || obj.region) {
-        lines.push(`**Geography:** ${[obj.country, obj.region].filter(Boolean).join(', ')}`);
-      }
-      lines.push(`**Accession:** ${obj.accessionNumber}`);
-      if (obj.creditLine) lines.push(`**Credit:** ${obj.creditLine}`);
-      if (obj.GalleryNumber) lines.push(`**Gallery:** ${obj.GalleryNumber}`);
-      if (obj.objectURL) lines.push(`**URL:** ${obj.objectURL}`);
-      if (obj.primaryImage) lines.push(`**Image (full):** ${obj.primaryImage}`);
-      if (obj.primaryImageSmall) lines.push(`**Image (small):** ${obj.primaryImageSmall}`);
-      if (obj.additionalImages.length > 0) {
-        lines.push(
-          `**Additional images (${obj.additionalImages.length}):** ${obj.additionalImages.join(', ')}`,
-        );
-      }
-      if (obj.objectWikidata_URL) lines.push(`**Wikidata:** ${obj.objectWikidata_URL}`);
-      if (obj.tags?.length) {
-        lines.push(
-          `**Tags:** ${obj.tags.map((t) => `${t.term}${t.AAT_URL ? ` [AAT](${t.AAT_URL})` : ''}${t.Wikidata_URL ? ` [WD](${t.Wikidata_URL})` : ''}`).join(', ')}`,
-        );
-      }
-      if (obj.constituents?.length) {
-        const parts = obj.constituents.map(
-          (c) =>
-            `constituentID:${c.constituentID} ${c.name} (${c.role}${c.gender ? `, ${c.gender}` : ''}${c.constituentWikidata_URL ? `, [WD](${c.constituentWikidata_URL})` : ''}${c.constituentULAN_URL ? `, [ULAN](${c.constituentULAN_URL})` : ''})`,
-        );
-        lines.push(`**Constituents:** ${parts.join('; ')}`);
-      }
+      lines.push(`**Nationality:** ${orDash(obj.artistNationality)}`);
+      lines.push(
+        `**Artist dates:** ${obj.artistBeginDate || obj.artistEndDate ? `${orDash(obj.artistBeginDate)}–${orDash(obj.artistEndDate)}` : '—'}`,
+      );
+      lines.push(
+        `**Department:** ${orDash(obj.department)} | **Object name:** ${orDash(obj.objectName)} | **Classification:** ${orDash(obj.classification)}`,
+      );
+      lines.push(
+        `**Date:** ${orDash(obj.objectDate)} (${obj.objectBeginDate}–${obj.objectEndDate})`,
+      );
+      lines.push(`**Medium:** ${orDash(obj.medium)}`);
+      lines.push(`**Dimensions:** ${orDash(obj.dimensions)}`);
+      lines.push(`**Culture:** ${orDash(obj.culture)}`);
+      lines.push(`**Period:** ${orDash(obj.period)}`);
+      lines.push(`**Dynasty:** ${orDash(obj.dynasty)}`);
+      lines.push(
+        `**Geography:** ${obj.country || obj.region ? [obj.country, obj.region].filter(Boolean).join(', ') : '—'}`,
+      );
+      lines.push(`**Accession:** ${orDash(obj.accessionNumber)}`);
+      lines.push(`**Credit:** ${orDash(obj.creditLine)}`);
+      lines.push(`**Gallery:** ${orDash(obj.GalleryNumber)}`);
+      lines.push(`**URL:** ${orDash(obj.objectURL)}`);
+      lines.push(`**Image (full):** ${orDash(obj.primaryImage)}`);
+      lines.push(`**Image (small):** ${orDash(obj.primaryImageSmall)}`);
+      lines.push(
+        `**Additional images${obj.additionalImages.length > 0 ? ` (${obj.additionalImages.length})` : ''}:** ${obj.additionalImages.length > 0 ? obj.additionalImages.join(', ') : '—'}`,
+      );
+      lines.push(`**Wikidata:** ${orDash(obj.objectWikidata_URL)}`);
+      lines.push(
+        `**Tags:** ${obj.tags?.length ? obj.tags.map((t) => `${t.term}${t.AAT_URL ? ` [AAT](${t.AAT_URL})` : ''}${t.Wikidata_URL ? ` [WD](${t.Wikidata_URL})` : ''}`).join(', ') : '—'}`,
+      );
+      const constituents = obj.constituents?.length
+        ? obj.constituents
+            .map(
+              (c) =>
+                `constituentID:${c.constituentID} ${c.name} (${c.role}${c.gender ? `, ${c.gender}` : ''}${c.constituentWikidata_URL ? `, [WD](${c.constituentWikidata_URL})` : ''}${c.constituentULAN_URL ? `, [ULAN](${c.constituentULAN_URL})` : ''})`,
+            )
+            .join('; ')
+        : '—';
+      lines.push(`**Constituents:** ${constituents}`);
       lines.push('');
     }
 
@@ -338,6 +335,8 @@ export const metGetObject = tool('met_get_object', {
       for (const f of result.failed) {
         lines.push(`- **${f.objectID}:** ${f.error}`);
       }
+    } else {
+      lines.push('**Failed fetches:** none');
     }
 
     return [{ type: 'text', text: lines.join('\n').trim() }];

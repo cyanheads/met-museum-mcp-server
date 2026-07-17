@@ -251,7 +251,7 @@ describe('metSearchCollections', () => {
     expect(text).toContain('Next offset:** 2');
   });
 
-  it('format shows "none" for nextOffset on the final page', () => {
+  it('format shows completion markers on the final page (not truncated, nextOffset none)', () => {
     const blocks = metSearchCollections.format!({
       total: 2,
       objectIDs: [1001, 1002],
@@ -261,6 +261,8 @@ describe('metSearchCollections', () => {
       nextOffset: null,
     });
     const text = blocks[0].text as string;
+    // truncated: false must render an explicit marker rather than silently vanishing.
+    expect(text).toContain('(complete)');
     expect(text).toContain('Next offset:** none');
     expect(text).toContain('Remaining:** 0');
   });

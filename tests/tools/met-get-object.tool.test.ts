@@ -67,6 +67,48 @@ const sampleRecord = {
 };
 
 /**
+ * Met object 1's sparse live shape: empty strings across the board, `tags` and
+ * `constituents` null, empty `additionalImages`, false booleans. Exercises the
+ * empty/null/false branches of format() that the populated sampleRecord never reaches.
+ */
+const sparseRecord = {
+  objectID: 1,
+  title: '',
+  isPublicDomain: false,
+  hasCC0Image: false,
+  primaryImage: '',
+  primaryImageSmall: '',
+  additionalImages: [] as string[],
+  objectURL: '',
+  department: '',
+  objectName: '',
+  classification: '',
+  isHighlight: false,
+  isTimelineWork: false,
+  artistDisplayName: '',
+  artistDisplayBio: '',
+  artistNationality: '',
+  artistBeginDate: '',
+  artistEndDate: '',
+  constituents: null,
+  objectDate: '',
+  objectBeginDate: 0,
+  objectEndDate: 0,
+  medium: '',
+  dimensions: '',
+  culture: '',
+  period: '',
+  dynasty: '',
+  accessionNumber: '',
+  creditLine: '',
+  country: '',
+  region: '',
+  tags: null,
+  objectWikidata_URL: '',
+  GalleryNumber: '',
+};
+
+/**
  * Configure the service mock so fetches COMPLETE in the reverse of input order —
  * the first input ID resolves last. This is the adversarial timing that a
  * completion-ordered handler reorders; a synchronous mock resolves in input order
@@ -214,5 +256,34 @@ describe('metGetObject', () => {
     const text = blocks[0].text as string;
     expect(text).toContain('Failed Fetches');
     expect(text).toContain('99');
+  });
+
+  it('format renders a placeholder for every empty field (sparse object 1 shape)', () => {
+    const blocks = metGetObject.format!({ objects: [sparseRecord], failed: [] });
+    const text = blocks[0].text as string;
+    // Every otherwise-dropped empty field must surface a placeholder in content[] —
+    // structuredContent already carries these values; content[] must not lose them.
+    expect(text).toContain('## (Untitled) — Object 1');
+    expect(text).toContain('**Artist:** —');
+    expect(text).toContain('**Nationality:** —');
+    expect(text).toContain('**Artist dates:** —');
+    expect(text).toContain('**Classification:** —');
+    expect(text).toContain('**Medium:** —');
+    expect(text).toContain('**Dimensions:** —');
+    expect(text).toContain('**Culture:** —');
+    expect(text).toContain('**Period:** —');
+    expect(text).toContain('**Dynasty:** —');
+    expect(text).toContain('**Geography:** —');
+    expect(text).toContain('**Credit:** —');
+    expect(text).toContain('**Gallery:** —');
+    expect(text).toContain('**URL:** —');
+    expect(text).toContain('**Image (full):** —');
+    expect(text).toContain('**Image (small):** —');
+    expect(text).toContain('**Additional images:** —');
+    expect(text).toContain('**Wikidata:** —');
+    expect(text).toContain('**Tags:** —');
+    expect(text).toContain('**Constituents:** —');
+    // Empty failed[] renders an explicit placeholder, not an omitted section.
+    expect(text).toContain('**Failed fetches:** none');
   });
 });

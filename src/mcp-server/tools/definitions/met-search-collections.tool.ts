@@ -10,9 +10,9 @@ import { getMetService } from '@/services/met/met-service.js';
 export const metSearchCollections = tool('met_search_collections', {
   title: 'Search Met Collection',
   description:
-    'Search the Metropolitan Museum of Art collection by keyword and optional filters; returns total match count and a page of object IDs. ' +
-    'Always chain the returned IDs to met_get_object (up to 20 at a time) to retrieve full records. ' +
-    'Search relevance is keyword-based, not semantic — use concise terms and apply departmentId or geoLocation filters to sharpen results. ' +
+    'Search the Metropolitan Museum of Art collection by keyword and optional filters. ' +
+    'Returns the total match count and a page of matching object IDs, which met_get_object resolves to full records. ' +
+    'Relevance is keyword-based, not semantic; department and geographic filters narrow results more than a longer query. ' +
     'The medium parameter maps to the classification field (pass "Paintings", "Drawings", etc., not material descriptions like "Oil on canvas"). ' +
     'isPublicDomain guarantees CC0-licensed images; hasImages also includes copyrighted works. ' +
     'isOnView restricts results to works currently on display in a Met gallery.',
@@ -22,16 +22,14 @@ export const metSearchCollections = tool('met_search_collections', {
       .string()
       .min(1)
       .describe(
-        'Keyword query. Searched across title, artist name, culture, medium, tags, and other text fields. ' +
-          'Use concise, specific terms — broad queries return large ID sets. ' +
-          'Tip: departmentId and geoLocation sharpen results far more than a longer query string.',
+        'Keyword query, matched across title, artist name, culture, medium, tags, and other text fields. Broad terms return large ID sets.',
       ),
     hasImages: z
       .boolean()
       .optional()
       .describe(
-        'When true, restricts results to objects that have at least one associated image. ' +
-          'For freely reusable CC0 images, use isPublicDomain instead — hasImages includes copyrighted works whose images cannot be reproduced.',
+        'When true, restricts results to objects that have at least one associated image, including copyrighted works whose images cannot be reproduced. ' +
+          'isPublicDomain is the filter for freely reusable CC0 images.',
       ),
     isPublicDomain: z
       .boolean()
@@ -39,23 +37,20 @@ export const metSearchCollections = tool('met_search_collections', {
       .describe(
         'When true, restricts results to objects released under CC0 open access — free to use without permission or attribution. ' +
           'These objects return direct high-resolution image URLs in met_get_object. ' +
-          'Can be combined with departmentId but severely restricts results (the search index only indexes a subset of public-domain objects per department); ' +
-          'prefer using isPublicDomain alone and filtering by department from the returned object records.',
+          'Combining with departmentId works but returns far fewer results, since the search index covers only a subset of public-domain objects per department.',
       ),
     isHighlight: z
       .boolean()
       .optional()
       .describe(
-        'When true, restricts to objects the Met has designated as highlights — major works central to the collection. ' +
-          'Use to surface iconic pieces rather than browsing the full corpus.',
+        'When true, restricts to objects the Met has designated as highlights — major works central to the collection.',
       ),
     isOnView: z
       .boolean()
       .optional()
       .describe(
         'When true, restricts results to objects currently on display in a Met gallery. ' +
-          'The GalleryNumber field on the met_get_object record identifies the specific gallery. ' +
-          'Combine with a keyword to answer "what is on display right now?" — pairs well with isHighlight for must-see works.',
+          'The GalleryNumber field on the met_get_object record identifies the specific gallery.',
       ),
     medium: z
       .string()
@@ -70,9 +65,8 @@ export const metSearchCollections = tool('met_search_collections', {
       .min(1)
       .optional()
       .describe(
-        'Restrict results to one curatorial department. Call met_list_departments to get valid IDs — the Met exposes a sparse set (roughly 1–21, with gaps), and an unrecognized ID is rejected with an invalid_department error rather than silently returning no matches. ' +
-          'Can be combined with other filters; combining with isPublicDomain works but returns far fewer results than expected — ' +
-          'use isPublicDomain alone when CC0 coverage is the goal.',
+        'Restrict results to one curatorial department. Valid IDs come from met_list_departments — the Met exposes a sparse set (roughly 1–21, with gaps); an unrecognized ID is rejected with an invalid_department error rather than silently returning no matches. ' +
+          'Can be combined with other filters; combining with isPublicDomain works but returns far fewer results than expected.',
       ),
     geoLocation: z
       .array(
@@ -81,7 +75,7 @@ export const metSearchCollections = tool('met_search_collections', {
       .optional()
       .describe(
         'Filter by geographic origin. Each value is matched broadly against geography fields and artist nationality. ' +
-          'Multiple values are AND-combined — ["France", "Egypt"] returns objects associated with both, not either; use a single value for broader results. ' +
+          'Multiple values are AND-combined — ["France", "Egypt"] returns objects associated with both, not either, so more values narrow the result set. ' +
           'Works best with the Egyptian Art, Greek and Roman Art, and similar departments that have well-populated geography fields.',
       ),
     dateBegin: z
@@ -106,8 +100,7 @@ export const metSearchCollections = tool('met_search_collections', {
       .default(20)
       .describe(
         'Maximum number of object IDs to return from the full result set. ' +
-          'The API returns all matches (up to tens of thousands) — this caps what is handed back. ' +
-          'Chain the returned IDs to met_get_object in batches of up to 20.',
+          'The Met search returns every match (up to tens of thousands); this caps how many IDs are returned.',
       ),
     offset: z
       .number()
@@ -116,7 +109,7 @@ export const metSearchCollections = tool('met_search_collections', {
       .default(0)
       .describe(
         'Zero-based index into the full result set to start from (default 0). ' +
-          'Paginate by passing the nextOffset returned by a previous call; each page re-runs the upstream search and applies the offset locally, so a broad query carries the same timeout risk on every page — narrow it with filters if paging times out. ' +
+          'The nextOffset from a previous response is the value to pass here for the next page; a broad query carries the same timeout risk on every page, so narrow it with filters if paging times out. ' +
           'An offset at or beyond total returns an empty page, not an error.',
       ),
   }),
@@ -128,15 +121,8 @@ export const metSearchCollections = tool('met_search_collections', {
         'Total number of matching objects in the Met collection (may far exceed the returned IDs).',
       ),
     objectIDs: z
-      .array(
-        z
-          .number()
-          .int()
-          .describe('A Met object ID. Pass to met_get_object to retrieve the full record.'),
-      )
-      .describe(
-        'Object IDs for the first `limit` results. Pass to met_get_object (up to 20 at a time) to retrieve full records.',
-      ),
+      .array(z.number().int().describe('A Met object ID.'))
+      .describe('Object IDs for the first `limit` results.'),
     returned: z
       .number()
       .int()
@@ -146,7 +132,7 @@ export const metSearchCollections = tool('met_search_collections', {
     truncated: z
       .boolean()
       .describe(
-        'True when matching IDs remain beyond this page (offset + returned < total). Pass nextOffset as offset to fetch the next page, increase limit, or refine filters to narrow results.',
+        'True when matching IDs remain beyond this page (offset + returned < total); false when this page is the last.',
       ),
     remaining: z
       .number()
@@ -266,7 +252,7 @@ export const metSearchCollections = tool('met_search_collections', {
   format: (result) => {
     const lines: string[] = [
       `**Total matches:** ${result.total}`,
-      `**Returned IDs:** ${result.returned}${result.truncated ? ' (truncated)' : ''}`,
+      `**Returned IDs:** ${result.returned}${result.truncated ? ' (truncated)' : ' (complete)'}`,
       `**Remaining:** ${result.remaining}`,
       `**Next offset:** ${result.nextOffset ?? 'none'}`,
       '',
