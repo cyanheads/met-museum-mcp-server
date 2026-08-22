@@ -36,7 +36,7 @@ describe('metListDepartments', () => {
         { departmentId: 10, displayName: 'Egyptian Art' },
       ],
     });
-    const text = blocks[0].text as string;
+    const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('11');
     expect(text).toContain('European Paintings');
     expect(text).toContain('10');

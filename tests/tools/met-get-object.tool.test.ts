@@ -135,11 +135,11 @@ describe('metGetObject', () => {
   it('returns fetched objects on success', async () => {
     mockGetObject.mockResolvedValue(sampleRecord);
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: metGetObject.errors });
     const input = metGetObject.input.parse({ objectIDs: [437980] });
     const result = await metGetObject.handler(input, ctx);
     expect(result.objects).toHaveLength(1);
-    expect(result.objects[0].objectID).toBe(437980);
+    expect(result.objects[0]?.objectID).toBe(437980);
     expect(result.failed).toHaveLength(0);
   });
 
@@ -152,12 +152,12 @@ describe('metGetObject', () => {
       .mockResolvedValueOnce(sampleRecord) // first ID succeeds
       .mockResolvedValue(null); // second ID is 404
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: metGetObject.errors });
     const input = metGetObject.input.parse({ objectIDs: [437980, 999999] });
     const result = await metGetObject.handler(input, ctx);
     expect(result.objects).toHaveLength(1);
     expect(result.failed).toHaveLength(1);
-    expect(result.failed[0].objectID).toBe(999999);
+    expect(result.failed[0]?.objectID).toBe(999999);
   });
 
   it('throws all_not_found when every fetch returns 404', async () => {
@@ -198,12 +198,12 @@ describe('metGetObject', () => {
   it('handles partial success — some succeed, some throw', async () => {
     mockGetObject.mockResolvedValueOnce(sampleRecord).mockRejectedValue(new Error('network error'));
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: metGetObject.errors });
     const input = metGetObject.input.parse({ objectIDs: [437980, 999999] });
     const result = await metGetObject.handler(input, ctx);
     expect(result.objects).toHaveLength(1);
     expect(result.failed).toHaveLength(1);
-    expect(result.failed[0].objectID).toBe(999999);
+    expect(result.failed[0]?.objectID).toBe(999999);
   });
 
   it('returns objects[] in input order when fetches complete out of order', async () => {
@@ -211,7 +211,7 @@ describe('metGetObject', () => {
     const ids = [104, 100, 106, 102];
     mockCompletionInReverseOrder(ids);
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: metGetObject.errors });
     const input = metGetObject.input.parse({ objectIDs: ids });
     const result = await metGetObject.handler(input, ctx);
 
@@ -226,7 +226,7 @@ describe('metGetObject', () => {
     const ids = [100, 201, 102, 202, 104];
     mockCompletionInReverseOrder(ids, new Set([201, 202]));
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: metGetObject.errors });
     const input = metGetObject.input.parse({ objectIDs: ids });
     const result = await metGetObject.handler(input, ctx);
 
@@ -239,7 +239,7 @@ describe('metGetObject', () => {
       objects: [sampleRecord],
       failed: [],
     });
-    const text = blocks[0].text as string;
+    const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('Wheat Field with Cypresses');
     expect(text).toContain('isPublicDomain');
     expect(text).toContain('hasCC0Image');
@@ -253,14 +253,14 @@ describe('metGetObject', () => {
       objects: [sampleRecord],
       failed: [{ objectID: 99, error: 'Not found.' }],
     });
-    const text = blocks[0].text as string;
+    const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('Failed Fetches');
     expect(text).toContain('99');
   });
 
   it('format renders a placeholder for every empty field (sparse object 1 shape)', () => {
     const blocks = metGetObject.format!({ objects: [sparseRecord], failed: [] });
-    const text = blocks[0].text as string;
+    const text = (blocks[0] as { text: string }).text;
     // Every otherwise-dropped empty field must surface a placeholder in content[] —
     // structuredContent already carries these values; content[] must not lose them.
     expect(text).toContain('## (Untitled) — Object 1');

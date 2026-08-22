@@ -122,7 +122,7 @@ export const metSearchCollections = tool('met_search_collections', {
       ),
     objectIDs: z
       .array(z.number().int().describe('A Met object ID.'))
-      .describe('Object IDs for the first `limit` results.'),
+      .describe('Object IDs for this page, up to `limit` results.'),
     returned: z
       .number()
       .int()

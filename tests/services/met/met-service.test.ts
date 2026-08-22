@@ -6,25 +6,34 @@
  */
 
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, timeout } from '@cyanheads/mcp-ts-core/errors';
 import { createInMemoryStorage, createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { metSearchCollections } from '@/mcp-server/tools/definitions/met-search-collections.tool.js';
 import { getMetService, initMetService } from '@/services/met/met-service.js';
 
-/** Minimal Response stub carrying just what MetService reads (ok/status/json/text). */
-function jsonResponse(body: unknown, init?: { ok?: boolean; status?: number }): Response {
-  return {
-    ok: init?.ok ?? true,
-    status: init?.status ?? 200,
-    json: async () => body,
-    text: async () => JSON.stringify(body),
-  } as unknown as Response;
+/** JSON response with a real body stream for fetchWithTimeout's deadline wrapper. */
+function jsonResponse(body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    headers: { 'content-type': 'application/json' },
+  });
 }
 
 /** A `/search` payload with `count` sequential IDs (1..count) and a reported total. */
 function idsResponse(total: number, count = total): Response {
   return jsonResponse({ total, objectIDs: Array.from({ length: count }, (_, i) => i + 1) });
+}
+
+/** A real streaming response whose body fails after headers with the supplied error. */
+function bodyFailureResponse(error: unknown): Response {
+  return new Response(
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.error(error);
+      },
+    }),
+    { headers: { 'content-type': 'application/json' } },
+  );
 }
 
 describe('MetService', () => {
@@ -104,13 +113,9 @@ describe('MetService', () => {
 
   describe('search — fail-fast on a deterministic timeout (#11)', () => {
     it('does not retry an aborted (timed-out) search and surfaces search_timeout with recovery', async () => {
-      // The manual-timeout path throws a raw AbortError; the fix reclassifies it to a
-      // non-retryable McpError so withRetry stops after one attempt (the old path
-      // treated the raw abort as transient and retried it four times).
-      const abortErr = Object.assign(new Error('The operation was aborted'), {
-        name: 'AbortError',
-      });
-      fetchMock.mockRejectedValue(abortErr);
+      // fetchWithTimeout classifies its own deadline before the service adds the
+      // search-specific reason and non-retryable recovery contract.
+      fetchMock.mockRejectedValue(timeout('Upstream request timed out.'));
       const ctx = createMockContext({ errors: metSearchCollections.errors });
 
       const err = await getMetService()
@@ -122,6 +127,17 @@ describe('MetService', () => {
       expect(err.data.reason).toBe('search_timeout');
       expect(err.data.retryable).toBe(false);
       expect(err.data.recovery.hint).toContain('Narrow the query');
+    });
+
+    it('also classifies a timeout while reading the response body as search_timeout', async () => {
+      fetchMock.mockResolvedValue(bodyFailureResponse(timeout('Upstream request timed out.')));
+      const ctx = createMockContext({ errors: metSearchCollections.errors });
+
+      await expect(getMetService().search({ q: 'the', limit: 20 }, ctx)).rejects.toMatchObject({
+        code: JsonRpcErrorCode.Timeout,
+        data: { reason: 'search_timeout', retryable: false },
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
     });
 
     it('a normal-latency search still succeeds in one fetch (no retry-behavior regression)', async () => {

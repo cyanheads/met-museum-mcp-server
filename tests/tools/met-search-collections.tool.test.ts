@@ -41,7 +41,7 @@ describe('metSearchCollections', () => {
       nextOffset: 3,
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: metSearchCollections.errors });
     const input = metSearchCollections.input.parse({ q: 'Van Gogh', limit: 3 });
     const result = await metSearchCollections.handler(input, ctx);
     expect(result.total).toBe(100);
@@ -77,12 +77,15 @@ describe('metSearchCollections', () => {
   it('invalid_date_range (missing pair) carries the recovery hint on data.recovery.hint', async () => {
     const ctx = createMockContext({ errors: metSearchCollections.errors });
     const input = metSearchCollections.input.parse({ q: 'test', limit: 20, dateBegin: 1800 });
-    const err = await metSearchCollections.handler(input, ctx).catch((e) => e);
-    expect(err.code).toBe(JsonRpcErrorCode.ValidationError);
-    expect(err.data.reason).toBe('invalid_date_range');
-    expect(err.data.recovery.hint).toBe(
-      'Provide both dateBegin and dateEnd as integer years, with dateBegin ≤ dateEnd.',
-    );
+    await expect(Promise.resolve(metSearchCollections.handler(input, ctx))).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: {
+        reason: 'invalid_date_range',
+        recovery: {
+          hint: 'Provide both dateBegin and dateEnd as integer years, with dateBegin ≤ dateEnd.',
+        },
+      },
+    });
   });
 
   it('invalid_date_range (dateBegin > dateEnd) carries the recovery hint on data.recovery.hint', async () => {
@@ -93,12 +96,15 @@ describe('metSearchCollections', () => {
       dateBegin: 1900,
       dateEnd: 1800,
     });
-    const err = await metSearchCollections.handler(input, ctx).catch((e) => e);
-    expect(err.code).toBe(JsonRpcErrorCode.ValidationError);
-    expect(err.data.reason).toBe('invalid_date_range');
-    expect(err.data.recovery.hint).toBe(
-      'Provide both dateBegin and dateEnd as integer years, with dateBegin ≤ dateEnd.',
-    );
+    await expect(Promise.resolve(metSearchCollections.handler(input, ctx))).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: {
+        reason: 'invalid_date_range',
+        recovery: {
+          hint: 'Provide both dateBegin and dateEnd as integer years, with dateBegin ≤ dateEnd.',
+        },
+      },
+    });
   });
 
   // --- #7: departmentId validated before searching ---
@@ -123,18 +129,22 @@ describe('metSearchCollections', () => {
   it('rejects a gap departmentId (2) with invalid_department and never searches', async () => {
     const ctx = createMockContext({ errors: metSearchCollections.errors });
     const input = metSearchCollections.input.parse({ q: 'painting', departmentId: 2, limit: 3 });
-    const err = await metSearchCollections.handler(input, ctx).catch((e) => e);
-    expect(err.code).toBe(JsonRpcErrorCode.ValidationError);
-    expect(err.data.reason).toBe('invalid_department');
-    expect(err.data.recovery.hint).toContain('met_list_departments');
+    await expect(Promise.resolve(metSearchCollections.handler(input, ctx))).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: {
+        reason: 'invalid_department',
+        recovery: { hint: expect.stringContaining('met_list_departments') },
+      },
+    });
     expect(mockSearch).not.toHaveBeenCalled();
   });
 
   it('rejects a high invalid departmentId (999) with invalid_department', async () => {
     const ctx = createMockContext({ errors: metSearchCollections.errors });
     const input = metSearchCollections.input.parse({ q: 'painting', departmentId: 999, limit: 3 });
-    const err = await metSearchCollections.handler(input, ctx).catch((e) => e);
-    expect(err.data.reason).toBe('invalid_department');
+    await expect(Promise.resolve(metSearchCollections.handler(input, ctx))).rejects.toMatchObject({
+      data: { reason: 'invalid_department' },
+    });
     expect(mockSearch).not.toHaveBeenCalled();
   });
 
@@ -153,8 +163,9 @@ describe('metSearchCollections', () => {
       departmentId: 11,
       limit: 20,
     });
-    const err = await metSearchCollections.handler(input, ctx).catch((e) => e);
-    expect(err.data.reason).toBe('no_results');
+    await expect(Promise.resolve(metSearchCollections.handler(input, ctx))).rejects.toMatchObject({
+      data: { reason: 'no_results' },
+    });
   });
 
   // --- #9: offset paging plumbed through the handler ---
@@ -168,7 +179,7 @@ describe('metSearchCollections', () => {
       remaining: 48,
       nextOffset: 52,
     });
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: metSearchCollections.errors });
     const input = metSearchCollections.input.parse({ q: 'cat', limit: 2, offset: 50 });
     const result = await metSearchCollections.handler(input, ctx);
     expect(mockSearch).toHaveBeenCalledWith(expect.objectContaining({ offset: 50, limit: 2 }), ctx);
@@ -185,7 +196,7 @@ describe('metSearchCollections', () => {
       remaining: 0,
       nextOffset: null,
     });
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: metSearchCollections.errors });
     const input = metSearchCollections.input.parse({ q: 'rare', limit: 20 });
     await metSearchCollections.handler(input, ctx);
     expect(mockSearch).toHaveBeenCalledWith(expect.objectContaining({ offset: 0 }), ctx);
@@ -201,7 +212,7 @@ describe('metSearchCollections', () => {
       nextOffset: null,
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: metSearchCollections.errors });
     const input = metSearchCollections.input.parse({
       q: 'painting',
       geoLocation: ['France', 'Spain'],
@@ -226,7 +237,7 @@ describe('metSearchCollections', () => {
       nextOffset: 3,
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: metSearchCollections.errors });
     const input = metSearchCollections.input.parse({ q: 'Rembrandt', isOnView: true, limit: 3 });
     const result = await metSearchCollections.handler(input, ctx);
     expect(mockSearch).toHaveBeenCalledWith(expect.objectContaining({ isOnView: true }), ctx);
@@ -242,7 +253,7 @@ describe('metSearchCollections', () => {
       remaining: 498,
       nextOffset: 2,
     });
-    const text = blocks[0].text as string;
+    const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('500');
     expect(text).toContain('1001');
     expect(text).toContain('1002');
@@ -260,7 +271,7 @@ describe('metSearchCollections', () => {
       remaining: 0,
       nextOffset: null,
     });
-    const text = blocks[0].text as string;
+    const text = (blocks[0] as { text: string }).text;
     // truncated: false must render an explicit marker rather than silently vanishing.
     expect(text).toContain('(complete)');
     expect(text).toContain('Next offset:** none');
