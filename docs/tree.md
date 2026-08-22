@@ -1,10 +1,9 @@
 # met-museum-mcp-server - Directory Structure
 
-Generated on: 2026-07-17 01:29:07
+Generated on: 2026-08-22 21:47:14
 
 ```text
 met-museum-mcp-server/
-├── .claude/
 ├── .claude-plugin/
 │   └── plugin.json
 ├── .codex-plugin/
@@ -15,6 +14,8 @@ met-museum-mcp-server/
 │   │   ├── bug_report.yml
 │   │   ├── config.yml
 │   │   └── feature_request.yml
+│   ├── CODE_OF_CONDUCT.md
+│   ├── CONTRIBUTING.md
 │   ├── FUNDING.yml
 │   └── SECURITY.md
 ├── .vscode/

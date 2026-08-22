@@ -6,7 +6,7 @@
     "url": "https://github.com/cyanheads/met-museum-mcp-server",
     "source": "github"
   },
-  "version": "0.2.5",
+  "version": "0.2.6",
   "remotes": [
     {
       "type": "streamable-http",
@@ -19,7 +19,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/met-museum-mcp-server",
       "runtimeHint": "bun",
-      "version": "0.2.5",
+      "version": "0.2.6",
       "packageArguments": [
         {
           "type": "positional",
@@ -48,7 +48,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/met-museum-mcp-server",
       "runtimeHint": "bun",
-      "version": "0.2.5",
+      "version": "0.2.6",
       "packageArguments": [
         {
           "type": "positional",
@@ -80,6 +80,13 @@
           "format": "string",
           "isRequired": false,
           "default": "/mcp"
+        },
+        {
+          "name": "MCP_SESSION_MODE",
+          "description": "HTTP session mode: auto, stateful, or stateless. This server explicitly sets stateless; the framework schema default is auto.",
+          "format": "string",
+          "isRequired": false,
+          "default": "stateless"
         },
         {
           "name": "MCP_AUTH_MODE",
