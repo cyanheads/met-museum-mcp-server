@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.0](changelog/0.3.x/0.3.0.md) — 2026-09-09 · ⚠️ Breaking
+
+true-only isPublicDomain/isHighlight filters, blank-input rejection, and offset-beyond-result-set signaling for met_search_collections
+
 ## [0.2.6](changelog/0.2.x/0.2.6.md) — 2026-08-22
 
 MCP 2026-07-28 support, explicit stateless HTTP serving, and current schema, error, and fetch behavior through @cyanheads/mcp-ts-core ^0.12.3

@@ -1,6 +1,6 @@
 # met-museum-mcp-server - Directory Structure
 
-Generated on: 2026-08-22 21:47:14
+Generated on: 2026-09-09 22:55:26
 
 ```text
 met-museum-mcp-server/
@@ -24,6 +24,7 @@ met-museum-mcp-server/
 ├── changelog/
 │   ├── 0.1.x/
 │   ├── 0.2.x/
+│   ├── 0.3.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
@@ -114,6 +115,8 @@ met-museum-mcp-server/
 │   │   │   └── server-json.md
 │   │   └── SKILL.md
 │   ├── release-and-publish/
+│   │   └── SKILL.md
+│   ├── release-pr-review/
 │   │   └── SKILL.md
 │   ├── report-issue-framework/
 │   │   └── SKILL.md
