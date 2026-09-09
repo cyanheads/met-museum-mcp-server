@@ -18,9 +18,15 @@ export interface SearchInput {
   departmentId?: number | undefined;
   geoLocation?: string[] | undefined;
   hasImages?: boolean | undefined;
-  isHighlight?: boolean | undefined;
+  /**
+   * Opt-in only. The Met search index is unsound on the `false` arm — it returns
+   * objects whose own record reports `isHighlight: true` — so the type admits
+   * `true` alone and the unsound value can never reach `buildSearchUrl`.
+   */
+  isHighlight?: true | undefined;
   isOnView?: boolean | undefined;
-  isPublicDomain?: boolean | undefined;
+  /** Opt-in only, for the same reason as `isHighlight`. */
+  isPublicDomain?: true | undefined;
   limit: number;
   medium?: string | undefined;
   offset?: number | undefined;
@@ -32,6 +38,12 @@ export interface SearchResult {
   /** The next `offset` to pass to continue paging, or `null` when the result set is exhausted. */
   nextOffset: number | null;
   objectIDs: number[];
+  /**
+   * The resolved offset this page was sliced at (the caller's `offset` after its
+   * default of 0). Echoed so a caller can read `offset >= total` and tell an empty
+   * page caused by an out-of-range offset from a genuine final page.
+   */
+  offset: number;
   /** Matching IDs after this page (`total - (offset + returned)`), floored at 0. */
   remaining: number;
   returned: number;
@@ -149,6 +161,7 @@ export class MetService {
             truncated,
             remaining,
             nextOffset: truncated ? consumed : null,
+            offset,
           };
         } catch (error) {
           if (error instanceof McpError && error.code === JsonRpcErrorCode.Timeout) {

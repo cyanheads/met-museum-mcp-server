@@ -109,6 +109,55 @@ describe('MetService', () => {
       expect(result.remaining).toBe(0);
       expect(result.nextOffset).toBeNull();
     });
+
+    // --- #17: the resolved offset is echoed on the result ---
+
+    it('echoes the requested offset on the result', async () => {
+      fetchMock.mockResolvedValue(idsResponse(100));
+      const result = await getMetService().search(
+        { q: 'cat', limit: 10, offset: 20 },
+        createMockContext(),
+      );
+      expect(result.offset).toBe(20);
+    });
+
+    it('echoes the applied default of 0 when offset is omitted', async () => {
+      fetchMock.mockResolvedValue(idsResponse(5));
+      const result = await getMetService().search({ q: 'rare', limit: 20 }, createMockContext());
+      expect(result.offset).toBe(0);
+    });
+
+    it('echoes an offset that ran past the end alongside the empty page', async () => {
+      fetchMock.mockResolvedValue(idsResponse(25));
+      const result = await getMetService().search(
+        { q: 'cat', limit: 10, offset: 999 },
+        createMockContext(),
+      );
+      // total is knowable from the same result, so offset >= total is directly readable.
+      expect(result.offset).toBe(999);
+      expect(result.total).toBe(25);
+    });
+  });
+
+  describe('buildSearchUrl — omitted optional filters stay off the request (#13)', () => {
+    it('omits medium and geoLocation entirely when they are not supplied', async () => {
+      fetchMock.mockResolvedValue(idsResponse(3));
+      await getMetService().search({ q: 'cat', limit: 10 }, createMockContext());
+      const url = new URL(String(fetchMock.mock.calls[0]?.[0]));
+      expect(url.searchParams.get('q')).toBe('cat');
+      expect(url.searchParams.has('medium')).toBe(false);
+      expect(url.searchParams.has('geoLocation')).toBe(false);
+    });
+
+    it('appends every geoLocation value when they are supplied', async () => {
+      fetchMock.mockResolvedValue(idsResponse(3));
+      await getMetService().search(
+        { q: 'cat', limit: 10, geoLocation: ['France', 'Egypt'] },
+        createMockContext(),
+      );
+      const url = new URL(String(fetchMock.mock.calls[0]?.[0]));
+      expect(url.searchParams.getAll('geoLocation')).toEqual(['France', 'Egypt']);
+    });
   });
 
   describe('search — fail-fast on a deterministic timeout (#11)', () => {

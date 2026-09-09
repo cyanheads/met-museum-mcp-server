@@ -14,7 +14,8 @@ export const metSearchCollections = tool('met_search_collections', {
     'Returns the total match count and a page of matching object IDs, which met_get_object resolves to full records. ' +
     'Relevance is keyword-based, not semantic; department and geographic filters narrow results more than a longer query. ' +
     'The medium parameter maps to the classification field (pass "Paintings", "Drawings", etc., not material descriptions like "Oil on canvas"). ' +
-    'isPublicDomain guarantees CC0-licensed images; hasImages also includes copyrighted works. ' +
+    'isPublicDomain selects CC0-licensed images but is a partial index — it omits genuinely public-domain objects and returns a few that do not match the query, so verify each record; hasImages also includes copyrighted works. ' +
+    'isPublicDomain and isHighlight are opt-in filters that accept true only; the upstream index is unsound on the false arm. ' +
     'isOnView restricts results to works currently on display in a Met gallery.',
   annotations: { readOnlyHint: true, idempotentHint: true },
   input: z.object({
@@ -29,21 +30,28 @@ export const metSearchCollections = tool('met_search_collections', {
       .optional()
       .describe(
         'When true, restricts results to objects that have at least one associated image, including copyrighted works whose images cannot be reproduced. ' +
-          'isPublicDomain is the filter for freely reusable CC0 images.',
+          'isPublicDomain is the nearest filter for freely reusable CC0 images, but it is partial — confirm per object from the isPublicDomain and hasCC0Image fields on met_get_object.',
       ),
     isPublicDomain: z
-      .boolean()
+      .literal(true, {
+        error: 'isPublicDomain accepts true only — omit the filter instead of passing false.',
+      })
       .optional()
       .describe(
-        'When true, restricts results to objects released under CC0 open access — free to use without permission or attribution. ' +
-          'These objects return direct high-resolution image URLs in met_get_object. ' +
-          'Combining with departmentId works but returns far fewer results, since the search index covers only a subset of public-domain objects per department.',
+        'Opt-in filter, true only — omit it rather than passing false, which the upstream index answers unsoundly. ' +
+          'Selects objects released under CC0 open access, which return direct high-resolution image URLs in met_get_object. ' +
+          'Its results are not a subset of the same search run without it: it omits objects whose own record reports isPublicDomain true, and adds a few CC0 objects that do not match the query at all — check each returned record against the query before presenting it. ' +
+          'Combining it with departmentId narrows it further; when a search returns nothing, retry without the filter.',
       ),
     isHighlight: z
-      .boolean()
+      .literal(true, {
+        error: 'isHighlight accepts true only — omit the filter instead of passing false.',
+      })
       .optional()
       .describe(
-        'When true, restricts to objects the Met has designated as highlights — major works central to the collection.',
+        'Opt-in filter, true only — omit it rather than passing false, which the upstream index answers unsoundly. ' +
+          'Selects objects the Met has designated as highlights — major works central to the collection. ' +
+          'Like isPublicDomain its results are not a subset of the unfiltered search: it omits objects whose own record reports isHighlight true, and adds a few highlights that do not match the query.',
       ),
     isOnView: z
       .boolean()
@@ -147,6 +155,13 @@ export const metSearchCollections = tool('met_search_collections', {
       .describe(
         'The offset to pass on the next call to continue paging, or null when the result set is exhausted (truncated is false).',
       ),
+    offset: z
+      .number()
+      .int()
+      .describe(
+        'The resolved offset this page was read from — the offset input after its default of 0. ' +
+          'Compare it against total: when offset is greater than or equal to total the page is empty because the offset ran past the end of the result set, not because the query has nothing left to return.',
+      ),
   }),
   errors: [
     {
@@ -161,6 +176,13 @@ export const metSearchCollections = tool('met_search_collections', {
       code: JsonRpcErrorCode.ValidationError,
       when: 'dateBegin or dateEnd is provided without the other, or dateBegin > dateEnd.',
       recovery: 'Provide both dateBegin and dateEnd as integer years, with dateBegin ≤ dateEnd.',
+    },
+    {
+      reason: 'invalid_filter',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'q is whitespace-only, or medium or geoLocation was supplied blank — an empty array, or an entry with no non-whitespace characters.',
+      recovery:
+        'Supply a non-blank value for the named field, or omit the optional filter entirely.',
     },
     {
       reason: 'invalid_department',
@@ -194,6 +216,44 @@ export const metSearchCollections = tool('met_search_collections', {
         'invalid_date_range',
         `dateBegin (${input.dateBegin}) must be ≤ dateEnd (${input.dateEnd}).`,
         ctx.recoveryFor('invalid_date_range'),
+      );
+    }
+
+    /**
+     * Reject blank filter values before any upstream call. A blank value is not an
+     * absent one to the Met search index: a forwarded blank parameter returns a
+     * different, smaller result set than the same query unfiltered, and a blank the
+     * URL builder drops silently widens the search instead. Neither outcome is
+     * distinguishable from a correct answer at the call site, so the only safe
+     * handling is to refuse. Ordered after the date-range checks so a request
+     * invalid on both counts reports the same fault it reports today.
+     */
+    if (input.q.trim() === '') {
+      throw ctx.fail(
+        'invalid_filter',
+        'q is whitespace-only — it must contain at least one non-whitespace character.',
+        ctx.recoveryFor('invalid_filter'),
+      );
+    }
+    if (input.medium?.trim() === '') {
+      throw ctx.fail(
+        'invalid_filter',
+        'medium is blank — supply a classification name such as "Paintings", or omit the filter.',
+        ctx.recoveryFor('invalid_filter'),
+      );
+    }
+    if (input.geoLocation?.length === 0) {
+      throw ctx.fail(
+        'invalid_filter',
+        'geoLocation is an empty array — supply at least one location, or omit the filter.',
+        ctx.recoveryFor('invalid_filter'),
+      );
+    }
+    if (input.geoLocation?.some((location) => location.trim() === '')) {
+      throw ctx.fail(
+        'invalid_filter',
+        'geoLocation contains a blank entry — every value must be a non-blank location name.',
+        ctx.recoveryFor('invalid_filter'),
       );
     }
 
@@ -239,10 +299,23 @@ export const metSearchCollections = tool('met_search_collections', {
     );
 
     if (result.total === 0) {
+      /**
+       * isPublicDomain is the filter most likely to have zeroed an otherwise-matching
+       * query, and the generic hint doesn't name it — so callers retry new keywords
+       * against the same filter and fail identically. The hint has to be built here
+       * rather than declared: ctx.recoveryFor resolves a static string keyed only by
+       * the reason and cannot branch on an input value.
+       */
       throw ctx.fail(
         'no_results',
         `No objects matched the query "${input.q}" with the specified filters.`,
-        ctx.recoveryFor('no_results'),
+        input.isPublicDomain === true
+          ? {
+              recovery: {
+                hint: 'Retry without isPublicDomain — the Met search index covers only a subset of public-domain objects and under-reports true matches. CC0 status stays verifiable per object from the isPublicDomain field on met_get_object.',
+              },
+            }
+          : ctx.recoveryFor('no_results'),
       );
     }
 
@@ -250,9 +323,22 @@ export const metSearchCollections = tool('met_search_collections', {
   },
 
   format: (result) => {
+    /**
+     * Three states, not two. `(complete)` claims a page finished the result set,
+     * which is wrong for a page that is empty because the offset ran past the end.
+     * The marker is gated on the resolved `offset` against `total` — the condition
+     * itself — rather than on `returned === 0`, which is also true of a page the
+     * upstream answered with a null ID array against a positive total.
+     */
+    const marker = result.truncated
+      ? ' (truncated)'
+      : result.offset >= result.total
+        ? ' (offset beyond result set)'
+        : ' (complete)';
     const lines: string[] = [
       `**Total matches:** ${result.total}`,
-      `**Returned IDs:** ${result.returned}${result.truncated ? ' (truncated)' : ' (complete)'}`,
+      `**Returned IDs:** ${result.returned}${marker}`,
+      `**Offset:** ${result.offset}`,
       `**Remaining:** ${result.remaining}`,
       `**Next offset:** ${result.nextOffset ?? 'none'}`,
       '',

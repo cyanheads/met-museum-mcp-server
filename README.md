@@ -54,12 +54,14 @@ Search the Met collection by keyword and optional filters.
 - Filter by date range (integer years, negative = BCE)
 - Filter by medium/classification (e.g., `"Paintings"`, `"Sculptures"`, `"Ceramics"`) — maps to the classification field, not material descriptions
 - Filter by geographic origin — country, region, or city; multiple values are AND-combined
-- `isPublicDomain=true` restricts to CC0 open-access objects (guaranteed usable image URLs)
+- `isPublicDomain=true` selects CC0 open-access objects. It is a partial index, not exhaustive coverage — it omits objects whose own record reports `isPublicDomain: true`, so confirm CC0 status per object from `met_get_object`
+- Every boolean filter also returns a few objects that do not match the query — see [#21](https://github.com/cyanheads/met-museum-mcp-server/issues/21); check each returned record against what you searched for
 - `hasImages=true` includes any object with images (includes copyrighted works without reusable URLs)
 - `isHighlight=true` restricts to collection highlights designated by the Met
+- `isPublicDomain` and `isHighlight` accept `true` only. The upstream index is unsound on the `false` arm — it returns objects whose own record contradicts the filter — so `false` is rejected; omit the filter instead. `hasImages` and `isOnView` are unaffected and remain plain booleans
 - `isOnView=true` restricts to objects currently on display in a Met gallery
 - Paginate past `limit` with `offset` (default 0) — a broad, unfiltered query carries the same timeout risk on every page as on the first
-- Returns total match count, truncation indicator, `remaining` count, `nextOffset` for the next page (`null` once exhausted), and up to `limit` object IDs (default 20, max 500)
+- Returns total match count, truncation indicator, `remaining` count, `nextOffset` for the next page (`null` once exhausted), the resolved `offset` this page was read from, and up to `limit` object IDs (default 20, max 500)
 - Returned IDs resolve to full records via `met_get_object` (up to 20 per call)
 
 ---
@@ -100,7 +102,7 @@ Agent-friendly output:
 
 - Provenance on every record — `isPublicDomain` and `hasCC0Image` flags distinguish CC0 objects from works with inaccessible images, so agents can reason about what they can actually display
 - Partial failure reporting — `met_get_object` returns `objects` and `failed` arrays so callers receive successful records alongside structured per-ID error context
-- Truncation signaling — `met_search_collections` returns `total`, `returned`, `truncated`, `remaining`, and `nextOffset` fields so agents know when to refine filters, increase `limit`, or page further with `offset`
+- Truncation signaling — `met_search_collections` returns `total`, `returned`, `truncated`, `remaining`, `nextOffset`, and the resolved `offset` fields so agents know when to refine filters, increase `limit`, or page further with `offset`; `offset >= total` marks a page that is empty because the offset ran past the end rather than because the query is exhausted
 
 ## Getting started
 

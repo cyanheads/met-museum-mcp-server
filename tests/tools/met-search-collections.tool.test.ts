@@ -25,7 +25,14 @@ const VALID_DEPARTMENT_IDS = new Set([
 
 describe('metSearchCollections', () => {
   beforeEach(() => {
-    vi.clearAllMocks();
+    /**
+     * resetAllMocks, not clearAllMocks: clearing wipes call records but leaves
+     * implementations in place, so a `mockResolvedValue` set by one test leaks into
+     * the next and can make an unconfigured test pass on a neighbour's fixture.
+     * Resetting drops the implementations too, so any test that forgets to stage
+     * `mockSearch` fails loudly instead of quietly asserting the wrong data.
+     */
+    vi.resetAllMocks();
     // Default: a fully-populated department set. Individual tests exercising an
     // invalid ID simply pass one not in this set (2, 999).
     mockGetValidDepartmentIds.mockResolvedValue(VALID_DEPARTMENT_IDS);
@@ -39,6 +46,7 @@ describe('metSearchCollections', () => {
       truncated: true,
       remaining: 97,
       nextOffset: 3,
+      offset: 0,
     });
 
     const ctx = createMockContext({ errors: metSearchCollections.errors });
@@ -60,6 +68,7 @@ describe('metSearchCollections', () => {
       truncated: false,
       remaining: 0,
       nextOffset: null,
+      offset: 0,
     });
 
     const ctx = createMockContext({ errors: metSearchCollections.errors });
@@ -117,6 +126,7 @@ describe('metSearchCollections', () => {
       truncated: true,
       remaining: 40,
       nextOffset: 2,
+      offset: 0,
     });
     const ctx = createMockContext({ errors: metSearchCollections.errors });
     const input = metSearchCollections.input.parse({ q: 'painting', departmentId: 11, limit: 2 });
@@ -156,6 +166,7 @@ describe('metSearchCollections', () => {
       truncated: false,
       remaining: 0,
       nextOffset: null,
+      offset: 0,
     });
     const ctx = createMockContext({ errors: metSearchCollections.errors });
     const input = metSearchCollections.input.parse({
@@ -178,6 +189,7 @@ describe('metSearchCollections', () => {
       truncated: true,
       remaining: 48,
       nextOffset: 52,
+      offset: 50,
     });
     const ctx = createMockContext({ errors: metSearchCollections.errors });
     const input = metSearchCollections.input.parse({ q: 'cat', limit: 2, offset: 50 });
@@ -195,6 +207,7 @@ describe('metSearchCollections', () => {
       truncated: false,
       remaining: 0,
       nextOffset: null,
+      offset: 0,
     });
     const ctx = createMockContext({ errors: metSearchCollections.errors });
     const input = metSearchCollections.input.parse({ q: 'rare', limit: 20 });
@@ -210,6 +223,7 @@ describe('metSearchCollections', () => {
       truncated: false,
       remaining: 0,
       nextOffset: null,
+      offset: 0,
     });
 
     const ctx = createMockContext({ errors: metSearchCollections.errors });
@@ -235,6 +249,7 @@ describe('metSearchCollections', () => {
       truncated: true,
       remaining: 114,
       nextOffset: 3,
+      offset: 0,
     });
 
     const ctx = createMockContext({ errors: metSearchCollections.errors });
@@ -252,6 +267,7 @@ describe('metSearchCollections', () => {
       truncated: true,
       remaining: 498,
       nextOffset: 2,
+      offset: 0,
     });
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('500');
@@ -270,11 +286,281 @@ describe('metSearchCollections', () => {
       truncated: false,
       remaining: 0,
       nextOffset: null,
+      offset: 0,
     });
     const text = (blocks[0] as { text: string }).text;
     // truncated: false must render an explicit marker rather than silently vanishing.
     expect(text).toContain('(complete)');
     expect(text).toContain('Next offset:** none');
     expect(text).toContain('Remaining:** 0');
+  });
+
+  // --- #12: isPublicDomain and isHighlight are true-only opt-ins ---
+  // The Met search index is only sound on the `true` arm of each; the `false` arm
+  // returns objects whose own record contradicts the filter. Narrowing at the
+  // schema is what puts the constraint in `tools/list`, so a model never builds
+  // the bad call in the first place.
+
+  it('rejects isPublicDomain: false at the input schema, naming the remedy', () => {
+    // The schema rejection surfaces as a bare -32602 with no recovery hint, so the
+    // Zod message is the only guidance the caller gets — it has to say what to do.
+    expect(() =>
+      metSearchCollections.input.parse({ q: 'sunflower', isPublicDomain: false }),
+    ).toThrow(/isPublicDomain accepts true only — omit the filter/);
+  });
+
+  it('rejects isHighlight: false at the input schema, naming the remedy', () => {
+    expect(() => metSearchCollections.input.parse({ q: 'sunflower', isHighlight: false })).toThrow(
+      /isHighlight accepts true only — omit the filter/,
+    );
+  });
+
+  it('still accepts isPublicDomain: true and forwards it to the service', async () => {
+    mockSearch.mockResolvedValue({
+      total: 4,
+      objectIDs: [437261, 436529],
+      returned: 2,
+      truncated: true,
+      remaining: 2,
+      nextOffset: 2,
+      offset: 0,
+    });
+    const ctx = createMockContext({ errors: metSearchCollections.errors });
+    const input = metSearchCollections.input.parse({
+      q: 'sunflower',
+      isPublicDomain: true,
+      limit: 2,
+    });
+    const result = await metSearchCollections.handler(input, ctx);
+    expect(mockSearch).toHaveBeenCalledWith(expect.objectContaining({ isPublicDomain: true }), ctx);
+    expect(result.total).toBe(4);
+  });
+
+  it('still accepts isHighlight: true and forwards it to the service', async () => {
+    mockSearch.mockResolvedValue({
+      total: 3,
+      objectIDs: [1, 2, 3],
+      returned: 3,
+      truncated: false,
+      remaining: 0,
+      nextOffset: null,
+      offset: 0,
+    });
+    const ctx = createMockContext({ errors: metSearchCollections.errors });
+    const input = metSearchCollections.input.parse({ q: 'vase', isHighlight: true, limit: 20 });
+    await metSearchCollections.handler(input, ctx);
+    expect(mockSearch).toHaveBeenCalledWith(expect.objectContaining({ isHighlight: true }), ctx);
+  });
+
+  it('leaves hasImages and isOnView as plain two-valued booleans', () => {
+    // #12 narrows only the two filters with a reproduced false-arm defect.
+    expect(() =>
+      metSearchCollections.input.parse({ q: 'vase', hasImages: false, isOnView: false }),
+    ).not.toThrow();
+  });
+
+  // --- #13: blank filter values are rejected in the handler ---
+  // A blank value is not an absent one upstream: the Met index answers a blank
+  // parameter with a different result set, so there is no safe value to forward.
+
+  const expectInvalidFilter = async (raw: Record<string, unknown>, field: string) => {
+    const ctx = createMockContext({ errors: metSearchCollections.errors });
+    const input = metSearchCollections.input.parse(raw);
+    const err = await Promise.resolve(metSearchCollections.handler(input, ctx)).catch((e) => e);
+    expect(err).toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: {
+        reason: 'invalid_filter',
+        recovery: {
+          hint: 'Supply a non-blank value for the named field, or omit the optional filter entirely.',
+        },
+      },
+    });
+    expect(err.message).toContain(field);
+    expect(mockSearch).not.toHaveBeenCalled();
+  };
+
+  it('rejects a whitespace-only q with invalid_filter naming the field', async () => {
+    await expectInvalidFilter({ q: '   ', limit: 3 }, 'q');
+  });
+
+  it('rejects a blank medium with invalid_filter naming the field', async () => {
+    await expectInvalidFilter({ q: 'sunflower', medium: '', limit: 3 }, 'medium');
+  });
+
+  it('rejects a whitespace-only medium with invalid_filter', async () => {
+    await expectInvalidFilter({ q: 'sunflower', medium: '   ', limit: 3 }, 'medium');
+  });
+
+  it('rejects an empty geoLocation array with invalid_filter', async () => {
+    await expectInvalidFilter({ q: 'sunflower', geoLocation: [], limit: 3 }, 'geoLocation');
+  });
+
+  it('rejects a geoLocation array whose only element is blank', async () => {
+    await expectInvalidFilter({ q: 'sunflower', geoLocation: [''], limit: 3 }, 'geoLocation');
+  });
+
+  it('rejects a geoLocation array mixing a valid element with a blank one', async () => {
+    // Depth case: the blank hides behind a valid sibling, so an all-blank check misses it.
+    await expectInvalidFilter(
+      { q: 'sunflower', geoLocation: ['France', ''], limit: 3 },
+      'geoLocation',
+    );
+  });
+
+  it('accepts a q with meaningful content and incidental surrounding whitespace', async () => {
+    mockSearch.mockResolvedValue({
+      total: 97,
+      objectIDs: [1],
+      returned: 1,
+      truncated: true,
+      remaining: 96,
+      nextOffset: 1,
+      offset: 0,
+    });
+    const ctx = createMockContext({ errors: metSearchCollections.errors });
+    const input = metSearchCollections.input.parse({ q: '  sunflower  ', limit: 1 });
+    const result = await metSearchCollections.handler(input, ctx);
+    expect(mockSearch).toHaveBeenCalledWith(expect.objectContaining({ q: '  sunflower  ' }), ctx);
+    expect(result.total).toBe(97);
+  });
+
+  it('leaves an omitted medium and geoLocation unaffected', async () => {
+    mockSearch.mockResolvedValue({
+      total: 5,
+      objectIDs: [1, 2, 3, 4, 5],
+      returned: 5,
+      truncated: false,
+      remaining: 0,
+      nextOffset: null,
+      offset: 0,
+    });
+    const ctx = createMockContext({ errors: metSearchCollections.errors });
+    const input = metSearchCollections.input.parse({ q: 'sunflower', limit: 20 });
+    await metSearchCollections.handler(input, ctx);
+    expect(mockSearch).toHaveBeenCalledWith(
+      expect.objectContaining({ medium: undefined, geoLocation: undefined }),
+      ctx,
+    );
+  });
+
+  it('keeps invalid_date_range ahead of the blank-filter check', async () => {
+    // Ordering pin: a request invalid on both counts must still report the
+    // date-range fault it reports today.
+    const ctx = createMockContext({ errors: metSearchCollections.errors });
+    const input = metSearchCollections.input.parse({ q: '   ', dateBegin: 1800, limit: 3 });
+    await expect(Promise.resolve(metSearchCollections.handler(input, ctx))).rejects.toMatchObject({
+      data: { reason: 'invalid_date_range' },
+    });
+  });
+
+  // --- #17: an exhausted offset page is distinguishable from a real final page ---
+
+  it('echoes the resolved offset through the handler output', async () => {
+    mockSearch.mockResolvedValue({
+      total: 97,
+      objectIDs: [],
+      returned: 0,
+      truncated: false,
+      remaining: 0,
+      nextOffset: null,
+      offset: 999999,
+    });
+    const ctx = createMockContext({ errors: metSearchCollections.errors });
+    const input = metSearchCollections.input.parse({ q: 'sunflower', limit: 3, offset: 999999 });
+    const result = await metSearchCollections.handler(input, ctx);
+    expect(result.offset).toBe(999999);
+  });
+
+  it('format marks an offset past the end distinctly, never as (complete)', () => {
+    const blocks = metSearchCollections.format!({
+      total: 97,
+      objectIDs: [],
+      returned: 0,
+      truncated: false,
+      remaining: 0,
+      nextOffset: null,
+      offset: 999999,
+    });
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).not.toContain('(complete)');
+    expect(text).toContain('offset beyond result set');
+    expect(text).toContain('Offset:** 999999');
+  });
+
+  it('format marks the exact offset === total boundary as past the end', () => {
+    // The boundary, not merely a far-past offset: offset 97 of 97 is already exhausted.
+    const blocks = metSearchCollections.format!({
+      total: 97,
+      objectIDs: [],
+      returned: 0,
+      truncated: false,
+      remaining: 0,
+      nextOffset: null,
+      offset: 97,
+    });
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).not.toContain('(complete)');
+    expect(text).toContain('offset beyond result set');
+  });
+
+  it('format still renders (truncated) on a mid-result page', () => {
+    const blocks = metSearchCollections.format!({
+      total: 100,
+      objectIDs: [51, 52],
+      returned: 2,
+      truncated: true,
+      remaining: 48,
+      nextOffset: 52,
+      offset: 50,
+    });
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).toContain('(truncated)');
+    expect(text).not.toContain('offset beyond result set');
+    expect(text).toContain('Offset:** 50');
+  });
+
+  // --- #20: no_results names isPublicDomain when it zeroed the query ---
+
+  it('no_results with isPublicDomain: true names the filter in the recovery hint', async () => {
+    mockSearch.mockResolvedValue({
+      total: 0,
+      objectIDs: [],
+      returned: 0,
+      truncated: false,
+      remaining: 0,
+      nextOffset: null,
+      offset: 0,
+    });
+    const ctx = createMockContext({ errors: metSearchCollections.errors });
+    const input = metSearchCollections.input.parse({
+      q: 'vase',
+      departmentId: 13,
+      isPublicDomain: true,
+      limit: 20,
+    });
+    const err = await Promise.resolve(metSearchCollections.handler(input, ctx)).catch((e) => e);
+    expect(err.data.reason).toBe('no_results');
+    expect(err.data.recovery.hint).toContain('isPublicDomain');
+    expect(err.data.recovery.hint).toContain('met_get_object');
+  });
+
+  it('no_results without isPublicDomain keeps the generic recovery hint', async () => {
+    mockSearch.mockResolvedValue({
+      total: 0,
+      objectIDs: [],
+      returned: 0,
+      truncated: false,
+      remaining: 0,
+      nextOffset: null,
+      offset: 0,
+    });
+    const ctx = createMockContext({ errors: metSearchCollections.errors });
+    const input = metSearchCollections.input.parse({ q: 'zzznomatch', limit: 20 });
+    const err = await Promise.resolve(metSearchCollections.handler(input, ctx)).catch((e) => e);
+    expect(err.data.reason).toBe('no_results');
+    expect(err.data.recovery.hint).toBe(
+      'Broaden the query, remove filters, or call met_list_departments and set a valid departmentId.',
+    );
   });
 });

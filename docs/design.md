@@ -35,7 +35,7 @@ Target users: art researchers, educators, students, designers sourcing CC0 image
 - Search returns object IDs only; full records require a per-ID fetch (`/objects/{id}`)
 - Batch-fetch pattern (array input + `Promise.allSettled` + concurrency limit) is essential to avoid N+1 after a search
 - No rate limit published; service has been stable at moderate request volumes — apply a reasonable concurrency cap (5 parallel) to be a polite caller
-- `isPublicDomain` and `hasImages` filters are distinct: `hasImages=true` includes copyrighted works with restricted images; `isPublicDomain=true` guarantees CC0-licensed, freely reusable image URLs
+- `isPublicDomain` and `hasImages` filters are distinct: `hasImages=true` includes copyrighted works with restricted images; `isPublicDomain=true` narrows to CC0-licensed, freely reusable image URLs, though only across the subset of the collection the search index covers
 - Attribution: CC0 means no attribution is legally required, but crediting "The Metropolitan Museum of Art" is courteous
 
 ---
@@ -89,11 +89,11 @@ z.object({
   hasImages: z.boolean().optional()
     .describe('When true, restricts results to objects that have at least one associated image. For freely reusable CC0 images, use isPublicDomain instead — hasImages includes copyrighted works whose images cannot be reproduced.'),
 
-  isPublicDomain: z.boolean().optional()
-    .describe('When true, restricts results to objects released under CC0 open access — free to use without permission or attribution. These objects return direct high-resolution image URLs in met_get_object. Can be combined with departmentId but severely restricts results (the search index only indexes a subset of public-domain objects per department); prefer using isPublicDomain alone and filtering by department from the returned object records.'),
+  isPublicDomain: z.literal(true).optional()
+    .describe('Opt-in filter, true only — omit it rather than passing false, which the upstream index answers unsoundly. Narrows results to objects released under CC0 open access, which return direct high-resolution image URLs in met_get_object. A partial index, not exhaustive coverage: it omits objects whose own record reports isPublicDomain true, and combining it with departmentId narrows it further still. Retry without the filter when a search returns nothing, and confirm CC0 status per object from the returned records.'),
 
-  isHighlight: z.boolean().optional()
-    .describe('When true, restricts to objects the Met has designated as highlights — major works central to the collection. Use to surface iconic pieces rather than browsing the full corpus.'),
+  isHighlight: z.literal(true).optional()
+    .describe('Opt-in filter, true only — omit it rather than passing false, which the upstream index answers unsoundly. Narrows results to objects the Met has designated as highlights. Like isPublicDomain it is a partial index, so it can omit objects whose own record reports isHighlight true.'),
 
   medium: z.string().optional()
     .describe('Filter by object classification (e.g., "Paintings", "Drawings", "Prints", "Ceramics", "Sculpture", "Photographs", "Textiles"). Maps to the classification field on the object, not the materials/medium text field — pass a classification category name, not a material description like "Oil on canvas".'),
@@ -126,7 +126,13 @@ z.object({
   returned: z.number().int()
     .describe('Count of object IDs in this response — may be less than `total` when the full result set was truncated by `limit`.'),
   truncated: z.boolean()
-    .describe('True when total > returned. Increase `limit`, refine filters, or add keywords to narrow results.'),
+    .describe('True when matching IDs remain beyond this page. Increase `limit`, refine filters, or page with `offset`.'),
+  remaining: z.number().int()
+    .describe('Count of matching object IDs after this page: total − (offset + returned), floored at 0.'),
+  nextOffset: z.number().int().nullable()
+    .describe('The offset to pass on the next call, or null when the result set is exhausted.'),
+  offset: z.number().int()
+    .describe('The resolved offset this page was read from. When offset >= total the page is empty because the offset ran past the end, not because the query has nothing left.'),
 })
 ```
 
@@ -142,9 +148,27 @@ errors: [
   },
   {
     reason: 'invalid_date_range',
-    code: JsonRpcErrorCode.InvalidParams,
+    code: JsonRpcErrorCode.ValidationError,
     when: 'dateBegin or dateEnd provided without the other, or dateBegin > dateEnd',
     recovery: 'Provide both dateBegin and dateEnd as integer years, with dateBegin ≤ dateEnd.',
+  },
+  {
+    reason: 'invalid_filter',
+    code: JsonRpcErrorCode.ValidationError,
+    when: 'q is whitespace-only, or medium or geoLocation was supplied blank',
+    recovery: 'Supply a non-blank value for the named field, or omit the optional filter entirely.',
+  },
+  {
+    reason: 'invalid_department',
+    code: JsonRpcErrorCode.ValidationError,
+    when: 'departmentId is provided but is not one of the Met department IDs',
+    recovery: 'Call met_list_departments to get valid department IDs, then retry with one of the returned IDs.',
+  },
+  {
+    reason: 'search_timeout',
+    code: JsonRpcErrorCode.Timeout,
+    when: 'The result set is too large to download within the request timeout',
+    recovery: 'Narrow the query or add filters to shrink the result set, then retry.',
   },
 ]
 ```
@@ -156,7 +180,10 @@ errors: [
 - `artistOrCulture` filter is documented by the Met but returns 0 results in live testing — excluded from the tool surface until confirmed functional.
 - `title` filter is documented but returns 0 results in live testing for all tested queries — excluded until confirmed functional.
 - `medium` parameter maps to the `classification` field, not the materials/medium text field. Pass classification names ("Paintings", "Drawings", "Prints", "Ceramics", "Sculpture", "Photographs", "Textiles"). Passing material descriptions like "Oil on canvas" returns 0.
-- `isPublicDomain + departmentId` can be combined but returns far fewer results than either filter alone — search index only covers a subset of public-domain objects per department.
+- `isPublicDomain + departmentId` can be combined but returns far fewer results than either filter alone — search index only covers a subset of public-domain objects per department. The under-inclusiveness is not department-specific: `q=sunflower` returns 97 unfiltered and 4 with `isPublicDomain=true`, omitting a confirmed public-domain object.
+- `isPublicDomain=false` and `isHighlight=false` return objects whose own records contradict the filter — the index is unsound on the `false` arm of both, so both parameters accept `true` only (see Decisions Log).
+- Any boolean filter set to `true` adds a fixed set of objects that do not match `q`. A keyword matching nothing (`q=zzzqqqxyz` → `total: 0` unfiltered) still returns a page once a boolean filter is present: `isPublicDomain=true` → `[437261, 228990, 436043]`, `isHighlight=true` → `[206989, 437261, 626692]`, `hasImages=true` → 128 IDs, `isOnView=true` → 67 IDs. The same IDs reappear under unrelated keywords, so a boolean-filtered result is the union of the real matches and that floor, not a subset of the unfiltered search — which also inflates `total` and puts `no_results` out of reach when a boolean is the only filter. Tracked in #21; the tool surface discloses it, the data is not yet corrected.
+- A blank parameter value is not treated as absent upstream — it selects a different result set (`q=sunflower` → 97; `&geoLocation=` → 19). Blank filter values are rejected client-side rather than forwarded (see Decisions Log).
 - `geoLocation` multiple values require repeated query params in the HTTP request (`geoLocation=France&geoLocation=Italy`). The tool schema uses `z.array(z.string())` — the service layer serializes each array element as a separate query param. Live testing (2026-06-01) confirmed multiple values are AND-combined (intersection), not OR (union) — `["France", "Italy"]` returns fewer results than `["France"]` alone. The filter also matches artist nationality, not just `country`/`region`/`geographyType` fields.
 - Search relevance is basic keyword match — not semantic. Long queries do not improve results; shorter terms and filters do.
 
@@ -397,9 +424,23 @@ The Met API documents `artistOrCulture=true` as a flag that restricts keyword ma
 
 The Met API documents `medium` as a search filter parameter. Live probing showed that passing actual material descriptions ("Oil on canvas", "Watercolor") returns 0 results, but passing classification category names ("Paintings", "Drawings", "Prints", "Ceramics", "Sculpture", "Photographs", "Textiles") returns results correctly. The `medium` parameter maps to the `classification` field on the object, not the `medium` (materials/technique) text field — a naming mismatch in the API. The filter is included in `met_search_collections` with documentation that explains classification values are required.
 
-### 3. `isPublicDomain + departmentId` interaction
+### 3. `isPublicDomain` and `isHighlight` are `true`-only opt-ins
 
-These two filters can be combined, but the combination returns far fewer results than expected. Live probing: `q=painting&isPublicDomain=true` → 96 results; `q=painting&isPublicDomain=true&departmentId=11` → 9 results. The search index appears to only index a subset of public-domain objects with department tags. The combination does not return zero results. Tool descriptions note that `isPublicDomain` is more reliable used alone, with department filtering applied post-fetch on the returned object records.
+**Under-inclusiveness (original finding).** `isPublicDomain + departmentId` can be combined, but the combination returns far fewer results than expected. Live probing: `q=painting&isPublicDomain=true` → 96 results; `q=painting&isPublicDomain=true&departmentId=11` → 9 results. The search index only indexes a subset of public-domain objects with department tags. The combination does not return zero results. Tool descriptions note that `isPublicDomain` is more reliable used alone, with department filtering applied post-fetch on the returned object records.
+
+**Extension: the under-inclusiveness is not department-specific.** `q=sunflower` → 97 matches unfiltered; `q=sunflower&isPublicDomain=true` → 4, and object `436580` — whose own record reports `isPublicDomain: true` — is absent from that arm. So the `true` arm is a partial index even with no department filter, and describing it as a guarantee of CC0 coverage overstates it.
+
+**The `true` arm is CC0-sound but not query-sound.** Every object it returns is genuinely public domain — `437261`, `436529`, `228990`, `436043` all report `isPublicDomain: true` with populated image URLs — but three of those four come back for *any* keyword, including one that matches nothing. The arm is a union of the real matches and a fixed floor, not a subset of the unfiltered search (see the note in the tool section and #21). The narrowing decision below is unaffected: the floor is present on the `true` arm with or without it.
+
+**The `false` arm is unsound.** `q=sunflower&isPublicDomain=false` → 1 match, object `436580`, whose record reports `isPublicDomain: true` — a wrong answer, not an empty one. `isHighlight=false` fails identically: `q=sunflower&isHighlight=false` returns objects `337700` and `309959`, both of which report `isHighlight: true`.
+
+**Decision.** Both parameters are narrowed to a `true`-only literal on the input schema and on `SearchInput`, so the unsound value can never reach `buildSearchUrl` and the constraint is advertised in `tools/list` rather than enforced only at runtime. The `true` arm is kept — narrow, and sound on the CC0 claim — rather than removing the filters or verifying post-fetch, which would change the caller's declared search semantics. `hasImages` and `isOnView` stay plain booleans: neither reproduced a wrong-answer defect on either arm across `q=sunflower` and `q=vase` (six `hasImages=false` records with no image URLs, five `isOnView=false` records with an empty `GalleryNumber`). Both share the query-irrelevant floor of #21, which is not what this decision narrows.
+
+### 3a. Blank filter values are rejected, not forwarded
+
+A blank parameter value is not an absent one to the Met index. Live probing against `q=sunflower` (baseline 97): `&isPublicDomain=` → 31, `&geoLocation=` → 19, `&zzz=1` → 34, `&bogusParam=true` → 0. A blank or unrecognized value silently selects a different result set, and the figure shifts with the exact string sent, so there is no safe blank to forward. `buildSearchUrl`'s truthiness checks separately *drop* a blank `medium` or an empty `geoLocation` array, silently widening the search to unfiltered.
+
+**Decision.** `met_search_collections` rejects a whitespace-only `q`, a blank `medium`, an empty `geoLocation` array, and any blank `geoLocation` element, via a declared `invalid_filter` reason. The check lives in the handler rather than the Zod schema: this file already validates semantically there (date-range pairing, department membership), a schema `.refine()` would surface as a bare JSON-RPC `-32602` with no `data.reason` and no recovery hint, and only a handler check can name the offending field dynamically under one shared reason. The advertised `inputSchema` is therefore unchanged by this decision — only runtime behavior narrows.
 
 ### 4. Exclude `title` search filter
 
