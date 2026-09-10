@@ -188,28 +188,43 @@ export class MetService {
    * of IDs plus continuation metadata (`nextOffset`, `remaining`).
    *
    * The upstream `/search` returns the complete ID array in one response, so paging
-   * is a local slice — no extra upstream capability needed. A broad, unfiltered
-   * query can deterministically exceed the request timeout while that array
-   * downloads; because the same query times out identically on every attempt, the
-   * timeout is surfaced as a non-retryable `search_timeout` (fail-fast) instead of
-   * being retried through the full timeout three more times.
+   * is a local slice — no extra upstream capability needed. A broad query can
+   * deterministically exceed the request timeout while that array downloads; because
+   * the same query times out identically on every attempt, the timeout is surfaced
+   * as a non-retryable `search_timeout` (fail-fast) instead of being retried through
+   * the full timeout three more times.
+   *
+   * A filtered search runs twice. The upstream index answers any filter parameter
+   * with the union of the genuine keyword matches and a fixed, query-independent
+   * floor of objects that do not match `q` at all, so a second run carrying `q`
+   * alone is issued in parallel and the filtered IDs are intersected against it.
+   * Intersecting rather than subtracting a known floor is what keeps the floor
+   * members that genuinely do match `q`; the control run must drop every filter,
+   * not just the booleans, because `medium` and the date range have floors of their
+   * own. `total` is the size of the intersection, so the continuation arithmetic
+   * derived from it describes what the caller can actually page through.
    */
   search(input: SearchInput, ctx: Context): Promise<SearchResult> {
     const offset = input.offset ?? 0;
     return withRetry(
       async () => {
         const url = this.buildSearchUrl(input);
-        ctx.log.debug('Met search request', { url: url.toString() });
+        /**
+         * Read off the built URL rather than re-listing the filter fields, so this
+         * cannot drift out of step with `buildSearchUrl` when a parameter is added.
+         */
+        const isFiltered = [...url.searchParams.keys()].some((key) => key !== 'q');
+        ctx.log.debug('Met search request', { url: url.toString(), filtered: isFiltered });
         try {
-          const response = await fetchWithTimeout(url, this.timeoutMs, ctx, { signal: ctx.signal });
-          const raw = (await response.json()) as RawSearchResponse;
-          const allIds = raw.objectIDs ?? [];
-          const sliced = allIds.slice(offset, offset + input.limit);
+          const { ids, total } = isFiltered
+            ? await this.searchIntersected(url, input, ctx)
+            : await this.searchUnfiltered(url, ctx);
+          const sliced = ids.slice(offset, offset + input.limit);
           const consumed = offset + sliced.length;
-          const remaining = Math.max(0, raw.total - consumed);
+          const remaining = Math.max(0, total - consumed);
           const truncated = remaining > 0;
           return {
-            total: raw.total,
+            total,
             objectIDs: sliced,
             returned: sliced.length,
             truncated,
@@ -235,6 +250,75 @@ export class MetService {
         signal: ctx.signal,
       },
     );
+  }
+
+  /** One `/search` round-trip, decoded. */
+  private async fetchSearch(url: URL, ctx: Context): Promise<RawSearchResponse> {
+    const response = await fetchWithTimeout(url, this.timeoutMs, ctx, { signal: ctx.signal });
+    return (await response.json()) as RawSearchResponse;
+  }
+
+  /** The single-run path: the upstream ID array and the total it reports. */
+  private async searchUnfiltered(
+    url: URL,
+    ctx: Context,
+  ): Promise<{ ids: number[]; total: number }> {
+    const raw = await this.fetchSearch(url, ctx);
+    return { ids: raw.objectIDs ?? [], total: raw.total };
+  }
+
+  /**
+   * The filtered path: the filtered run intersected with a control run of the same
+   * `q` carrying no filters. Both are issued together, so the wall-clock cost is the
+   * slower of the two rather than their sum.
+   *
+   * Order comes from the filtered run, preserving upstream relevance ranking; the
+   * control run contributes membership only, through a Set because it reaches tens
+   * of thousands of IDs (`q=cat` is 51,873).
+   *
+   * The control run is **best-effort**, and deliberately so: it is the broadest form
+   * of the query, so it can cost far more than the filtered run it corrects.
+   * `q=the&departmentId=11` answers in 0.44s with 132 IDs, while `q=the` alone needs
+   * 12.7s for 2.7 MB — past the default 10s timeout. Failing the search there would
+   * make a fast, working query unreachable in order to strip a floor of 2. So a
+   * control failure falls back to the filtered run uncorrected and discloses that on
+   * `ctx.enrich.notice`, while a failure of the *filtered* run stays fatal and
+   * surfaces as `search_timeout`. Catching on the control promise itself keeps its
+   * rejection away from `Promise.all` and from `withRetry`, so a degraded run never
+   * re-issues the whole search.
+   *
+   * A control run that resolves with a null `objectIDs` is not a failure — it is the
+   * upstream reporting zero matches, which is what makes `no_results` reachable
+   * behind a filter at all. That case intersects to empty rather than degrading.
+   */
+  private async searchIntersected(
+    filteredUrl: URL,
+    input: SearchInput,
+    ctx: Context,
+  ): Promise<{ ids: number[]; total: number }> {
+    const controlUrl = this.buildSearchUrl({ q: input.q, limit: input.limit });
+    const [filtered, control] = await Promise.all([
+      this.fetchSearch(filteredUrl, ctx),
+      this.fetchSearch(controlUrl, ctx).catch((error: unknown) => {
+        ctx.log.warning('Met search control run failed — returning unchecked results', {
+          q: input.q,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return null;
+      }),
+    ]);
+
+    const filteredIds = filtered.objectIDs ?? [];
+    if (control === null) {
+      ctx.enrich.notice(
+        `Unchecked results: the second, unfiltered run of "${input.q}" that removes filter matches unrelated to the keyword did not complete, so this page may contain unrelated objects and total is the uncorrected upstream count. Retry with a narrower keyword to let the check run, or verify each record with met_get_object.`,
+      );
+      return { ids: filteredIds, total: filtered.total };
+    }
+
+    const matchesQuery = new Set(control.objectIDs ?? []);
+    const ids = filteredIds.filter((objectID) => matchesQuery.has(objectID));
+    return { ids, total: ids.length };
   }
 
   /**

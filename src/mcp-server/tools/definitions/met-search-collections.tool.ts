@@ -14,7 +14,9 @@ export const metSearchCollections = tool('met_search_collections', {
     'Returns the total match count and a page of matching object IDs, which met_get_object resolves to full records. ' +
     'Relevance is keyword-based, not semantic; department and geographic filters narrow results more than a longer query. ' +
     'The medium parameter maps to the classification field (pass "Paintings", "Drawings", etc., not material descriptions like "Oil on canvas"). ' +
-    'isPublicDomain selects CC0-licensed images but is a partial index — it omits genuinely public-domain objects and returns a few that do not match the query, so verify each record; hasImages also includes copyrighted works. ' +
+    'Every filter draws on a partial upstream index, so a filtered search omits some objects whose own record satisfies the filter — the results are not exhaustive, and dropping the filter is what widens them. ' +
+    'A filtered search is checked against the same query run unfiltered, so its results match the keyword; when that check is too costly to complete the page is returned unchecked and the response says so in its notice. ' +
+    'isPublicDomain selects CC0-licensed images; hasImages also includes copyrighted works. ' +
     'isPublicDomain and isHighlight are opt-in filters that accept true only; the upstream index is unsound on the false arm. ' +
     'isOnView restricts results to works currently on display in a Met gallery.',
   annotations: { readOnlyHint: true, idempotentHint: true },
@@ -30,7 +32,8 @@ export const metSearchCollections = tool('met_search_collections', {
       .optional()
       .describe(
         'When true, restricts results to objects that have at least one associated image, including copyrighted works whose images cannot be reproduced. ' +
-          'isPublicDomain is the nearest filter for freely reusable CC0 images, but it is partial — confirm per object from the isPublicDomain and hasCC0Image fields on met_get_object.',
+          'A partial index like every filter here: it omits some objects that do have images, so absence from the results is not evidence an object has none. ' +
+          'isPublicDomain is the nearest filter for freely reusable CC0 images — confirm per object from the isPublicDomain and hasCC0Image fields on met_get_object.',
       ),
     isPublicDomain: z
       .literal(true, {
@@ -40,7 +43,7 @@ export const metSearchCollections = tool('met_search_collections', {
       .describe(
         'Opt-in filter, true only — omit it rather than passing false, which the upstream index answers unsoundly. ' +
           'Selects objects released under CC0 open access, which return direct high-resolution image URLs in met_get_object. ' +
-          'Its results are not a subset of the same search run without it: it omits objects whose own record reports isPublicDomain true, and adds a few CC0 objects that do not match the query at all — check each returned record against the query before presenting it. ' +
+          'A partial index, not exhaustive coverage: it omits objects whose own record reports isPublicDomain true — object 436580 matches the query "sunflower" and is public domain, yet the filtered search does not return it — so absence from the results is not evidence an object lacks CC0 status. ' +
           'Combining it with departmentId narrows it further; when a search returns nothing, retry without the filter.',
       ),
     isHighlight: z
@@ -51,13 +54,14 @@ export const metSearchCollections = tool('met_search_collections', {
       .describe(
         'Opt-in filter, true only — omit it rather than passing false, which the upstream index answers unsoundly. ' +
           'Selects objects the Met has designated as highlights — major works central to the collection. ' +
-          'Like isPublicDomain its results are not a subset of the unfiltered search: it omits objects whose own record reports isHighlight true, and adds a few highlights that do not match the query.',
+          'A partial index like isPublicDomain: it omits objects whose own record reports isHighlight true, so absence from the results is not evidence a work is not a highlight.',
       ),
     isOnView: z
       .boolean()
       .optional()
       .describe(
         'When true, restricts results to objects currently on display in a Met gallery. ' +
+          'A partial index like the other filters — it omits some objects that are on view, so absence from the results is not evidence a work is off display. ' +
           'The GalleryNumber field on the met_get_object record identifies the specific gallery.',
       ),
     medium: z
@@ -65,7 +69,8 @@ export const metSearchCollections = tool('met_search_collections', {
       .optional()
       .describe(
         'Filter by object classification (e.g., "Paintings", "Drawings", "Prints", "Ceramics", "Sculpture", "Photographs", "Textiles"). ' +
-          'Maps to the classification field on the object, not the materials/medium text field — pass a classification category name, not a material description like "Oil on canvas".',
+          'Maps to the classification field on the object, not the materials/medium text field — pass a classification category name, not a material description like "Oil on canvas". ' +
+          'A partial index like the other filters: it omits some objects that carry the classification on their own record.',
       ),
     departmentId: z
       .number()
@@ -74,6 +79,7 @@ export const metSearchCollections = tool('met_search_collections', {
       .optional()
       .describe(
         'Restrict results to one curatorial department. Valid IDs come from met_list_departments — the Met exposes a sparse set (roughly 1–21, with gaps); an unrecognized ID is rejected with an invalid_department error rather than silently returning no matches. ' +
+          'A partial index like the other filters: it omits some objects whose own record names the department. ' +
           'Can be combined with other filters; combining with isPublicDomain works but returns far fewer results than expected.',
       ),
     geoLocation: z
@@ -84,6 +90,7 @@ export const metSearchCollections = tool('met_search_collections', {
       .describe(
         'Filter by geographic origin. Each value is matched broadly against geography fields and artist nationality. ' +
           'Multiple values are AND-combined — ["France", "Egypt"] returns objects associated with both, not either, so more values narrow the result set. ' +
+          'A partial index like the other filters: it omits some objects whose own geography fields name the location. ' +
           'Works best with the Egyptian Art, Greek and Roman Art, and similar departments that have well-populated geography fields.',
       ),
     dateBegin: z
@@ -91,14 +98,16 @@ export const metSearchCollections = tool('met_search_collections', {
       .int()
       .optional()
       .describe(
-        'Earliest object date (year, inclusive). Negative integers for BCE (e.g., -500 for 500 BCE). Requires dateEnd.',
+        'Earliest object date (year, inclusive). Negative integers for BCE (e.g., -500 for 500 BCE). Requires dateEnd. ' +
+          'The range is a partial index like the other filters: it omits some objects whose own record dates them inside it.',
       ),
     dateEnd: z
       .number()
       .int()
       .optional()
       .describe(
-        'Latest object date (year, inclusive). Negative integers for BCE. Requires dateBegin.',
+        'Latest object date (year, inclusive). Negative integers for BCE. Requires dateBegin. ' +
+          'The range is a partial index like the other filters: it omits some objects whose own record dates them inside it.',
       ),
     limit: z
       .number()
@@ -163,11 +172,19 @@ export const metSearchCollections = tool('met_search_collections', {
           'Compare it against total: when offset is greater than or equal to total the page is empty because the offset ran past the end of the result set, not because the query has nothing left to return.',
       ),
   }),
+  enrichment: {
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'Present only when a filtered search could not be checked against the unfiltered query. That check is best-effort; when it does not complete the page is returned uncorrected and may contain objects unrelated to the keyword.',
+      ),
+  },
   errors: [
     {
       reason: 'no_results',
       code: JsonRpcErrorCode.NotFound,
-      when: 'total is 0 — the API returned null objectIDs for this query+filter combination.',
+      when: 'total is 0 — the API returned null objectIDs for the query, or nothing the filters returned also matched the query.',
       recovery:
         'Broaden the query, remove filters, or call met_list_departments and set a valid departmentId.',
     },
@@ -194,9 +211,9 @@ export const metSearchCollections = tool('met_search_collections', {
     {
       reason: 'search_timeout',
       code: JsonRpcErrorCode.Timeout,
-      when: 'The result set is too large to download within the request timeout — a broad, unfiltered query.',
+      when: 'The keyword+filter result set is too large to download within the request timeout — a broad query with few or no filters.',
       recovery:
-        'Narrow the query or add filters (departmentId, geoLocation, medium, or dateBegin plus dateEnd) to shrink the result set, then retry.',
+        'Narrow the query: add or tighten filters (departmentId, geoLocation, medium, or dateBegin plus dateEnd), or use a more specific keyword, then retry.',
     },
   ],
 

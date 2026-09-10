@@ -143,7 +143,7 @@ errors: [
   {
     reason: 'no_results',
     code: JsonRpcErrorCode.NotFound,
-    when: 'total is 0 (API returned null objectIDs)',
+    when: 'total is 0 — API returned null objectIDs, or nothing the filters returned also matched the query',
     recovery: 'Broaden the query, remove filters, or call met_list_departments and set a valid departmentId.',
   },
   {
@@ -167,8 +167,8 @@ errors: [
   {
     reason: 'search_timeout',
     code: JsonRpcErrorCode.Timeout,
-    when: 'The result set is too large to download within the request timeout',
-    recovery: 'Narrow the query or add filters to shrink the result set, then retry.',
+    when: 'The keyword+filter result set is too large to download within the request timeout — a broad query with few or no filters',
+    recovery: 'Narrow the query: add or tighten filters (departmentId, geoLocation, medium, or dateBegin plus dateEnd), or use a more specific keyword, then retry.',
   },
 ]
 ```
@@ -182,7 +182,9 @@ errors: [
 - `medium` parameter maps to the `classification` field, not the materials/medium text field. Pass classification names ("Paintings", "Drawings", "Prints", "Ceramics", "Sculpture", "Photographs", "Textiles"). Passing material descriptions like "Oil on canvas" returns 0.
 - `isPublicDomain + departmentId` can be combined but returns far fewer results than either filter alone — search index only covers a subset of public-domain objects per department. The under-inclusiveness is not department-specific: `q=sunflower` returns 97 unfiltered and 4 with `isPublicDomain=true`, omitting a confirmed public-domain object.
 - `isPublicDomain=false` and `isHighlight=false` return objects whose own records contradict the filter — the index is unsound on the `false` arm of both, so both parameters accept `true` only (see Decisions Log).
-- Any boolean filter set to `true` adds a fixed set of objects that do not match `q`. A keyword matching nothing (`q=zzzqqqxyz` → `total: 0` unfiltered) still returns a page once a boolean filter is present: `isPublicDomain=true` → `[437261, 228990, 436043]`, `isHighlight=true` → `[206989, 437261, 626692]`, `hasImages=true` → 128 IDs, `isOnView=true` → 67 IDs. The same IDs reappear under unrelated keywords, so a boolean-filtered result is the union of the real matches and that floor, not a subset of the unfiltered search — which also inflates `total` and puts `no_results` out of reach when a boolean is the only filter. Tracked in #21; the tool surface discloses it, the data is not yet corrected.
+- **Every filter parameter carries a query-independent floor upstream, corrected here by intersection.** The Met `/search` index answers any filter with the union of the genuine keyword matches and a fixed set of objects that do not match `q` at all — `q=zzzqqqxyz` (0 matches unfiltered) returns 3 IDs with `isPublicDomain=true`, 3 with `isHighlight=true`, 128 with `hasImages=true`, 67 with `isOnView=true`, 338 with `medium=Paintings`, 2 with `departmentId=11`, and 29 with `dateBegin=1800&dateEnd=1900`. A filtered search therefore issues a second run carrying `q` alone and returns only the IDs present in both (see Decisions Log). `total` is the intersection size, so `truncated`, `remaining`, and `nextOffset` describe what the caller can actually page through.
+- A filtered search costs two upstream requests, issued in parallel — wall-clock is the slower of the two, not their sum. The control run is **best-effort**: it is the broadest form of the query and can cost far more than the filtered run it corrects (`q=the&departmentId=11` answers in 0.44s with 132 IDs; `q=the` alone needs 12.7s to deliver 2.7 MB, past the default 10s timeout). When it fails the filtered run is returned uncorrected, with its upstream `total` and an `enrichment.notice` disclosing that the results were not checked. Only a failure of the *filtered* run raises `search_timeout`, so adding filters still shrinks the download that timed out.
+- Intersecting makes a filtered result sound but not complete. The partial-index caveat survives it: `isPublicDomain=true` still omits object `436580`, which matches `q=sunflower` and reports `isPublicDomain: true` on its own record — intersection can only remove IDs the filtered call returned, never add ones it omitted.
 - A blank parameter value is not treated as absent upstream — it selects a different result set (`q=sunflower` → 97; `&geoLocation=` → 19). Blank filter values are rejected client-side rather than forwarded (see Decisions Log).
 - `geoLocation` multiple values require repeated query params in the HTTP request (`geoLocation=France&geoLocation=Italy`). The tool schema uses `z.array(z.string())` — the service layer serializes each array element as a separate query param. Live testing (2026-06-01) confirmed multiple values are AND-combined (intersection), not OR (union) — `["France", "Italy"]` returns fewer results than `["France"]` alone. The filter also matches artist nationality, not just `country`/`region`/`geographyType` fields.
 - Search relevance is basic keyword match — not semantic. Long queries do not improve results; shorter terms and filters do.
@@ -479,7 +481,7 @@ The Met API documents `medium` as a search filter parameter. Live probing showed
 
 **Extension: the under-inclusiveness is not department-specific.** `q=sunflower` → 97 matches unfiltered; `q=sunflower&isPublicDomain=true` → 4, and object `436580` — whose own record reports `isPublicDomain: true` — is absent from that arm. So the `true` arm is a partial index even with no department filter, and describing it as a guarantee of CC0 coverage overstates it.
 
-**The `true` arm is CC0-sound but not query-sound.** Every object it returns is genuinely public domain — `437261`, `436529`, `228990`, `436043` all report `isPublicDomain: true` with populated image URLs — but three of those four come back for *any* keyword, including one that matches nothing. The arm is a union of the real matches and a fixed floor, not a subset of the unfiltered search (see the note in the tool section and #21). The narrowing decision below is unaffected: the floor is present on the `true` arm with or without it.
+**The `true` arm is CC0-sound but was not query-sound.** Every object it returns is genuinely public domain — `437261`, `436529`, `228990`, `436043` all report `isPublicDomain: true` with populated image URLs — but three of those four came back for *any* keyword, including one that matches nothing. That query-independent floor reaches every filter parameter, not just this one, and is corrected by the intersection in Decision #14. The narrowing decision below is independent of it: the floor was present on the `true` arm either way.
 
 **The `false` arm is unsound.** `q=sunflower&isPublicDomain=false` → 1 match, object `436580`, whose record reports `isPublicDomain: true` — a wrong answer, not an empty one. `isHighlight=false` fails identically: `q=sunflower&isHighlight=false` returns objects `337700` and `309959`, both of which report `isHighlight: true`.
 
@@ -555,6 +557,27 @@ A repeated ID in one call fetched the object twice, charged it to the byte budge
 
 **Decision.** De-duplicate in the handler, first occurrence keeping its position, and advertise it in the `objectIDs` description. A `.refine()` rejecting duplicates was the alternative and is worse on two counts: it narrows the advertised `inputSchema` for input a caller could previously send, and it answers a request with an obvious reading — a repeated ID means the caller wants that record, once — with an error. De-duplicating also halves the upstream calls for such input.
 
+### 14. Intersect a filtered search with an unfiltered control run of the same query
+
+Adding any filter to `/search` makes the upstream index return the union of the genuine keyword matches and a fixed, query-independent floor. The floor is per parameter and per value, present in every filtered response rather than only the ones where the keyword matches nothing: `q=zzzqqqxyz` matches nothing unfiltered yet returns 3 IDs under `isPublicDomain=true`, 338 under `medium=Paintings`, and 29 under `dateBegin=1800&dateEnd=1900`. The consequences compound — `total` is inflated by the floor size, `no_results` is unreachable whenever a filter is present, and an agent presenting the IDs is presenting unrelated artworks.
+
+**Decision.** A search carrying any filter issues a second upstream request with `q` alone and no filter parameters at all, in parallel with the filtered one, and keeps only the filtered IDs that also appear in the control run. `total` becomes the intersection size, and the page slice and continuation fields derive from it as before.
+
+Why each part:
+
+- **Intersect rather than subtract a cached floor.** A cached per-filter floor is cheaper — one query-independent fetch per filter combination — but unsound in the opposite direction: it drops the floor members that genuinely match the query. `q=cat&hasImages=true` returns 673 IDs, 632 of them in the 51,873-result unfiltered run and 41 not. The `hasImages` floor is 128 IDs, so 87 of those 128 are inside the 632 — genuine matches that a wholesale floor subtraction would discard. Intersection removes exactly the 41 the unfiltered query does not support and keeps the rest.
+- **The control run drops every filter, not just the booleans.** `medium` and the date range carry the largest floors measured (338 and 29), so a control run that kept them would leave those floors in place.
+- **Order comes from the filtered run.** It preserves the upstream relevance ranking a caller is paging through; the control run supplies membership only, via a `Set` because it reaches tens of thousands of IDs (`q=cat` is 51,873 unfiltered).
+- **Parallel, not sequential.** Wall-clock cost is the slower of the two runs rather than their sum.
+- **The control run is best-effort; only the filtered run's failure is fatal.** This is the load-bearing part of the design, because the control run can cost far more than the query it corrects. Measured: `q=the&departmentId=11` returns 132 correct IDs in 0.44s on 952 bytes, while its control run `q=the` needs 12.7s to deliver 2.7 MB — past the 10,000 ms `requestTimeoutMs` default. Making the correction mandatory would turn a fast, working, narrow query into a hard `search_timeout` in order to strip a floor of 2 objects out of 132: a worse defect than the one being fixed, because it removes reachability rather than accuracy. So a control run that rejects — timeout, transport error, unparseable body — falls back to the filtered run's IDs and upstream `total`, the behavior the tool had before this decision, and discloses it. A control run that *resolves* with a null `objectIDs` is not a failure: that is the upstream reporting zero matches, and honoring it is what makes `no_results` reachable behind a filter.
+- **Disclosure rides `ctx.enrich.notice`, not an output field.** The `lint:mcp` `enrichment-prefer-block` rule puts agent-facing context there, and the framework mirrors enrichment onto `structuredContent` and the `content[]` trailer alike with no `format()` entry, so both client surfaces see it. The declared `notice` is optional, so a checked response is shaped exactly as before.
+- **The rejection is caught on the control promise itself**, not by `Promise.allSettled` at the join — the failure then never reaches `Promise.all`, the `search_timeout` classifier, or `withRetry`, so a degraded run cannot re-issue the whole search.
+- **No schema change to the domain payload.** `total` and `objectIDs` keep their declared shape; this is a data correction plus an optional enrichment field. Verifying each returned object against the filter would have been a no-op, since floor objects genuinely satisfy the filter — catching this would mean checking text fields against `q`, which is relevance ranking the server should not be doing.
+
+Because the control run is best-effort, `search_timeout` fires only on the filtered run, and its recovery still advises adding filters — they do shrink that download.
+
+Intersecting makes a filtered result sound but not complete. Decision #3's under-inclusiveness survives it unchanged: intersection can only remove IDs the filtered call returned, never add ones it omitted, so `isPublicDomain=true` still omits object `436580`. That surviving caveat is what the filter descriptions and server instructions state now, in place of the floor disclosure they carried before.
+
 ---
 
 ## Known Limitations
@@ -566,7 +589,9 @@ A repeated ID in one call fetched the object twice, charged it to the byte budge
 - **`isPublicDomain + departmentId` severely restricts results** — the combination works but returns far fewer results than either filter alone due to partial search-index coverage. Use `isPublicDomain` alone and filter by department on the returned object records (see Decisions Log).
 - **Non-public-domain objects have no image URLs** — the Met restricts images for works still under copyright. `primaryImage` and `primaryImageSmall` are empty strings; agents cannot display images for these works.
 - **Search covers approximately 267,000 objects, not all 501,731** — the `/search` endpoint does not index every object in the collection. The `/objects` endpoint (full enumeration) covers 501,731 IDs, suggesting ~235K objects exist outside the search index (likely due to incomplete cataloguing).
-- **No cursor-based pagination** — the Met `/search` endpoint returns all matching IDs in a single response with no cursor or page token. This server layers `offset`/`limit` pagination over that full set, returning `nextOffset` to fetch the next page; each page re-runs the upstream search and slices locally, so a very broad search carries the same timeout risk on every page.
+- **No cursor-based pagination** — the Met `/search` endpoint returns all matching IDs in a single response with no cursor or page token. This server layers `offset`/`limit` pagination over that full set, returning `nextOffset` to fetch the next page; each page re-runs the upstream search and slices locally, so a very broad query carries the same timeout risk on every page. A filtered page re-runs both the filtered and the control search (see Decisions Log #14).
+- **Filters are sound but not exhaustive** — a filtered search returns only objects that match the keyword, but omits some whose own record satisfies the filter, because the upstream search index covers a subset of the collection. Absence from a filtered result is not evidence about the object; confirm the attribute from the `met_get_object` record, and drop the filter to widen.
+- **A filtered page can come back unchecked** — the unfiltered control run that removes the upstream floor is best-effort, so a keyword broad enough to exceed the request timeout on its own returns the filtered results uncorrected rather than failing. Those responses carry a `notice` saying so; a narrower keyword lets the check run (see Decisions Log #14).
 
 ---
 

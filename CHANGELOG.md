@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.5.1](changelog/0.5.x/0.5.1.md) — 2026-09-09
+
+met_search_collections intersects filtered results against an unfiltered control run, removing objects that don't match the query (#21)
+
 ## [0.5.0](changelog/0.5.x/0.5.0.md) — 2026-09-09 · ⚠️ Breaking
 
 met_get_object: byte-bounded batch responses with deferred[], de-duplicated objectIDs, new geography and measurements fields

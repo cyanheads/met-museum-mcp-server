@@ -8,7 +8,12 @@
 
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import { JsonRpcErrorCode, timeout } from '@cyanheads/mcp-ts-core/errors';
-import { createInMemoryStorage, createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import {
+  createInMemoryStorage,
+  createMockContext,
+  getEnrichment,
+  runToolContract,
+} from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { metGetObject } from '@/mcp-server/tools/definitions/met-get-object.tool.js';
 import { metSearchCollections } from '@/mcp-server/tools/definitions/met-search-collections.tool.js';
@@ -24,6 +29,31 @@ function jsonResponse(body: unknown): Response {
 /** A `/search` payload with `count` sequential IDs (1..count) and a reported total. */
 function idsResponse(total: number, count = total): Response {
   return jsonResponse({ total, objectIDs: Array.from({ length: count }, (_, i) => i + 1) });
+}
+
+/**
+ * True when a `/search` request carries `q` alone — the shape of the unfiltered
+ * control run. Mirrors the service's own "any parameter beyond q" test, so a mock
+ * can tell the two runs of a filtered search apart.
+ */
+function isControlRun(request: unknown): boolean {
+  const url = new URL(String(request));
+  return [...url.searchParams.keys()].every((key) => key === 'q');
+}
+
+/**
+ * Stage the two responses a filtered search consumes: the filtered run and the
+ * unfiltered control run it is intersected against. Routing on the URL rather
+ * than call order keeps the mock correct however the two are scheduled.
+ */
+function routeSearch(filtered: unknown, control: unknown) {
+  return (request: unknown) =>
+    Promise.resolve(jsonResponse(isControlRun(request) ? control : filtered));
+}
+
+/** A `/search` payload carrying exactly these IDs, with a matching total. */
+function idsBody(objectIDs: number[]) {
+  return { total: objectIDs.length, objectIDs };
 }
 
 /** A real streaming response whose body fails after headers with the supplied error. */
@@ -489,13 +519,17 @@ describe('MetService', () => {
     });
 
     it('appends every geoLocation value when they are supplied', async () => {
-      fetchMock.mockResolvedValue(idsResponse(3));
+      // A filtered search consumes two responses concurrently, so the mock has to
+      // mint a fresh one per call — a single Response body cannot be read twice.
+      fetchMock.mockImplementation(() => Promise.resolve(idsResponse(3)));
       await getMetService().search(
         { q: 'cat', limit: 10, geoLocation: ['France', 'Egypt'] },
         createMockContext(),
       );
-      const url = new URL(String(fetchMock.mock.calls[0]?.[0]));
-      expect(url.searchParams.getAll('geoLocation')).toEqual(['France', 'Egypt']);
+      const filteredUrl = fetchMock.mock.calls
+        .map((call) => new URL(String(call[0])))
+        .find((url) => !isControlRun(url));
+      expect(filteredUrl?.searchParams.getAll('geoLocation')).toEqual(['France', 'Egypt']);
     });
   });
 
@@ -514,7 +548,10 @@ describe('MetService', () => {
       expect(err.code).toBe(JsonRpcErrorCode.Timeout);
       expect(err.data.reason).toBe('search_timeout');
       expect(err.data.retryable).toBe(false);
+      // search_timeout only fires on the filtered run — the control run is
+      // best-effort — so filters genuinely do shrink the download that timed out.
       expect(err.data.recovery.hint).toContain('Narrow the query');
+      expect(err.data.recovery.hint).toContain('filters');
     });
 
     it('also classifies a timeout while reading the response body as search_timeout', async () => {
@@ -533,6 +570,433 @@ describe('MetService', () => {
       const result = await getMetService().search({ q: 'vermeer', limit: 20 }, createMockContext());
       expect(fetchMock).toHaveBeenCalledTimes(1);
       expect(result.objectIDs).toEqual([1, 2, 3]);
+    });
+  });
+
+  /**
+   * The upstream `/search` answers any filter parameter with the union of the real
+   * keyword matches and a fixed, query-independent floor. Every case below is drawn
+   * from the live measurements in #21: `q=sunflower&isPublicDomain=true` returns
+   * `[437261, 436529, 228990, 436043]`, of which only `436529` is in the 97-result
+   * unfiltered run.
+   */
+  describe('search — filtered runs are intersected with an unfiltered control (#21)', () => {
+    const SUNFLOWER_FILTERED = [437261, 436529, 228990, 436043];
+
+    it('drops the floor IDs the unfiltered control run does not contain', async () => {
+      fetchMock.mockImplementation(
+        routeSearch(
+          { total: 4, objectIDs: SUNFLOWER_FILTERED },
+          { total: 97, objectIDs: [436529, 436580, 337700] },
+        ),
+      );
+      const result = await getMetService().search(
+        { q: 'sunflower', isPublicDomain: true, limit: 20 },
+        createMockContext(),
+      );
+
+      expect(result.objectIDs).toEqual([436529]);
+      expect(result.total).toBe(1);
+      expect(result.returned).toBe(1);
+      expect(result.truncated).toBe(false);
+      expect(result.remaining).toBe(0);
+      expect(result.nextOffset).toBeNull();
+    });
+
+    it('retains a floor member that genuinely matches the query', async () => {
+      // 437261 is a floor member for isPublicDomain, but it is a true match for a
+      // query it actually relates to — subtracting a cached floor would lose it.
+      fetchMock.mockImplementation(
+        routeSearch(
+          { total: 4, objectIDs: SUNFLOWER_FILTERED },
+          { total: 3, objectIDs: [437261, 436529, 500000] },
+        ),
+      );
+      const result = await getMetService().search(
+        { q: 'jerome', isPublicDomain: true, limit: 20 },
+        createMockContext(),
+      );
+
+      expect(result.objectIDs).toEqual([437261, 436529]);
+      expect(result.total).toBe(2);
+    });
+
+    it('preserves the filtered run’s ordering, not the control run’s', async () => {
+      fetchMock.mockImplementation(routeSearch(idsBody([30, 10, 20]), idsBody([10, 20, 30, 40])));
+      const result = await getMetService().search(
+        { q: 'cat', hasImages: true, limit: 20 },
+        createMockContext(),
+      );
+
+      expect(result.objectIDs).toEqual([30, 10, 20]);
+    });
+
+    it('derives total, remaining, truncated, and nextOffset from the intersection', async () => {
+      fetchMock.mockImplementation(
+        routeSearch(idsBody([1, 2, 3, 4, 5, 6]), idsBody([2, 3, 5, 6, 99])),
+      );
+      const result = await getMetService().search(
+        { q: 'cat', medium: 'Paintings', limit: 2 },
+        createMockContext(),
+      );
+
+      // Intersection is [2, 3, 5, 6]; the upstream filtered total of 6 is discarded.
+      expect(result.total).toBe(4);
+      expect(result.objectIDs).toEqual([2, 3]);
+      expect(result.returned).toBe(2);
+      expect(result.truncated).toBe(true);
+      expect(result.remaining).toBe(2);
+      expect(result.nextOffset).toBe(2);
+    });
+
+    it('slices the intersection by offset and limit, not the raw filtered array', async () => {
+      fetchMock.mockImplementation(routeSearch(idsBody([1, 2, 3, 4, 5, 6]), idsBody([2, 3, 5, 6])));
+      const result = await getMetService().search(
+        { q: 'cat', isOnView: true, limit: 2, offset: 1 },
+        createMockContext(),
+      );
+
+      // Offset 1 of the intersection [2, 3, 5, 6] — not offset 1 of [1..6].
+      expect(result.objectIDs).toEqual([3, 5]);
+      expect(result.offset).toBe(1);
+      expect(result.total).toBe(4);
+      expect(result.remaining).toBe(1);
+      expect(result.nextOffset).toBe(3);
+    });
+
+    it('an offset past the end of the intersection returns an empty page, not an error', async () => {
+      fetchMock.mockImplementation(routeSearch(idsBody([1, 2, 3, 4, 5, 6]), idsBody([2, 3])));
+      const result = await getMetService().search(
+        { q: 'cat', isHighlight: true, limit: 10, offset: 5 },
+        createMockContext(),
+      );
+
+      // Offset 5 runs past the 2-ID intersection even though the filtered run had 6.
+      expect(result.objectIDs).toEqual([]);
+      expect(result.returned).toBe(0);
+      expect(result.total).toBe(2);
+      expect(result.offset).toBe(5);
+      expect(result.remaining).toBe(0);
+      expect(result.nextOffset).toBeNull();
+    });
+
+    it('reports total 0 when nothing in the filtered run matched the query', async () => {
+      // The #21 reproduction: a nonsense keyword whose filtered run is the floor alone.
+      fetchMock.mockImplementation(
+        routeSearch(
+          { total: 3, objectIDs: [437261, 228990, 436043] },
+          { total: 0, objectIDs: null },
+        ),
+      );
+      const result = await getMetService().search(
+        { q: 'zzzqqqxyz', isPublicDomain: true, limit: 5 },
+        createMockContext(),
+      );
+
+      expect(result.total).toBe(0);
+      expect(result.objectIDs).toEqual([]);
+      expect(result.returned).toBe(0);
+      expect(result.truncated).toBe(false);
+      expect(result.nextOffset).toBeNull();
+    });
+
+    it('issues the control run with q alone, stripping every filter parameter', async () => {
+      fetchMock.mockImplementation(routeSearch(idsBody([1]), idsBody([1])));
+      await getMetService().search(
+        {
+          q: 'cat',
+          limit: 20,
+          hasImages: true,
+          isPublicDomain: true,
+          isHighlight: true,
+          isOnView: true,
+          medium: 'Paintings',
+          departmentId: 11,
+          geoLocation: ['France'],
+          dateBegin: 1800,
+          dateEnd: 1900,
+        },
+        createMockContext(),
+      );
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      const urls = fetchMock.mock.calls.map((call) => new URL(String(call[0])));
+      const control = urls.find((url) => isControlRun(url));
+      const filtered = urls.find((url) => !isControlRun(url));
+
+      expect([...(control?.searchParams.keys() ?? [])]).toEqual(['q']);
+      expect(control?.searchParams.get('q')).toBe('cat');
+      // The filtered run is untouched — the control run is an addition, not a rewrite.
+      expect(filtered?.searchParams.get('medium')).toBe('Paintings');
+      expect(filtered?.searchParams.get('dateBegin')).toBe('1800');
+      expect(filtered?.searchParams.getAll('geoLocation')).toEqual(['France']);
+    });
+
+    it.each([
+      ['hasImages true', { hasImages: true }],
+      ['hasImages false', { hasImages: false }],
+      ['isOnView', { isOnView: true }],
+      ['isPublicDomain', { isPublicDomain: true as const }],
+      ['isHighlight', { isHighlight: true as const }],
+      ['medium', { medium: 'Paintings' }],
+      ['departmentId', { departmentId: 11 }],
+      ['geoLocation', { geoLocation: ['France'] }],
+      ['date range', { dateBegin: 1800, dateEnd: 1900 }],
+    ])('issues a control run for %s', async (_label, filter) => {
+      fetchMock.mockImplementation(routeSearch(idsBody([1, 2]), idsBody([1])));
+      const result = await getMetService().search(
+        { q: 'cat', limit: 20, ...filter },
+        createMockContext(),
+      );
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(result.objectIDs).toEqual([1]);
+    });
+
+    it('an unfiltered search issues exactly one upstream request and keeps the upstream total', async () => {
+      fetchMock.mockResolvedValue(jsonResponse({ total: 97, objectIDs: [1, 2, 3] }));
+      const result = await getMetService().search(
+        { q: 'sunflower', limit: 20 },
+        createMockContext(),
+      );
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect([...new URL(String(fetchMock.mock.calls[0]?.[0])).searchParams.keys()]).toEqual(['q']);
+      // Unfiltered behavior is untouched: the upstream total stands as reported.
+      expect(result.total).toBe(97);
+      expect(result.objectIDs).toEqual([1, 2, 3]);
+    });
+
+    it('issues the two runs in parallel rather than one after the other', async () => {
+      let releaseFiltered!: () => void;
+      const filteredGate = new Promise<void>((resolve) => {
+        releaseFiltered = resolve;
+      });
+      fetchMock.mockImplementation(async (request: unknown) => {
+        if (isControlRun(request)) {
+          // Only reachable while the filtered run is still pending — a sequential
+          // implementation would block here forever and time the test out.
+          releaseFiltered();
+          return jsonResponse(idsBody([1, 2]));
+        }
+        await filteredGate;
+        return jsonResponse(idsBody([1, 2, 9]));
+      });
+
+      const result = await getMetService().search(
+        { q: 'cat', hasImages: true, limit: 20 },
+        createMockContext(),
+      );
+
+      expect(result.objectIDs).toEqual([1, 2]);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    // A control-run failure does not fail the search — that path is covered in the
+    // degraded-control block below, alongside the filtered-run timeout that does.
+
+    it('raises no_results through the tool when the intersection is empty', async () => {
+      // End to end over the real service: the upstream filtered response is a
+      // populated page, and the tool still has to report no_results.
+      fetchMock.mockImplementation(
+        routeSearch(
+          { total: 3, objectIDs: [437261, 228990, 436043] },
+          { total: 0, objectIDs: null },
+        ),
+      );
+      const ctx = createMockContext({ errors: metSearchCollections.errors });
+      const input = metSearchCollections.input.parse({
+        q: 'zzzqqqxyz',
+        isPublicDomain: true,
+        limit: 5,
+      });
+
+      const err = await Promise.resolve(metSearchCollections.handler(input, ctx)).catch((e) => e);
+      expect(err.code).toBe(JsonRpcErrorCode.NotFound);
+      expect(err.data.reason).toBe('no_results');
+      // The targeted #20 hint still fires — now reachable behind a filter.
+      expect(err.data.recovery.hint).toContain('isPublicDomain');
+    });
+
+    it('an intersected page satisfies the output schema and renders through format()', async () => {
+      fetchMock.mockImplementation(
+        routeSearch(
+          { total: 4, objectIDs: SUNFLOWER_FILTERED },
+          { total: 97, objectIDs: [436529, 436580] },
+        ),
+      );
+      const ctx = createMockContext({ errors: metSearchCollections.errors });
+      const input = metSearchCollections.input.parse({
+        q: 'sunflower',
+        isPublicDomain: true,
+        limit: 20,
+      });
+
+      const result = await metSearchCollections.handler(input, ctx);
+      const parsed = metSearchCollections.output.safeParse(result);
+      expect(parsed.error?.message).toBeUndefined();
+      expect(parsed.success).toBe(true);
+
+      // content[] carries the intersected count, not the upstream filtered total.
+      const text = (metSearchCollections.format!(result)[0] as { text: string }).text;
+      expect(text).toContain('**Total matches:** 1');
+      expect(text).toContain('436529');
+      expect(text).not.toContain('228990');
+      expect(text).toContain('(complete)');
+    });
+  });
+
+  /**
+   * The control run is the broadest form of the query and can take far longer than
+   * the filtered one it corrects: `q=the&departmentId=11` answers in 0.44s with 132
+   * IDs, while `q=the` alone needs 12.7s to deliver 2.7 MB — past the default 10s
+   * request timeout. Failing the whole search on that would make a fast, working,
+   * narrow query unusable in order to strip a floor of 2, so a control failure
+   * degrades to the uncorrected behavior and discloses it.
+   */
+  describe('search — a failed control run degrades instead of failing the search (#21)', () => {
+    /** Filtered run succeeds; the unfiltered control run fails with `error`. */
+    function controlFails(error: unknown, filtered: unknown = { total: 3, objectIDs: [1, 2, 3] }) {
+      return (request: unknown) =>
+        isControlRun(request) ? Promise.reject(error) : Promise.resolve(jsonResponse(filtered));
+    }
+
+    it('returns the filtered IDs and the upstream total when the control run times out', async () => {
+      fetchMock.mockImplementation(controlFails(timeout('Upstream request timed out.')));
+      const result = await getMetService().search(
+        { q: 'the', isPublicDomain: true, limit: 20 },
+        createMockContext(),
+      );
+
+      // Uncorrected — exactly what this tool returns today, rather than an error.
+      expect(result.objectIDs).toEqual([1, 2, 3]);
+      expect(result.total).toBe(3);
+      expect(result.returned).toBe(3);
+      expect(result.truncated).toBe(false);
+    });
+
+    it('does not raise search_timeout when only the control run timed out', async () => {
+      fetchMock.mockImplementation(controlFails(timeout('Upstream request timed out.')));
+      const ctx = createMockContext({ errors: metSearchCollections.errors });
+
+      await expect(
+        getMetService().search({ q: 'the', hasImages: true, limit: 20 }, ctx),
+      ).resolves.toMatchObject({ objectIDs: [1, 2, 3] });
+    });
+
+    it('still raises search_timeout when the filtered run itself times out', async () => {
+      fetchMock.mockImplementation((request: unknown) =>
+        isControlRun(request)
+          ? Promise.resolve(jsonResponse(idsBody([1, 2, 3])))
+          : Promise.reject(timeout('Upstream request timed out.')),
+      );
+      const ctx = createMockContext({ errors: metSearchCollections.errors });
+
+      const err = await getMetService()
+        .search({ q: 'the', hasImages: true, limit: 20 }, ctx)
+        .catch((e) => e);
+
+      expect(err.code).toBe(JsonRpcErrorCode.Timeout);
+      expect(err.data.reason).toBe('search_timeout');
+      expect(err.data.retryable).toBe(false);
+    });
+
+    it('degrades on a non-timeout control failure too', async () => {
+      fetchMock.mockImplementation(controlFails(new Error('socket hang up')));
+      const result = await getMetService().search(
+        { q: 'the', medium: 'Paintings', limit: 20 },
+        createMockContext(),
+      );
+
+      expect(result.objectIDs).toEqual([1, 2, 3]);
+      expect(result.total).toBe(3);
+    });
+
+    it('does not re-run the whole search through withRetry when the control run fails', async () => {
+      fetchMock.mockImplementation(controlFails(new Error('socket hang up')));
+      await getMetService().search({ q: 'the', hasImages: true, limit: 20 }, createMockContext());
+
+      // One filtered call and one control call — a retried search would show more.
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it('attaches a notice naming the query, the risk, and the way to get the check to run', async () => {
+      fetchMock.mockImplementation(controlFails(timeout('Upstream request timed out.')));
+      const ctx = createMockContext({ errors: metSearchCollections.errors });
+      await getMetService().search({ q: 'the', isPublicDomain: true, limit: 20 }, ctx);
+
+      const notice = String(getEnrichment(ctx).notice ?? '');
+      expect(notice).toContain('"the"');
+      expect(notice).toContain('unrelated');
+      expect(notice).toContain('narrower keyword');
+      expect(notice).toContain('met_get_object');
+    });
+
+    it('attaches no notice when the control run succeeded', async () => {
+      fetchMock.mockImplementation(routeSearch(idsBody([1, 2, 3]), idsBody([1, 2])));
+      const ctx = createMockContext({ errors: metSearchCollections.errors });
+      const result = await getMetService().search(
+        { q: 'cat', isPublicDomain: true, limit: 20 },
+        ctx,
+      );
+
+      expect(result.objectIDs).toEqual([1, 2]);
+      expect(getEnrichment(ctx).notice).toBeUndefined();
+    });
+
+    it('attaches no notice to an unfiltered search', async () => {
+      fetchMock.mockResolvedValue(jsonResponse({ total: 97, objectIDs: [1, 2, 3] }));
+      const ctx = createMockContext({ errors: metSearchCollections.errors });
+      await getMetService().search({ q: 'sunflower', limit: 20 }, ctx);
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(getEnrichment(ctx).notice).toBeUndefined();
+    });
+
+    it('a control run that legitimately matched nothing still empties the intersection', async () => {
+      // A resolved `objectIDs: null` is the upstream's "zero matches", not a failure
+      // — degrading here would put no_results back out of reach, the whole defect.
+      fetchMock.mockImplementation(
+        routeSearch(
+          { total: 3, objectIDs: [437261, 228990, 436043] },
+          { total: 0, objectIDs: null },
+        ),
+      );
+      const ctx = createMockContext({ errors: metSearchCollections.errors });
+      const result = await getMetService().search(
+        { q: 'zzzqqqxyz', isPublicDomain: true, limit: 5 },
+        ctx,
+      );
+
+      expect(result.total).toBe(0);
+      expect(getEnrichment(ctx).notice).toBeUndefined();
+    });
+
+    it('carries the notice onto structuredContent and content[] through the tool contract', async () => {
+      // runToolContract runs the real pipeline — output parse, format(), enrichment
+      // merge and trailer — so this proves the notice lands where clients read it,
+      // on both surfaces, rather than merely having been requested.
+      fetchMock.mockImplementation(controlFails(timeout('Upstream request timed out.')));
+
+      const result = await runToolContract(metSearchCollections, {
+        q: 'the',
+        isPublicDomain: true,
+        limit: 20,
+      });
+
+      expect(result.isError).toBeFalsy();
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured.total).toBe(3);
+      expect(structured.objectIDs).toEqual([1, 2, 3]);
+      expect(String(structured.notice)).toContain('unrelated');
+
+      const text = (result.content ?? [])
+        .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+        .map((block) => block.text)
+        .join('\n');
+      expect(text).toContain('**Total matches:** 3');
+      expect(text).toContain('unrelated');
+      expect(text).toContain('narrower keyword');
     });
   });
 
