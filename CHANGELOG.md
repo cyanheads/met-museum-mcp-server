@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.0](changelog/0.4.x/0.4.0.md) — 2026-09-09 · ⚠️ Breaking
+
+met_get_object: nullable objectBeginDate/objectEndDate, Markdown-escaped content[] text, null tag URLs normalized
+
 ## [0.3.0](changelog/0.3.x/0.3.0.md) — 2026-09-09 · ⚠️ Breaking
 
 true-only isPublicDomain/isHighlight filters, blank-input rejection, and offset-beyond-result-set signaling for met_search_collections

@@ -1,6 +1,6 @@
 # met-museum-mcp-server - Directory Structure
 
-Generated on: 2026-09-09 22:55:26
+Generated on: 2026-09-09 23:59:13
 
 ```text
 met-museum-mcp-server/
@@ -25,6 +25,7 @@ met-museum-mcp-server/
 │   ├── 0.1.x/
 │   ├── 0.2.x/
 │   ├── 0.3.x/
+│   ├── 0.4.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
@@ -149,6 +150,8 @@ met-museum-mcp-server/
 │   │   └── met/
 │   │       ├── met-service.ts
 │   │       └── types.ts
+│   ├── utils/
+│   │   └── markdown.ts
 │   └── index.ts
 ├── tests/
 │   ├── prompts/
@@ -156,10 +159,13 @@ met-museum-mcp-server/
 │   ├── services/
 │   │   └── met/
 │   │       └── met-service.test.ts
-│   └── tools/
-│       ├── met-get-object.tool.test.ts
-│       ├── met-list-departments.tool.test.ts
-│       └── met-search-collections.tool.test.ts
+│   ├── tools/
+│   │   ├── met-get-object.tool.test.ts
+│   │   ├── met-list-departments.tool.test.ts
+│   │   └── met-search-collections.tool.test.ts
+│   ├── utils/
+│   │   └── markdown.test.ts
+│   └── format-escaping.test.ts
 ├── .dockerignore
 ├── .env.example
 ├── .gitattributes
