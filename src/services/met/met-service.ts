@@ -83,9 +83,11 @@ export interface ObjectRecord {
   isPublicDomain: boolean;
   isTimelineWork: boolean;
   medium: string;
-  objectBeginDate: number;
+  /** Null when the Met has no machine-readable date for the work. */
+  objectBeginDate: number | null;
   objectDate: string;
-  objectEndDate: number;
+  /** Null when the Met has no machine-readable date for the work. */
+  objectEndDate: number | null;
   objectID: number;
   objectName: string;
   objectURL: string;
@@ -117,6 +119,30 @@ export interface Department {
  * filtered search.
  */
 const DEPARTMENT_IDS_CACHE_TTL_MS = 60 * 60 * 1000;
+
+/**
+ * Resolve the machine-readable date range, mapping "unknown" to null.
+ *
+ * The Met sends `0`/`0` when a work has no machine-readable date. Its date model
+ * skips year zero the way historical year numbering requires — object `250240`
+ * encodes "1st century BCE" as `-100` to `-1`, not `-100` to `0` — so zero is
+ * never a real year and is free to carry the sentinel. Only the `0`/`0` pair is
+ * the unknown marker; a single zero bound is left as sent.
+ *
+ * This is the one numeric field pair that departs from the server's `''`/`0`
+ * absence convention, because an unbounded signed year has no safe sentinel.
+ */
+function resolveDateRange(raw: RawObjectRecord): {
+  objectBeginDate: number | null;
+  objectEndDate: number | null;
+} {
+  const objectBeginDate = raw.objectBeginDate ?? null;
+  const objectEndDate = raw.objectEndDate ?? null;
+  if (objectBeginDate === 0 && objectEndDate === 0) {
+    return { objectBeginDate: null, objectEndDate: null };
+  }
+  return { objectBeginDate, objectEndDate };
+}
 
 export class MetService {
   private readonly baseUrl: string;
@@ -298,8 +324,7 @@ export class MetService {
       artistEndDate: raw.artistEndDate ?? '',
       constituents: raw.constituents ?? null,
       objectDate: raw.objectDate ?? '',
-      objectBeginDate: raw.objectBeginDate ?? 0,
-      objectEndDate: raw.objectEndDate ?? 0,
+      ...resolveDateRange(raw),
       medium: raw.medium ?? '',
       dimensions: raw.dimensions ?? '',
       culture: raw.culture ?? '',
@@ -309,7 +334,15 @@ export class MetService {
       creditLine: raw.creditLine ?? '',
       country: raw.country ?? '',
       region: raw.region ?? '',
-      tags: raw.tags ?? null,
+      // Per item, not per array: the Met sends a null AAT_URL/Wikidata_URL for a
+      // term with no Getty/Wikidata record, and the array-level guard above never
+      // descends into it.
+      tags:
+        raw.tags?.map((tag) => ({
+          term: tag.term,
+          AAT_URL: tag.AAT_URL ?? '',
+          Wikidata_URL: tag.Wikidata_URL ?? '',
+        })) ?? null,
       objectWikidata_URL: raw.objectWikidata_URL ?? '',
       GalleryNumber: raw.GalleryNumber ?? '',
     };

@@ -215,8 +215,8 @@ z.object({
       .describe('Object title as catalogued.'),
     isPublicDomain: z.boolean()
       .describe('True when the object is released under CC0 open access. Only true objects return usable image URLs.'),
-    hasImages: z.boolean()
-      .describe('True when primaryImage is non-empty.'),
+    hasCC0Image: z.boolean()
+      .describe('True when a CC0 open-access image URL is available (primaryImage is non-empty). Distinct from met_search_collections\'s hasImages filter, which matches objects that have any image including copyrighted works.'),
     primaryImage: z.string()
       .describe('Full-resolution image URL (CC0 objects only; empty string for non-public-domain works).'),
     primaryImageSmall: z.string()
@@ -262,10 +262,10 @@ z.object({
       .describe('All persons associated with the object. Null for anonymous or unknown attribution.'),
     objectDate: z.string()
       .describe('Human-readable date string (e.g., "1887", "ca. 1295–1294 B.C.", "1700–1800").'),
-    objectBeginDate: z.number().int()
-      .describe('Earliest date as an integer year (negative = BCE). Use for date range comparisons.'),
-    objectEndDate: z.number().int()
-      .describe('Latest date as an integer year (negative = BCE).'),
+    objectBeginDate: z.number().int().nullable()
+      .describe('Earliest date as an integer year (negative = BCE). Null when the Met has no machine-readable date for the work — read objectDate for what is known instead, and do not treat null as year zero or substitute a default.'),
+    objectEndDate: z.number().int().nullable()
+      .describe('Latest date as an integer year (negative = BCE). Null under the same condition as objectBeginDate — the two are null together.'),
     medium: z.string()
       .describe('Materials and techniques (e.g., "Oil on canvas", "Bronze", "Limestone").'),
     dimensions: z.string()
@@ -329,6 +329,10 @@ errors: [
 - A 404 from the API returns `{"message":"ObjectID not found"}` with HTTP 404 — classify as a per-item failure in `failed[]`, not a tool-level throw.
 - Non-public-domain objects (`isPublicDomain: false`) return empty strings for `primaryImage`, `primaryImageSmall`, and `additionalImages` — normalize and derive `hasCC0Image: Boolean(primaryImage)`.
 - `constituents` and `tags` are `null` on the wire for anonymous/untagged objects — pass through as nullable; don't coerce to `[]`.
+- Inside a populated `tags[]`, `AAT_URL` and `Wikidata_URL` are themselves nullable on the wire (a term with no Getty/Wikidata record) — normalize each item's URLs to `''`, matching every other absent string. `constituents[]` sub-fields send `''` and need no per-item guard.
+- `objectBeginDate`/`objectEndDate` are `0`/`0` when the Met has no machine-readable date. The Met's date model skips year zero (object `250240` encodes "1st century BCE" as `-100` to `-1`), so zero is never a real year and is free to carry the sentinel. Normalize that pair to `null`/`null` and render `objectDate` alone in `content[]`; a single zero bound is left as sent.
+- Upstream catalog text is escaped at the `content[]` render boundary (`escapeMarkdown`, `src/utils/markdown.ts`) — real titles carry complete Markdown sequences. `structuredContent` keeps the raw value.
+- The nine URL-shaped fields (`objectURL`, `primaryImage`, `primaryImageSmall`, `additionalImages[]`, `objectWikidata_URL`, `tags[].AAT_URL`, `tags[].Wikidata_URL`, `constituents[].constituentULAN_URL`, `constituents[].constituentWikidata_URL`) are free catalog text, not identifiers — object `288322` sends `(not assigned)` in a constituent's ULAN field. Validate each with `isHttpUrl` before rendering: an `http`/`https` value becomes a link destination unescaped, anything else renders through the prose escaper. Escaping a destination is not an option — a backslash inside one breaks the link.
 - The full object record has many geography fields (`city`, `state`, `county`, `locus`, `excavation`, `river`, etc.) that are almost universally empty. These are excluded from the output schema — the meaningful geographic fields (`country`, `region`) are retained. This keeps the output focused.
 - `GalleryNumber` is `""` (not null) when off display — preserve as-is; an empty string is meaningful ("not on display").
 

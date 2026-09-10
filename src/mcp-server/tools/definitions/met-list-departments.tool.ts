@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { getMetService } from '@/services/met/met-service.js';
+import { escapeMarkdown } from '@/utils/markdown.js';
 
 export const metListDepartments = tool('met_list_departments', {
   title: 'List Met Departments',
@@ -41,7 +42,10 @@ export const metListDepartments = tool('met_list_departments', {
   },
 
   format: (result) => {
-    const lines = result.departments.map((d) => `- **${d.departmentId}** — ${d.displayName}`);
+    // displayName is upstream text — escaped so it cannot restructure content[].
+    const lines = result.departments.map(
+      (d) => `- **${d.departmentId}** — ${escapeMarkdown(d.displayName)}`,
+    );
     return [{ type: 'text', text: `## Met Departments\n\n${lines.join('\n')}` }];
   },
 });

@@ -7,6 +7,7 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getServerConfig } from '@/config/server-config.js';
 import { getMetService } from '@/services/met/met-service.js';
+import { escapeMarkdown, isHttpUrl } from '@/utils/markdown.js';
 
 const ConstituentSchema = z
   .object({
@@ -111,8 +112,17 @@ const ObjectSchema = z
     objectBeginDate: z
       .number()
       .int()
-      .describe('Earliest date as an integer year (negative = BCE).'),
-    objectEndDate: z.number().int().describe('Latest date as an integer year (negative = BCE).'),
+      .nullable()
+      .describe(
+        'Earliest date as an integer year (negative = BCE). Null when the Met has no machine-readable date for the work — read objectDate for what is known instead, and do not treat null as year zero or substitute a default.',
+      ),
+    objectEndDate: z
+      .number()
+      .int()
+      .nullable()
+      .describe(
+        'Latest date as an integer year (negative = BCE). Null under the same condition as objectBeginDate — the two are null together.',
+      ),
     medium: z
       .string()
       .describe('Materials and techniques (e.g., "Oil on canvas", "Bronze", "Limestone").'),
@@ -277,52 +287,76 @@ export const metGetObject = tool('met_get_object', {
 
   format: (result) => {
     const lines: string[] = [];
+    /** Placeholder for an absent value. */
     const orDash = (v: string) => v || '—';
+    /**
+     * Upstream catalog prose. Escaped at this boundary so a title, credit line,
+     * or tag carrying Markdown syntax cannot restructure `content[]` or hide
+     * itself from a client that reads only that surface.
+     */
+    const prose = (v: string) => orDash(escapeMarkdown(v));
+    /**
+     * A URL-shaped upstream field rendered on its own. Validated rather than
+     * escaped — a backslash inside a destination breaks the link — and anything
+     * that is not an http URL is catalog text, so it renders as prose.
+     */
+    const destination = (v: string) => (isHttpUrl(v) ? v : escapeMarkdown(v));
+    /**
+     * The same field inside the server's own `[label](…)` wrapper. A value that
+     * cannot be a destination keeps its label and renders as visible text, so
+     * `(not assigned)` reads honestly instead of as a dead link.
+     */
+    const labeledLink = (label: string, v: string) =>
+      isHttpUrl(v) ? `[${label}](${v})` : `${label}: ${escapeMarkdown(v)}`;
 
     for (const obj of result.objects) {
-      lines.push(`## ${obj.title || '(Untitled)'} — Object ${obj.objectID}`);
+      lines.push(`## ${escapeMarkdown(obj.title) || '(Untitled)'} — Object ${obj.objectID}`);
       lines.push(
         `**isPublicDomain:** ${obj.isPublicDomain ? 'Yes (CC0)' : 'No'} | **hasCC0Image:** ${obj.hasCC0Image ? 'Yes' : 'No'} | **isHighlight:** ${obj.isHighlight ? 'Yes' : 'No'} | **isTimelineWork:** ${obj.isTimelineWork ? 'Yes' : 'No'}`,
       );
       lines.push(
-        `**Artist:** ${orDash(obj.artistDisplayName)}${obj.artistDisplayBio ? ` (${obj.artistDisplayBio})` : ''}`,
+        `**Artist:** ${prose(obj.artistDisplayName)}${obj.artistDisplayBio ? ` (${escapeMarkdown(obj.artistDisplayBio)})` : ''}`,
       );
-      lines.push(`**Nationality:** ${orDash(obj.artistNationality)}`);
+      lines.push(`**Nationality:** ${prose(obj.artistNationality)}`);
       lines.push(
-        `**Artist dates:** ${obj.artistBeginDate || obj.artistEndDate ? `${orDash(obj.artistBeginDate)}–${orDash(obj.artistEndDate)}` : '—'}`,
-      );
-      lines.push(
-        `**Department:** ${orDash(obj.department)} | **Object name:** ${orDash(obj.objectName)} | **Classification:** ${orDash(obj.classification)}`,
+        `**Artist dates:** ${obj.artistBeginDate || obj.artistEndDate ? `${prose(obj.artistBeginDate)}–${prose(obj.artistEndDate)}` : '—'}`,
       );
       lines.push(
-        `**Date:** ${orDash(obj.objectDate)} (${obj.objectBeginDate}–${obj.objectEndDate})`,
+        `**Department:** ${prose(obj.department)} | **Object name:** ${prose(obj.objectName)} | **Classification:** ${prose(obj.classification)}`,
       );
-      lines.push(`**Medium:** ${orDash(obj.medium)}`);
-      lines.push(`**Dimensions:** ${orDash(obj.dimensions)}`);
-      lines.push(`**Culture:** ${orDash(obj.culture)}`);
-      lines.push(`**Period:** ${orDash(obj.period)}`);
-      lines.push(`**Dynasty:** ${orDash(obj.dynasty)}`);
+      // A null range means the Met has no machine-readable date — render the
+      // human-readable field alone rather than a fabricated or empty span.
+      const dateRange =
+        obj.objectBeginDate != null && obj.objectEndDate != null
+          ? ` (${obj.objectBeginDate}–${obj.objectEndDate})`
+          : '';
+      lines.push(`**Date:** ${prose(obj.objectDate)}${dateRange}`);
+      lines.push(`**Medium:** ${prose(obj.medium)}`);
+      lines.push(`**Dimensions:** ${prose(obj.dimensions)}`);
+      lines.push(`**Culture:** ${prose(obj.culture)}`);
+      lines.push(`**Period:** ${prose(obj.period)}`);
+      lines.push(`**Dynasty:** ${prose(obj.dynasty)}`);
       lines.push(
-        `**Geography:** ${obj.country || obj.region ? [obj.country, obj.region].filter(Boolean).join(', ') : '—'}`,
+        `**Geography:** ${orDash([obj.country, obj.region].filter(Boolean).map(escapeMarkdown).join(', '))}`,
       );
-      lines.push(`**Accession:** ${orDash(obj.accessionNumber)}`);
-      lines.push(`**Credit:** ${orDash(obj.creditLine)}`);
-      lines.push(`**Gallery:** ${orDash(obj.GalleryNumber)}`);
-      lines.push(`**URL:** ${orDash(obj.objectURL)}`);
-      lines.push(`**Image (full):** ${orDash(obj.primaryImage)}`);
-      lines.push(`**Image (small):** ${orDash(obj.primaryImageSmall)}`);
+      lines.push(`**Accession:** ${prose(obj.accessionNumber)}`);
+      lines.push(`**Credit:** ${prose(obj.creditLine)}`);
+      lines.push(`**Gallery:** ${prose(obj.GalleryNumber)}`);
+      lines.push(`**URL:** ${orDash(destination(obj.objectURL))}`);
+      lines.push(`**Image (full):** ${orDash(destination(obj.primaryImage))}`);
+      lines.push(`**Image (small):** ${orDash(destination(obj.primaryImageSmall))}`);
       lines.push(
-        `**Additional images${obj.additionalImages.length > 0 ? ` (${obj.additionalImages.length})` : ''}:** ${obj.additionalImages.length > 0 ? obj.additionalImages.join(', ') : '—'}`,
+        `**Additional images${obj.additionalImages.length > 0 ? ` (${obj.additionalImages.length})` : ''}:** ${obj.additionalImages.length > 0 ? obj.additionalImages.map(destination).join(', ') : '—'}`,
       );
-      lines.push(`**Wikidata:** ${orDash(obj.objectWikidata_URL)}`);
+      lines.push(`**Wikidata:** ${orDash(destination(obj.objectWikidata_URL))}`);
       lines.push(
-        `**Tags:** ${obj.tags?.length ? obj.tags.map((t) => `${t.term}${t.AAT_URL ? ` [AAT](${t.AAT_URL})` : ''}${t.Wikidata_URL ? ` [WD](${t.Wikidata_URL})` : ''}`).join(', ') : '—'}`,
+        `**Tags:** ${obj.tags?.length ? obj.tags.map((t) => `${escapeMarkdown(t.term)}${t.AAT_URL ? ` ${labeledLink('AAT', t.AAT_URL)}` : ''}${t.Wikidata_URL ? ` ${labeledLink('WD', t.Wikidata_URL)}` : ''}`).join(', ') : '—'}`,
       );
       const constituents = obj.constituents?.length
         ? obj.constituents
             .map(
               (c) =>
-                `constituentID:${c.constituentID} ${c.name} (${c.role}${c.gender ? `, ${c.gender}` : ''}${c.constituentWikidata_URL ? `, [WD](${c.constituentWikidata_URL})` : ''}${c.constituentULAN_URL ? `, [ULAN](${c.constituentULAN_URL})` : ''})`,
+                `constituentID:${c.constituentID} ${escapeMarkdown(c.name)} (${escapeMarkdown(c.role)}${c.gender ? `, ${escapeMarkdown(c.gender)}` : ''}${c.constituentWikidata_URL ? `, ${labeledLink('WD', c.constituentWikidata_URL)}` : ''}${c.constituentULAN_URL ? `, ${labeledLink('ULAN', c.constituentULAN_URL)}` : ''})`,
             )
             .join('; ')
         : '—';

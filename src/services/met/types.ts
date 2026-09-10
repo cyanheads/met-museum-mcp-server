@@ -79,10 +79,16 @@ export interface RawConstituent {
   role: string;
 }
 
+/**
+ * The two URL fields are nullable on the wire — the Met sends `null`, not `""`,
+ * for a term with no Getty/Wikidata record (confirmed on object 487659's
+ * `Bow and Arrow` tag). `RawConstituent`'s sibling URL fields are not: upstream
+ * sends `""` there, so a guard would be a fallback for an unobserved state.
+ */
 export interface RawTag {
-  AAT_URL: string;
+  AAT_URL: string | null;
   term: string;
-  Wikidata_URL: string;
+  Wikidata_URL: string | null;
 }
 
 /** Raw departments response from GET /departments */
