@@ -4,7 +4,7 @@
  */
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { metGetObject } from '@/mcp-server/tools/definitions/met-get-object.tool.js';
 import { escapeMarkdown } from '@/utils/markdown.js';
@@ -62,6 +62,24 @@ const sampleRecord = {
   creditLine: 'Purchase',
   country: '',
   region: '',
+  geography: {
+    geographyType: '',
+    city: '',
+    state: '',
+    county: '',
+    subregion: '',
+    locale: '',
+    locus: '',
+    excavation: '',
+    river: '',
+  },
+  measurements: [
+    {
+      elementName: 'Overall',
+      elementDescription: '',
+      elementMeasurements: { Height: 73.2, Width: 93.4 },
+    },
+  ],
   tags: [{ term: 'Landscapes', AAT_URL: '', Wikidata_URL: '' }],
   objectWikidata_URL: 'https://www.wikidata.org/wiki/Q45585',
   GalleryNumber: '825',
@@ -104,6 +122,24 @@ const sparseRecord = {
   creditLine: '',
   country: '',
   region: '',
+  geography: {
+    geographyType: '',
+    city: '',
+    state: '',
+    county: '',
+    subregion: '',
+    locale: '',
+    locus: '',
+    excavation: '',
+    river: '',
+  },
+  measurements: null as
+    | {
+        elementName: string;
+        elementDescription: string;
+        elementMeasurements: Record<string, number>;
+      }[]
+    | null,
   tags: null,
   objectWikidata_URL: '',
   GalleryNumber: '',
@@ -127,6 +163,44 @@ function mockCompletionInReverseOrder(ids: number[], notFound = new Set<number>(
     });
   });
 }
+
+/** The budget the tool applies, mirrored here so the arithmetic is explicit. */
+const BUDGET = 60_000;
+
+const utf8Bytes = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).length;
+
+/**
+ * A record whose serialized size is `targetBytes`, padded through a single
+ * ASCII prose field so the size is exact and the padding is inert to format().
+ */
+function sizedRecord(objectID: number, targetBytes: number) {
+  const base = { ...sampleRecord, objectID, creditLine: '' };
+  return { ...base, creditLine: 'x'.repeat(Math.max(0, targetBytes - utf8Bytes(base))) };
+}
+
+/** Resolve each mocked ID to its record; anything else is a 404. */
+function mockRecords(records: { objectID: number }[]): void {
+  const byId = new Map(records.map((r) => [r.objectID, r]));
+  mockGetObject.mockImplementation((objectID: number) => byId.get(objectID) ?? null);
+}
+
+/**
+ * The handler result plus the enrichment it accumulated on the way. `ids`
+ * defaults to the mocked records; pass it explicitly to interleave IDs that
+ * are not mocked, which the service mock resolves as 404s, or to repeat one.
+ */
+async function run(
+  records: { objectID: number }[],
+  ids: number[] = records.map((r) => r.objectID),
+) {
+  mockRecords(records);
+  const ctx = createMockContext({ errors: metGetObject.errors });
+  const result = await metGetObject.handler(metGetObject.input.parse({ objectIDs: ids }), ctx);
+  return { result, enrichment: getEnrichment(ctx) };
+}
+
+/** Numeric, not lexicographic — real Met object IDs are multi-digit. */
+const byNumber = (a: number, b: number) => a - b;
 
 describe('metGetObject', () => {
   beforeEach(() => {
@@ -286,6 +360,391 @@ describe('metGetObject', () => {
     expect(text).toContain('**Constituents:** —');
     // Empty failed[] renders an explicit placeholder, not an omitted section.
     expect(text).toContain('**Failed fetches:** none');
+  });
+
+  describe('batch byte budget (#15)', () => {
+    it('returns every record and discloses nothing when the batch fits', async () => {
+      const { result, enrichment } = await run([sizedRecord(1, 5_000), sizedRecord(2, 5_000)]);
+
+      expect(result.objects).toHaveLength(2);
+      // A fitting batch is what it was before the budget existed: no disclosure
+      // field appears at all on either surface — absent, not empty.
+      expect(result.deferred).toBeUndefined();
+      expect(enrichment.notice).toBeUndefined();
+      expect((metGetObject.format!(result)[0] as { text: string }).text).not.toContain('Deferred');
+    });
+
+    it('defers whole records once the cumulative budget is spent', async () => {
+      // 3 × 20,000 lands exactly on the budget; the fourth cannot fit.
+      const { result } = await run([
+        sizedRecord(1, 20_000),
+        sizedRecord(2, 20_000),
+        sizedRecord(3, 20_000),
+        sizedRecord(4, 20_000),
+      ]);
+
+      expect(result.objects.map((o) => o.objectID)).toEqual([1, 2, 3]);
+      expect(result.deferred?.map((d) => d.objectID)).toEqual([4]);
+      // Every returned record is whole — a deferral never splits one.
+      expect(result.objects.every((o) => o.title === sampleRecord.title)).toBe(true);
+    });
+
+    it('delivers a response larger than the budget, since content[] repeats the records', async () => {
+      mockRecords([sizedRecord(1, 50_000), sizedRecord(2, 30_000)]);
+      const called = await runToolContract(metGetObject, { objectIDs: [1, 2] });
+
+      const structuredBytes = utf8Bytes(called.structuredContent);
+      const contentBytes = utf8Bytes(called.content);
+      const admittedBytes = (
+        called.structuredContent as { objects: unknown[] }
+      ).objects.reduce<number>((sum, o) => sum + utf8Bytes(o), 0);
+
+      // What the budget actually bounds: the admitted records, serialized.
+      expect(admittedBytes).toBeLessThanOrEqual(BUDGET);
+      // content[] renders those same records again, on the same order of
+      // magnitude, so what reaches the wire is roughly twice the budget — which
+      // is why the notice must not present the budget as a response-size cap.
+      expect(contentBytes).toBeGreaterThan(admittedBytes / 2);
+      expect(structuredBytes + contentBytes).toBeGreaterThan(BUDGET);
+    });
+
+    it('names the surface the budget measures, and that the response is larger', async () => {
+      const { enrichment } = await run([sizedRecord(1, 50_000), sizedRecord(2, 30_000)]);
+
+      expect(enrichment.notice).toContain('structuredContent');
+      expect(enrichment.notice).toContain('content[]');
+      // An unqualified "60000-byte batch budget" reads as a bound on the response
+      // an agent is about to receive, which is roughly double that.
+      expect(enrichment.notice).not.toMatch(/60000-byte batch budget/);
+    });
+
+    it('reports each deferred record’s size so a follow-up batch can be sized', async () => {
+      const { result, enrichment } = await run([sizedRecord(1, 50_000), sizedRecord(2, 30_000)]);
+
+      expect(result.deferred).toEqual([{ objectID: 2, bytes: 30_000 }]);
+      expect(enrichment.notice).toContain('60000-byte budget measured on that surface alone');
+      expect(enrichment.notice).toContain('Returned 1 of 2 fetched records');
+    });
+
+    it('admits the first record unconditionally even when it alone exceeds the budget', async () => {
+      // Without the unconditional first admission this ID is unreachable: every
+      // call that requests it would defer it forever.
+      const { result } = await run([sizedRecord(1, BUDGET + 20_000), sizedRecord(2, 1_000)]);
+
+      expect(result.objects.map((o) => o.objectID)).toEqual([1]);
+      expect(result.deferred?.map((d) => d.objectID)).toEqual([2]);
+    });
+
+    it('partitions every requested ID across objects, failed, and deferred exactly once', async () => {
+      // Real multi-digit Met IDs: a single-digit fixture makes the union comparison
+      // below pass under a lexicographic sort, which would not hold for real input.
+      // 11207 and 45734 are interleaved 404s; 548211 overflows and 544683 follows
+      // it into deferred.
+      const requested = [437980, 11207, 548211, 544683, 45734];
+      const { result: mixed } = await run(
+        [sizedRecord(437980, 30_000), sizedRecord(548211, 40_000), sizedRecord(544683, 2_000)],
+        requested,
+      );
+
+      const returned = mixed.objects.map((o) => o.objectID);
+      const failed = mixed.failed.map((f) => f.objectID);
+      const deferred = mixed.deferred?.map((d) => d.objectID) ?? [];
+
+      expect(returned).toEqual([437980]);
+      expect(failed).toEqual([11207, 45734]);
+      expect(deferred).toEqual([548211, 544683]);
+
+      const union = [...returned, ...failed, ...deferred];
+      expect([...union].sort(byNumber)).toEqual([...requested].sort(byNumber));
+      // Exactly once, not merely all-present: a duplicated ID would still satisfy
+      // a membership check while breaking the partition.
+      expect(new Set(union).size).toBe(union.length);
+    });
+
+    it('spends the budget in request order when fetches complete out of order', async () => {
+      // The budget cases above mock a synchronous service, so they resolve in input
+      // order no matter how the handler assembles its results — a completion-ordered
+      // handler would pass them and still return a scattered set. Here the first
+      // input ID resolves last, which is what makes "objects[] is a prefix of the
+      // successes in request order" a real assertion rather than a restatement.
+      const ids = [104, 100, 106, 102, 108];
+      const byId = new Map(ids.map((id) => [id, sizedRecord(id, 25_000)]));
+      mockGetObject.mockImplementation(
+        (objectID: number) =>
+          new Promise((resolve) =>
+            setTimeout(() => resolve(byId.get(objectID)), (ids.length - ids.indexOf(objectID)) * 5),
+          ),
+      );
+
+      const ctx = createMockContext({ errors: metGetObject.errors });
+      const result = await metGetObject.handler(metGetObject.input.parse({ objectIDs: ids }), ctx);
+
+      // 2 × 25,000 fits; a third would not. Completion order was [108, 102, 106, 100, 104].
+      expect(result.objects.map((o) => o.objectID)).toEqual([104, 100]);
+      expect(result.deferred?.map((d) => d.objectID)).toEqual([106, 102, 108]);
+    });
+
+    it('bounds a heavy 20-ID batch, in request order, under the budget', async () => {
+      // The reported defect's shape: twenty records each far heavier than typical.
+      const records = Array.from({ length: 20 }, (_, i) => sizedRecord(i + 1, 5_000));
+      const { result } = await run(records);
+
+      expect(result.objects.map((o) => o.objectID)).toEqual([
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+      ]);
+      expect(result.deferred?.map((d) => d.objectID)).toEqual([13, 14, 15, 16, 17, 18, 19, 20]);
+      // The invariant the handler enforces: the sum of the admitted records fits,
+      // and one more would have broken it.
+      const admitted = result.objects.reduce((sum, o) => sum + utf8Bytes(o), 0);
+      expect(admitted).toBeLessThanOrEqual(BUDGET);
+      expect(admitted + (result.deferred?.[0]?.bytes ?? 0)).toBeGreaterThan(BUDGET);
+    });
+
+    it('leaves a sparse batch of many records entirely untouched', async () => {
+      const records = Array.from({ length: 20 }, (_, i) => ({ ...sparseRecord, objectID: i + 1 }));
+      const { result } = await run(records);
+
+      expect(result.objects).toHaveLength(20);
+      expect(result.deferred).toBeUndefined();
+    });
+
+    it('discloses the same budget outcome on both client surfaces', async () => {
+      // Driven through the real contract boundary so structuredContent and
+      // content[] are the ones a client would actually receive — enrichment
+      // included, which format() never renders itself.
+      mockRecords([sizedRecord(1, 50_000), sizedRecord(2, 30_000)]);
+      const called = await runToolContract(metGetObject, { objectIDs: [1, 2] });
+
+      const structured = called.structuredContent as {
+        objects: { objectID: number }[];
+        deferred?: { objectID: number; bytes: number }[];
+        notice?: string;
+      };
+      const text = called.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+
+      expect(structured.objects.map((o) => o.objectID)).toEqual([1]);
+      expect(structured.deferred).toEqual([{ objectID: 2, bytes: 30_000 }]);
+      expect(structured.notice).toContain('Returned 1 of 2 fetched records');
+
+      // The same outcome, in the markdown twin — including the caveat that the
+      // budget bounds structuredContent, not the response the caller receives.
+      expect(text).toContain('## Deferred — batch byte budget');
+      expect(text).toContain('- **2:** 30000 bytes');
+      expect(text).toContain('Returned 1 of 2 fetched records');
+      expect(text).toContain('the delivered response is roughly twice that');
+      expect(structured.notice).toContain('the delivered response is roughly twice that');
+    });
+  });
+
+  describe('duplicate object IDs', () => {
+    it('fetches and returns a repeated ID once', async () => {
+      const { result } = await run([sizedRecord(437980, 5_000)], [437980, 437980]);
+
+      expect(result.objects.map((o) => o.objectID)).toEqual([437980]);
+      expect(result.deferred).toBeUndefined();
+      expect(mockGetObject).toHaveBeenCalledTimes(1);
+    });
+
+    it('never lists a repeated ID in both objects[] and deferred[]', async () => {
+      // One ID heavy enough to spend the budget, requested twice: the second
+      // occurrence overflows and the caller is told to re-request a record it
+      // already received, breaking the returned/failed/deferred partition.
+      const { result } = await run([sizedRecord(437980, 50_000)], [437980, 437980]);
+
+      expect(result.objects.map((o) => o.objectID)).toEqual([437980]);
+      expect(result.deferred).toBeUndefined();
+    });
+
+    it('does not let a repeat spend the budget twice and displace a distinct record', async () => {
+      const { result } = await run(
+        [sizedRecord(437980, 50_000), sizedRecord(548211, 5_000)],
+        [437980, 437980, 548211],
+      );
+
+      // 50,000 + 5,000 fits the budget; charging 437980 twice would defer 548211.
+      expect(result.objects.map((o) => o.objectID)).toEqual([437980, 548211]);
+      expect(result.deferred).toBeUndefined();
+    });
+
+    it('collapses an all-duplicate call to one fetch and one record', async () => {
+      const { result } = await run([sizedRecord(437980, 5_000)], [437980, 437980, 437980]);
+
+      expect(result.objects.map((o) => o.objectID)).toEqual([437980]);
+      expect(mockGetObject).toHaveBeenCalledTimes(1);
+    });
+
+    it('reports a repeated ID that fails upstream once in failed[]', async () => {
+      // 11207 is not mocked, so the service mock resolves it as a 404.
+      const { result } = await run([sizedRecord(437980, 5_000)], [437980, 11207, 11207]);
+
+      expect(result.objects.map((o) => o.objectID)).toEqual([437980]);
+      expect(result.failed.map((f) => f.objectID)).toEqual([11207]);
+    });
+
+    it('counts unique IDs, not repeats, when every fetch fails', async () => {
+      mockRecords([]);
+      const ctx = createMockContext({ errors: metGetObject.errors });
+
+      await expect(
+        metGetObject.handler(metGetObject.input.parse({ objectIDs: [11207, 11207] }), ctx),
+      ).rejects.toMatchObject({
+        code: JsonRpcErrorCode.NotFound,
+        data: { reason: 'all_not_found' },
+        message: expect.stringContaining('All 1 requested object ID not found'),
+      });
+    });
+
+    it('keeps a repeated ID at its first requested position', async () => {
+      const { result } = await run(
+        [sizedRecord(437980, 5_000), sizedRecord(548211, 5_000), sizedRecord(544683, 5_000)],
+        [544683, 437980, 548211, 437980],
+      );
+
+      expect(result.objects.map((o) => o.objectID)).toEqual([544683, 437980, 548211]);
+    });
+
+    it('leaves a duplicate-free call untouched', async () => {
+      const { result, enrichment } = await run([
+        sizedRecord(437980, 5_000),
+        sizedRecord(548211, 5_000),
+      ]);
+
+      expect(result.objects.map((o) => o.objectID)).toEqual([437980, 548211]);
+      expect(result.failed).toEqual([]);
+      expect(result.deferred).toBeUndefined();
+      expect(enrichment.notice).toBeUndefined();
+      expect(mockGetObject).toHaveBeenCalledTimes(2);
+    });
+
+    it('renders a repeated ID once on both client surfaces', async () => {
+      mockRecords([sizedRecord(437980, 5_000)]);
+      const called = await runToolContract(metGetObject, { objectIDs: [437980, 437980] });
+
+      const structured = called.structuredContent as {
+        objects: { objectID: number }[];
+        deferred?: { objectID: number }[];
+      };
+      const text = called.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+
+      expect(structured.objects.map((o) => o.objectID)).toEqual([437980]);
+      expect(structured.deferred).toBeUndefined();
+      expect(text.match(/— Object 437980/g)).toHaveLength(1);
+    });
+  });
+
+  describe('geography and measurements (#16)', () => {
+    /** 548211's shape after normalization — seven findspot fields, three axes. */
+    const geographyRichRecord = {
+      ...sparseRecord,
+      objectID: 548211,
+      title: 'Sarcophagus of Harkhebit',
+      country: 'Egypt',
+      region: 'Memphite Region',
+      geography: {
+        geographyType: 'From',
+        city: '',
+        state: '',
+        county: '',
+        subregion: 'Saqqara',
+        locale: 'Late Period cemetery, Tomb of Harkhebit',
+        locus: 'burial chamber',
+        excavation: 'Egyptian Antiquities Service excavations, 1902',
+        river: '',
+      },
+      measurements: [
+        {
+          elementName: 'Overall',
+          elementDescription: '',
+          elementMeasurements: { Height: 256.5405, Thickness: 132.0803, Width: 127.0003 },
+        },
+      ],
+    };
+
+    /** 544683's shape — sibling elements carrying different axis keys. */
+    const multiMeasurementRecord = {
+      ...sparseRecord,
+      objectID: 544683,
+      measurements: [
+        {
+          elementName: 'Other',
+          elementDescription: 'Depth nxt to boy',
+          elementMeasurements: { Depth: 4.8 },
+        },
+        {
+          elementName: 'Other',
+          elementDescription: 'Depth nxt to man',
+          elementMeasurements: { Depth: 5.7 },
+        },
+        {
+          elementName: 'Overall',
+          elementDescription: '',
+          elementMeasurements: { Height: 17, Width: 12.5 },
+        },
+      ],
+    };
+
+    const render = (record: typeof sparseRecord) =>
+      (metGetObject.format!({ objects: [record], failed: [] })[0] as { text: string }).text;
+
+    it('renders populated findspot fields on the existing Geography line', () => {
+      const text = render(geographyRichRecord);
+
+      expect(text).toContain(
+        '**Geography:** Egypt, Memphite Region (Type: From; Subregion: Saqqara; Locale: Late Period cemetery, Tomb of Harkhebit; Locus: burial chamber; Excavation: Egyptian Antiquities Service excavations, 1902)',
+      );
+      // Empty findspot fields are omitted, not dashed — nine placeholders would
+      // bury the two fields that are usually populated.
+      expect(text).not.toContain('City:');
+      expect(text).not.toContain('River:');
+    });
+
+    it('leaves the Geography line exactly as it was when no findspot is recorded', () => {
+      // sampleRecord has an all-empty geography block, so its line must not gain
+      // a parenthetical.
+      const text = (
+        metGetObject.format!({ objects: [sampleRecord], failed: [] })[0] as { text: string }
+      ).text;
+      expect(text).toContain('**Geography:** —\n');
+    });
+
+    it('renders every measurement element with its own axis keys', () => {
+      const text = render(multiMeasurementRecord);
+
+      expect(text).toContain(
+        '**Measurements:** Other (Depth nxt to boy): Depth 4.8; Other (Depth nxt to man): Depth 5.7; Overall: Height 17, Width 12.5',
+      );
+    });
+
+    it('renders a multi-axis element without inventing axes it does not carry', () => {
+      const text = render(geographyRichRecord);
+
+      expect(text).toContain(
+        '**Measurements:** Overall: Height 256.5405, Thickness 132.0803, Width 127.0003',
+      );
+      expect(text).not.toContain('Depth');
+      expect(text).not.toContain('Length');
+    });
+
+    it('renders a placeholder when measurements is null, like the other nullable arrays', () => {
+      expect(render(sparseRecord)).toContain('**Measurements:** —');
+    });
+
+    it('escapes upstream text in element names, descriptions, and axis keys', () => {
+      // The axis keys are upstream map keys, not schema-fixed labels — they reach
+      // content[] as text and are escaped on the same boundary as the values.
+      const text = render({
+        ...sparseRecord,
+        measurements: [
+          {
+            elementName: '[Overall]',
+            elementDescription: '*sight*',
+            elementMeasurements: { Height_max: 12 },
+          },
+        ],
+      });
+
+      expect(text).toContain('**Measurements:** \\[Overall\\] (\\*sight\\*): Height\\_max 12');
+    });
   });
 
   describe('format — unknown machine-readable date (#14)', () => {

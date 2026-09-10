@@ -248,6 +248,131 @@ const rawObjects = {
     objectWikidata_URL: '',
     GalleryNumber: '',
   },
+
+  /**
+   * 548211 — the richest findspot in the sampled archaeological departments:
+   * seven geography fields populated at once, and a single measurements element
+   * carrying three axes.
+   */
+  geographyRich: {
+    objectID: 548211,
+    title: 'Sarcophagus of Harkhebit',
+    isPublicDomain: true,
+    primaryImage: 'https://images.metmuseum.org/CRDImages/eg/original/07.229.1a-b_EGDP011797.jpg',
+    primaryImageSmall: '',
+    additionalImages: [],
+    objectURL: 'https://www.metmuseum.org/art/collection/search/548211',
+    department: 'Egyptian Art',
+    objectName: 'Sarcophagus, Harkhebit',
+    classification: '',
+    isHighlight: false,
+    isTimelineWork: true,
+    artistDisplayName: '',
+    artistDisplayBio: '',
+    artistNationality: '',
+    artistBeginDate: '',
+    artistEndDate: '',
+    constituents: null,
+    objectDate: '595–526 BCE',
+    objectBeginDate: -595,
+    objectEndDate: -526,
+    medium: 'Greywacke',
+    dimensions: 'H. 256.5 cm  (101 in.); W. 127 cm (50 in.) at shoulders',
+    culture: '',
+    period: 'Late Period (Saite)',
+    dynasty: 'Dynasty 26, mid to late',
+    accessionNumber: '07.229.1a, b',
+    creditLine: 'Rogers Fund, 1907',
+    country: 'Egypt',
+    region: 'Memphite Region',
+    geographyType: 'From',
+    city: '',
+    state: '',
+    county: '',
+    subregion: 'Saqqara',
+    locale: 'Late Period cemetery, Tomb of Harkhebit',
+    locus: 'burial chamber',
+    excavation: 'Egyptian Antiquities Service excavations, 1902',
+    river: '',
+    measurements: [
+      {
+        elementName: 'Overall',
+        elementDescription: null,
+        elementMeasurements: { Height: 256.5405, Thickness: 132.0803, Width: 127.0003 },
+      },
+    ],
+    tags: null,
+    objectWikidata_URL: 'https://www.wikidata.org/wiki/Q28670008',
+    GalleryNumber: '123',
+  },
+
+  /**
+   * 544683 — three measurement elements whose axis keys differ from one another:
+   * two `Depth`-only siblings distinguished only by their descriptions, and one
+   * `Height`/`Width` element with a null description. The shape a fixed set of
+   * named measurement fields could not carry.
+   */
+  multiMeasurement: {
+    objectID: 544683,
+    title: 'Statue of two men and a boy that served as a domestic icon',
+    isPublicDomain: true,
+    primaryImage: 'https://images.metmuseum.org/CRDImages/eg/original/DP206147.jpg',
+    primaryImageSmall: '',
+    additionalImages: [],
+    objectURL: 'https://www.metmuseum.org/art/collection/search/544683',
+    department: 'Egyptian Art',
+    objectName: 'Statue group, two men, boy',
+    classification: '',
+    isHighlight: true,
+    isTimelineWork: true,
+    artistDisplayName: '',
+    artistDisplayBio: '',
+    artistNationality: '',
+    artistBeginDate: '',
+    artistEndDate: '',
+    constituents: null,
+    objectDate: 'ca. 1347–1330 BCE',
+    objectBeginDate: -1353,
+    objectEndDate: -1353,
+    medium: 'Limestone, paint',
+    dimensions: 'h. 17 cm (6 11/16 in); w. 12.5 cm (4 15/16 in)',
+    culture: '',
+    period: 'New Kingdom, Amarna Period',
+    dynasty: 'Dynasty 18',
+    accessionNumber: '11.150.21',
+    creditLine: 'Rogers Fund, 1911',
+    country: '',
+    region: 'Middle Egypt',
+    geographyType: 'Probably originally from',
+    city: '',
+    state: '',
+    county: '',
+    subregion: 'Amarna (Akhetaten)',
+    locale: '',
+    locus: '',
+    excavation: '',
+    river: '',
+    measurements: [
+      {
+        elementName: 'Other',
+        elementDescription: 'Depth nxt to boy',
+        elementMeasurements: { Depth: 4.8 },
+      },
+      {
+        elementName: 'Other',
+        elementDescription: 'Depth nxt to man',
+        elementMeasurements: { Depth: 5.7 },
+      },
+      {
+        elementName: 'Overall',
+        elementDescription: null,
+        elementMeasurements: { Height: 17, Width: 12.5 },
+      },
+    ],
+    tags: null,
+    objectWikidata_URL: 'https://www.wikidata.org/wiki/Q29385817',
+    GalleryNumber: '121',
+  },
 } as const;
 
 describe('MetService', () => {
@@ -497,6 +622,104 @@ describe('MetService', () => {
       expect(record?.hasCC0Image).toBe(false);
       expect(record?.tags).toBeNull();
       expect(record?.constituents).toBeNull();
+    });
+
+    describe('geography and measurements (#16)', () => {
+      it('normalizes the nine findspot fields without touching country/region', async () => {
+        fetchMock.mockResolvedValue(jsonResponse(rawObjects.geographyRich));
+        const record = await getMetService().getObject(548211, createMockContext());
+
+        expect(record?.geography).toEqual({
+          geographyType: 'From',
+          city: '',
+          state: '',
+          county: '',
+          subregion: 'Saqqara',
+          locale: 'Late Period cemetery, Tomb of Harkhebit',
+          locus: 'burial chamber',
+          excavation: 'Egyptian Antiquities Service excavations, 1902',
+          river: '',
+        });
+        // country and region stay top-level and are not duplicated into the block.
+        expect(record?.country).toBe('Egypt');
+        expect(record?.region).toBe('Memphite Region');
+        expect(record?.geography).not.toHaveProperty('country');
+        expect(record?.geography).not.toHaveProperty('region');
+      });
+
+      it('defaults every findspot field to the empty-string convention when absent', async () => {
+        fetchMock.mockResolvedValue(jsonResponse({ objectID: 999 }));
+        const record = await getMetService().getObject(999, createMockContext());
+
+        expect(Object.values(record?.geography ?? {})).toEqual(Array(9).fill(''));
+      });
+
+      it('preserves every measurements element in order, each with its own axes', async () => {
+        fetchMock.mockResolvedValue(jsonResponse(rawObjects.multiMeasurement));
+        const record = await getMetService().getObject(544683, createMockContext());
+
+        expect(record?.measurements).toEqual([
+          {
+            elementName: 'Other',
+            elementDescription: 'Depth nxt to boy',
+            elementMeasurements: { Depth: 4.8 },
+          },
+          {
+            elementName: 'Other',
+            elementDescription: 'Depth nxt to man',
+            elementMeasurements: { Depth: 5.7 },
+          },
+          // Sibling elements carry different axis keys — the open map is load-bearing.
+          {
+            elementName: 'Overall',
+            elementDescription: '',
+            elementMeasurements: { Height: 17, Width: 12.5 },
+          },
+        ]);
+      });
+
+      it('normalizes a null elementDescription to the empty-string convention', async () => {
+        fetchMock.mockResolvedValue(jsonResponse(rawObjects.geographyRich));
+        const record = await getMetService().getObject(548211, createMockContext());
+
+        // Null on the wire; '' here, matching the tag URL fields rather than the
+        // date pair — a string field has a safe in-domain sentinel.
+        expect(record?.measurements?.[0]?.elementDescription).toBe('');
+        expect(record?.measurements?.[0]?.elementMeasurements).toEqual({
+          Height: 256.5405,
+          Thickness: 132.0803,
+          Width: 127.0003,
+        });
+      });
+
+      it('keeps a null measurements array null rather than coercing it to []', async () => {
+        fetchMock.mockResolvedValue(jsonResponse({ objectID: 999, measurements: null }));
+        const record = await getMetService().getObject(999, createMockContext());
+
+        expect(record?.measurements).toBeNull();
+      });
+
+      it('defaults a measurement element with no axes to an empty map', async () => {
+        fetchMock.mockResolvedValue(
+          jsonResponse({ objectID: 999, measurements: [{ elementName: 'Overall' }] }),
+        );
+        const record = await getMetService().getObject(999, createMockContext());
+
+        expect(record?.measurements).toEqual([
+          { elementName: 'Overall', elementDescription: '', elementMeasurements: {} },
+        ]);
+      });
+
+      it('produces a geography-rich record met_get_object’s output schema accepts', async () => {
+        fetchMock.mockResolvedValue(jsonResponse(rawObjects.geographyRich));
+        const rich = await getMetService().getObject(548211, createMockContext());
+        fetchMock.mockResolvedValue(jsonResponse(rawObjects.multiMeasurement));
+        const multi = await getMetService().getObject(544683, createMockContext());
+
+        const parsed = metGetObject.output.safeParse({ objects: [rich, multi], failed: [] });
+        expect(parsed.error?.message).toBeUndefined();
+        expect(parsed.success).toBe(true);
+      });
     });
 
     describe('unknown machine-readable dates (#14)', () => {

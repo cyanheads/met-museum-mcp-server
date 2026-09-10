@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.4.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/met-museum-mcp-server) [![MCP Server](https://img.shields.io/badge/MCP%20Server-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/met-museum-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/met-museum-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.5.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/met-museum-mcp-server) [![MCP Server](https://img.shields.io/badge/MCP%20Server-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/met-museum-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/met-museum-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -70,12 +70,15 @@ Search the Met collection by keyword and optional filters.
 
 Fetch full records for one or more Met Museum object IDs.
 
-- Accepts 1–20 IDs per call
+- Accepts 1–20 IDs per call; a repeated ID is fetched and returned once, at its first position
 - Partial-success — a single 404 does not fail the whole batch; failed IDs are reported per-ID
 - Full metadata: title, department, classification, medium, dimensions, date, culture, period, dynasty, accession number, credit line, gallery number
 - Artist data: display name, biography, nationality, dates, Getty ULAN URL, Wikidata URL
 - Constituents array for all associated persons (null for anonymous/unattributed works)
 - Controlled vocabulary tags with Getty AAT and Wikidata URLs
+- Nested `geography` block with the nine findspot fields beyond `country`/`region` — `geographyType`, `city`, `state`, `county`, `subregion`, `locale`, `locus`, `excavation`, `river` — each an empty string when the Met records nothing
+- Structured `measurements` array: one entry per measured element, each with an open map of axis name to value (centimeters for spatial axes, kilograms for weight). Null when the Met records none
+- Records are returned whole and never truncated. A call whose records together exceed a cumulative budget on serialized `structuredContent` bytes returns fewer of them; the rest are listed in `deferred[]` with their sizes, to re-request in a follow-up call. `content[]` re-renders the admitted records, so the delivered response is roughly twice the budget
 - Canonical metmuseum.org URL for human follow-up
 - CC0 objects return full-resolution and web-display image URLs plus additional image arrays
 - Object-level Wikidata URL for enrichment via external knowledge graph tools

@@ -284,6 +284,31 @@ z.object({
       .describe('Country of origin. Often empty.'),
     region: z.string()
       .describe('Geographic region of origin. Often empty.'),
+    geography: z.object({
+      geographyType: z.string()
+        .describe('How the object relates to the place (e.g., "From", "Original"). Empty when the Met records no findspot.'),
+      city: z.string().describe('City of origin or findspot. Empty on nearly every record.'),
+      state: z.string().describe('State or province of origin. Empty on nearly every record.'),
+      county: z.string().describe('County of origin. Empty on nearly every record.'),
+      subregion: z.string()
+        .describe('Sub-region or site within the region (e.g., "Saqqara"). Commonly populated for archaeological departments.'),
+      locale: z.string()
+        .describe('Named place within the site (e.g., "Tomb of Harkhebit"). Excavated objects only.'),
+      locus: z.string()
+        .describe('Specific findspot within the locale (e.g., "burial chamber"). Excavated objects only.'),
+      excavation: z.string()
+        .describe('Excavation that recovered the object (e.g., "MMA excavations, 1928-29"). Excavated objects only.'),
+      river: z.string().describe('Associated river. Empty on nearly every record.'),
+    }).describe('Findspot detail beyond the top-level country and region, which are not repeated here.'),
+    measurements: z.array(z.object({
+      elementName: z.string()
+        .describe('Which part of the object was measured (e.g., "Overall", "Other", "Length").'),
+      elementDescription: z.string()
+        .describe('Qualifier distinguishing this element from a sibling with the same name (e.g., "Print" vs "Negativ"). Empty when the Met records none.'),
+      elementMeasurements: z.record(z.string(), z.number())
+        .describe('Measured axes for this element — centimeters for spatial axes, kilograms for weight. Which keys are present varies element to element.'),
+    })).nullable()
+      .describe('Structured element measurements — the numeric counterpart to the formatted dimensions string. Null when the Met records none.'),
     tags: z.array(z.object({
       term: z.string()
         .describe('Tag label (e.g., "Men", "Self-portraits", "Flowers").'),
@@ -305,7 +330,24 @@ z.object({
     error: z.string()
       .describe('Error detail and suggested recovery action.'),
   })).describe('Object IDs that failed to fetch with per-ID error context.'),
+
+  deferred: z.array(z.object({
+    objectID: z.number().int()
+      .describe('Object ID whose record was fetched but withheld from this response.'),
+    bytes: z.number().int().nonnegative()
+      .describe('Serialized structuredContent size of the withheld record — the same scale the budget is measured on — so a follow-up batch can be sized before it is requested.'),
+  })).optional()
+    .describe('Records that were fetched but did not fit the call\'s cumulative budget on serialized structuredContent bytes, in request order. Absent when every fetched record fit.'),
 })
+```
+
+**Enrichment block:**
+
+```ts
+enrichment: {
+  notice: z.string().optional()
+    .describe('How to retrieve the deferred records, with the budget applied. Present only when the batch byte budget deferred a record.'),
+}
 ```
 
 **Error contract:**
@@ -333,7 +375,10 @@ errors: [
 - `objectBeginDate`/`objectEndDate` are `0`/`0` when the Met has no machine-readable date. The Met's date model skips year zero (object `250240` encodes "1st century BCE" as `-100` to `-1`), so zero is never a real year and is free to carry the sentinel. Normalize that pair to `null`/`null` and render `objectDate` alone in `content[]`; a single zero bound is left as sent.
 - Upstream catalog text is escaped at the `content[]` render boundary (`escapeMarkdown`, `src/utils/markdown.ts`) — real titles carry complete Markdown sequences. `structuredContent` keeps the raw value.
 - The nine URL-shaped fields (`objectURL`, `primaryImage`, `primaryImageSmall`, `additionalImages[]`, `objectWikidata_URL`, `tags[].AAT_URL`, `tags[].Wikidata_URL`, `constituents[].constituentULAN_URL`, `constituents[].constituentWikidata_URL`) are free catalog text, not identifiers — object `288322` sends `(not assigned)` in a constituent's ULAN field. Validate each with `isHttpUrl` before rendering: an `http`/`https` value becomes a link destination unescaped, anything else renders through the prose escaper. Escaping a destination is not an option — a backslash inside one breaks the link.
-- The full object record has many geography fields (`city`, `state`, `county`, `locus`, `excavation`, `river`, etc.) that are almost universally empty. These are excluded from the output schema — the meaningful geographic fields (`country`, `region`) are retained. This keeps the output focused.
+- The nine findspot fields beyond `country`/`region` ship as a nested `geography` block, each defaulting to `''` when absent (see Decision #7). `country` and `region` stay top-level and are not duplicated into the block.
+- `measurements` is `null` on the wire when the Met records none — pass through as nullable like `tags`/`constituents`. Within a populated array, `elementDescription` is itself nullable on the wire (object `544683`'s `Overall` element) and normalizes to `''`; `elementMeasurements` is an open `Record<string, number>` because sibling elements of one record carry different axis keys, and its keys are upstream text, so `format()` escapes them alongside the element name and description.
+- The records a single call returns are bounded by a cumulative budget on serialized `structuredContent` bytes (see Decision #12). The budget is spent in request order and admits whole records only; anything that does not fit is reported in `deferred[]` with its size, never truncated or dropped. `content[]` re-renders the admitted records, so the delivered response is roughly twice the budget — the disclosure states this rather than leaving the number to read as a response cap.
+- `objectIDs` is de-duplicated before fetching, first occurrence keeping its position (see Decision #13), so a repeated ID is fetched once, charged to the budget once, and appears in exactly one of `objects[]`/`failed[]`/`deferred[]`.
 - `GalleryNumber` is `""` (not null) when off display — preserve as-is; an empty string is meaningful ("not on display").
 
 ---
@@ -454,13 +499,19 @@ The Met API documents `title=true` as a flag that restricts keyword matching to 
 
 The API has no batch endpoint — each object ID requires its own HTTP GET. The search-returns-IDs-only design of the Met API makes serial fetching impractical (a 20-result search would take 20 serial round trips). Batch input with `Promise.allSettled` and a concurrency gate solves this cleanly. Max 20 per call is a practical cap: 20 × ~150ms = ~3s worst case at concurrency 1, or ~600ms at concurrency 5. Larger batches should be multiple tool calls.
 
+The cap bounds *latency*, not response size — a record's cost is driven by its `constituents`/`tags`/`additionalImages`/`measurements` counts, so three composite objects can cost more than twenty sparse ones. Response size is bounded separately (Decision #12); the input cap stays at 20.
+
 ### 6. Exclude `/objects` (full corpus enumeration) from the tool surface
 
 The endpoint returns all 501,731 object IDs. There is no practical agent workflow that needs to enumerate the full collection — it's too large to consume and produces no useful output on its own. Search + department filtering covers all real use cases. The `/objects?departmentIds=&metadataDate=` variant (filtering by department and update date) is marginally useful but also excluded — an agent wanting "all Egyptian Art objects" should use `met_search_collections` with `departmentId=10`.
 
-### 7. Exclude sparse geography fields from `met_get_object` output
+### 7. Geography fields are department-stratified, not universally empty — expose them as a nested block
 
-The API record has 10+ geography fields (`city`, `state`, `county`, `locale`, `locus`, `excavation`, `river`, etc.). For the overwhelming majority of records, all of these are empty strings. Including them would bloat every response with 10 empty fields. The design retains `country` and `region` as the semantically meaningful geography fields, plus `culture` (which carries geographic context for non-Western works). `geoLocation` search filter maps to these same fields on the source data.
+**Original decision.** The API record has 10+ geography fields (`city`, `state`, `county`, `locale`, `locus`, `excavation`, `river`, etc.), read as almost universally empty and excluded to keep the output focused; `country` and `region` were retained as the semantically meaningful pair, plus `culture` for non-Western works.
+
+**Revision.** "Almost universally empty" holds for `county` and `river`, empty in every record drawn so far. Population of the rest is department-stratified: `subregion` was populated in every draw from the two archaeological departments (Ancient West Asian Art, Egyptian Art), and object `548211` (Sarcophagus of Harkhebit) carried `geographyType`, `country`, `region`, `subregion`, `locale`, `locus`, and `excavation` at once. `city` and `state` look empty only from an archaeological or costume sample — a later draw across Islamic Art, Medieval Art, Asian Art, Arms and Armor, and the Michael C. Rockefeller Wing found `city` on three of six records (`452102` Damascus, `472562` Constantinople (?), `788174` Springfield) and `state` on one (`788174` Massachusetts), making `city` the block's most widely populated field outside the archaeological departments. A researcher who finds a work through `geoLocation` and then fetches it was losing the field that explained the match. Costume Institute records populated none of the nine, so the original reasoning describes those departments correctly.
+
+**Decision.** All nine excluded fields ship, nested under `geography` rather than flattened, so nine sparse fields read as one block instead of nine top-level siblings. `country` and `region` stay exactly where they are and are **not** duplicated into the block — a second copy would force a choice about which is authoritative for no functional gain. Each field defaults to `''` when absent, and `format()` omits an empty one from the rendered Geography line rather than printing a placeholder for it; nine dashes would bury the two fields that usually are populated. The added cost is bounded by Decision #12 like every other field.
 
 ### 8. No resource definitions
 
@@ -477,6 +528,32 @@ An empty string is meaningful: it signals the object is not currently on display
 ### 11. `constituents` vs flat artist fields — include both
 
 The API provides flat `artistDisplayName`, `artistDisplayBio`, `artistNationality`, `artistBeginDate`, `artistEndDate` fields as well as a `constituents` array (which includes role, constituentID, and Wikidata/ULAN URLs). Both are retained. The flat fields are convenient for the 90% case (single artist, well-known work). The `constituents` array is necessary for multi-artist works and for enrichment chains via Wikidata. Many objects omit the `constituents` array (`null`) — primarily anonymous archaeological objects — so it is nullable.
+
+### 12. Bound the returned records by cumulative bytes, not by record count
+
+`met_get_object` returns every field of up to 20 records, and the per-record cost is set by four upstream arrays with no length cap (`constituents`, `tags`, `additionalImages`, and now `measurements`). A live 20-ID batch produced a 159,464-byte response. Nothing in the tool bounded how large a correct response could get.
+
+The alternatives each fail on their own terms: lowering the input cap narrows the advertised `inputSchema` for every existing caller while bounding a proxy rather than the driver; truncating the heavy arrays drops data with no retrieval path; a field selector leaves the default call unchanged and would require making every currently-required output field optional; and defaulting to a compact shape silently gives existing callers less than they asked for.
+
+The framework's `outlineOnOverflow` is built for the *one fat document* case and defaults to a 24,000-byte budget per document — applied per Met record (the heaviest measured normalizes to under 4 KB) it would never fire. `spillover()` is for tabular rows staged to a queryable canvas, and `paginateArray` paginates by element count, the proxy the measurements rule out. So this is a pattern the tool establishes rather than one it adopts, borrowing the outline technique's disclosure vocabulary — per-item sizes, an explicit re-call instruction naming the budget — without its mechanism.
+
+**Decision.** Assemble `objects[]` in request order, admitting whole records while a cumulative 60,000-byte budget lasts, and account for every ID that did not fit in a sibling `deferred[]` carrying its `objectID` and serialized size. Three boundaries:
+
+- **Never a partial record.** A record goes in whole or is deferred whole, so nothing downstream reasons about a half-populated object — and the per-record shape is untouched by the bound.
+- **The first successful record is admitted unconditionally**, even when it alone exceeds the budget. Without that, an unusually large object would be deferred by every call that requested it and become permanently unreachable.
+- **Admission stops at the first record that does not fit**, rather than packing smaller later records around it. The returned set is then a prefix of the successes and a re-call with the deferred IDs continues where the response left off.
+
+60,000 bytes is where the advertised 20-ID cap meets the measured record size: 60,000 / 20 = 3,000 bytes per record, between a typical normalized record (~2.4 KB with Decision #7's fields) and the heaviest sampled one (~3.7 KB). A full 20-ID batch of ordinary records therefore returns whole and unchanged; only a batch whose records run heavy spends the budget early. It is a code constant, not an env var — a deploy-tunable threshold would drift the tool's response shape between environments.
+
+**The budget measures `structuredContent`, and only it** — the surface the sizing measurements identify as dominant. `content[]` renders the same admitted records as markdown, so the response that reaches the wire runs to roughly twice the budget: a call that spent 50,352 bytes of `structuredContent` delivered 100,390 bytes across both surfaces. Measuring one surface is deliberate (admitting against the sum of both would bind the budget to `format()`'s output length, which is a rendering concern), but it makes the disclosure's phrasing load-bearing: the notice names the measured surface and states that the delivered response is larger, so an agent budgeting context off the number is not off by a factor of two.
+
+`deferred[]` is optional and absent when everything fit, so a fitting response is what it was before the bound existed. The re-call guidance rides the `enrichment` block (`ctx.enrich.notice`), which the framework mirrors onto `structuredContent` and `content[]` alike, keeping both surfaces on the same budget outcome.
+
+### 13. De-duplicate `objectIDs` rather than rejecting a repeat
+
+A repeated ID in one call fetched the object twice, charged it to the byte budget twice — displacing a distinct record that would otherwise have fit — and, once the budget was spent, returned it in `objects[]` while also listing it in `deferred[]`, telling the caller to re-request a record it had already received. That breaks Decision #12's partition: every requested ID in exactly one of `objects[]`, `failed[]`, `deferred[]`.
+
+**Decision.** De-duplicate in the handler, first occurrence keeping its position, and advertise it in the `objectIDs` description. A `.refine()` rejecting duplicates was the alternative and is worse on two counts: it narrows the advertised `inputSchema` for input a caller could previously send, and it answers a request with an obvious reading — a repeated ID means the caller wants that record, once — with an error. De-duplicating also halves the upstream calls for such input.
 
 ---
 

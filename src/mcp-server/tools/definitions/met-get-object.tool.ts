@@ -42,6 +42,71 @@ const TagSchema = z
   })
   .describe('A controlled vocabulary tag applied to the object.');
 
+const GeographySchema = z
+  .object({
+    geographyType: z
+      .string()
+      .describe(
+        'How the object relates to the place (e.g., "From", "Original", "Probably originally from"). Empty when the Met records no findspot.',
+      ),
+    city: z
+      .string()
+      .describe(
+        'City of origin or findspot (e.g., "Damascus", "Constantinople (?)", "Springfield"). The most widely populated field of this block outside the archaeological departments; empty when the Met records no city.',
+      ),
+    state: z
+      .string()
+      .describe(
+        'State or province of origin (e.g., "Massachusetts"). Sparse, and concentrated in departments that catalogue a manufacturing place. Empty when the Met records none.',
+      ),
+    county: z.string().describe('County of origin. Empty on nearly every record.'),
+    subregion: z
+      .string()
+      .describe(
+        'Sub-region or site within the region (e.g., "Saqqara", "Deir el-Bahri"). Commonly populated for archaeological departments, empty elsewhere.',
+      ),
+    locale: z
+      .string()
+      .describe(
+        'Named place within the site (e.g., "Late Period cemetery, Tomb of Harkhebit"). Excavated objects only.',
+      ),
+    locus: z
+      .string()
+      .describe(
+        'Specific findspot within the locale (e.g., "burial chamber"). Excavated objects only.',
+      ),
+    excavation: z
+      .string()
+      .describe(
+        'Excavation that recovered the object (e.g., "MMA excavations, 1928-29"). Excavated objects only.',
+      ),
+    river: z.string().describe('Associated river. Empty on nearly every record.'),
+  })
+  .describe(
+    'Findspot detail beyond the top-level country and region, which are not repeated here. Every field is an empty string when the Met records nothing; population concentrates in the archaeological departments.',
+  );
+
+const MeasurementSchema = z
+  .object({
+    elementName: z
+      .string()
+      .describe('Which part of the object was measured (e.g., "Overall", "Other", "Length").'),
+    elementDescription: z
+      .string()
+      .describe(
+        'Qualifier distinguishing this element from a sibling with the same name (e.g., "Print" vs "Negativ"). Empty when the Met records none.',
+      ),
+    elementMeasurements: z
+      .record(
+        z.string().describe('Measurement axis (e.g., "Height", "Width", "Depth", "Length").'),
+        z.number().describe('Measured value — centimeters for spatial axes, kilograms for weight.'),
+      )
+      .describe(
+        'Measured axes for this element. Which keys are present varies element to element, so read the keys rather than assuming a fixed set. Empty object when the Met records no values.',
+      ),
+  })
+  .describe('One measured element of the object.');
+
 const ObjectSchema = z
   .object({
     objectID: z.number().int().describe('Unique Met object identifier.'),
@@ -144,6 +209,13 @@ const ObjectSchema = z
     creditLine: z.string().describe('Provenance and gift/bequest attribution.'),
     country: z.string().describe('Country of origin. Often empty.'),
     region: z.string().describe('Geographic region of origin. Often empty.'),
+    geography: GeographySchema,
+    measurements: z
+      .array(MeasurementSchema)
+      .nullable()
+      .describe(
+        'Structured element measurements — the numeric counterpart to the formatted dimensions string. Null when the Met records none.',
+      ),
     tags: z
       .array(TagSchema)
       .nullable()
@@ -161,12 +233,49 @@ const ObjectSchema = z
   })
   .describe('A fully fetched Met Museum object record.');
 
+/**
+ * Cumulative serialized-byte ceiling for the records one call returns.
+ *
+ * Measured on `structuredContent`, the surface that dominates, and only on it.
+ * `content[]` renders the same admitted records as markdown, so what reaches the
+ * wire is roughly twice this number — the disclosure says so rather than letting
+ * a caller read the budget as a response-size cap.
+ *
+ * The axis is the sum, not the record: no single Met record approaches an
+ * overflow (the heaviest measured normalizes to under 4 KB), while twenty of
+ * them together are what produces a six-figure response. So this is not the
+ * framework's per-document `outlineOnOverflow` budget applied per object —
+ * that would never fire here — but the same idea moved to the batch.
+ *
+ * The number is where the advertised 20-ID cap meets the measured record size:
+ * 60,000 / 20 = 3,000 bytes per record, which sits between a typical normalized
+ * record and the heaviest sampled one. A full 20-ID batch of ordinary records
+ * therefore comes back whole and unchanged, and only a batch whose records run
+ * heavy — the case this bound exists for — spends the budget early.
+ *
+ * A helper constant, deliberately not an env var: a deploy-tunable threshold
+ * would drift the tool's response shape between environments.
+ */
+const BATCH_BUDGET_BYTES = 60_000;
+
+const utf8 = new TextEncoder();
+
+/**
+ * Serialized size of a record in bytes, not UTF-16 code units. Met catalog text
+ * is full of multi-byte characters (en dashes in date spans, accented artist
+ * names), so a `.length` measurement understates the real payload.
+ */
+function serializedBytes(value: unknown): number {
+  return utf8.encode(JSON.stringify(value)).length;
+}
+
 export const metGetObject = tool('met_get_object', {
   title: 'Get Met Objects',
   description:
     'Fetch full records for one or more Met Museum object IDs. Accepts up to 20 IDs per call and returns partial success — a single 404 does not fail the whole batch; per-ID failures are reported separately. ' +
     'Object IDs come from met_search_collections. Non-public-domain objects return empty image URLs. ' +
-    'The constituents array is null for anonymous or unattributed works; tags is null for untagged objects.',
+    'The constituents array is null for anonymous or unattributed works; tags and measurements are null when the Met records none. ' +
+    'Records are returned whole and never truncated, so a batch of unusually large records may return fewer than requested — any that did not fit are listed in deferred[] with their sizes, to be re-requested in a follow-up call.',
   annotations: { readOnlyHint: true, idempotentHint: true },
   input: z.object({
     objectIDs: z
@@ -175,6 +284,7 @@ export const metGetObject = tool('met_get_object', {
       .max(20)
       .describe(
         'One or more Met object IDs to fetch. Maximum 20 per call. IDs come from met_search_collections. ' +
+          'A repeated ID is fetched and returned once, at its first position. ' +
           'Partial failures are reported per ID rather than failing the whole batch.',
       ),
   }),
@@ -190,7 +300,37 @@ export const metGetObject = tool('met_get_object', {
           .describe('A per-ID fetch failure.'),
       )
       .describe('Object IDs that failed to fetch with per-ID error context.'),
+    deferred: z
+      .array(
+        z
+          .object({
+            objectID: z
+              .number()
+              .int()
+              .describe('Object ID whose record was fetched but withheld from this response.'),
+            bytes: z
+              .number()
+              .int()
+              .nonnegative()
+              .describe(
+                'Serialized structuredContent size of the withheld record — the same scale the budget is measured on — so a follow-up batch can be sized before it is requested.',
+              ),
+          })
+          .describe('A record fetched successfully but withheld to keep the response bounded.'),
+      )
+      .optional()
+      .describe(
+        'Records that were fetched but did not fit the call’s cumulative budget on serialized structuredContent bytes, in request order. Re-call met_get_object with these IDs to retrieve them. Absent when every fetched record fit.',
+      ),
   }),
+  enrichment: {
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'How to retrieve the deferred records, with the budget applied. Present only when the batch byte budget deferred a record.',
+      ),
+  },
   errors: [
     {
       reason: 'all_not_found',
@@ -212,7 +352,14 @@ export const metGetObject = tool('met_get_object', {
     const { batchConcurrency } = getServerConfig();
     const service = getMetService();
 
-    ctx.log.info('Met batch object fetch', { count: input.objectIDs.length });
+    // De-duplicated up front, first occurrence winning its position. A repeated
+    // ID would otherwise be fetched twice, charged to the byte budget twice —
+    // displacing a distinct record that would have fit — and, once the budget
+    // was spent, land in both objects[] and deferred[], telling the caller to
+    // re-request a record it had already received.
+    const objectIDs = [...new Set(input.objectIDs)];
+
+    ctx.log.info('Met batch object fetch', { count: objectIDs.length });
 
     type SuccessItem = {
       ok: true;
@@ -224,13 +371,13 @@ export const metGetObject = tool('met_get_object', {
     // objects[] and failed[] follow the caller's objectIDs order regardless of the order
     // fetches complete in under concurrency. A shared cursor claims positions; `nextIndex++`
     // is atomic between awaits, so each index is taken by exactly one worker.
-    const results = new Array<SuccessItem | FailItem>(input.objectIDs.length);
+    const results = new Array<SuccessItem | FailItem>(objectIDs.length);
     let nextIndex = 0;
 
     const processNext = async (): Promise<void> => {
-      while (nextIndex < input.objectIDs.length) {
+      while (nextIndex < objectIDs.length) {
         const index = nextIndex++;
-        const objectID = input.objectIDs[index];
+        const objectID = objectIDs[index];
         if (objectID == null) break;
         try {
           const record = await service.getObject(objectID, ctx);
@@ -256,33 +403,62 @@ export const metGetObject = tool('met_get_object', {
     };
 
     // Drain the input list with a fixed concurrency limit.
-    const workers = Array.from({ length: Math.min(batchConcurrency, input.objectIDs.length) }, () =>
+    const workers = Array.from({ length: Math.min(batchConcurrency, objectIDs.length) }, () =>
       processNext(),
     );
     await Promise.all(workers);
 
-    const objects = results.filter((r): r is SuccessItem => r.ok).map((r) => r.record);
+    const succeeded = results.filter((r): r is SuccessItem => r.ok);
     const failItems = results.filter((r): r is FailItem => !r.ok);
     const failed = failItems.map((r) => ({ objectID: r.objectID, error: r.error }));
+
+    // Admit whole records in request order while the cumulative budget lasts, and
+    // stop at the first that does not fit — the returned set is a prefix of the
+    // successes, so a re-call with the deferred IDs continues where this left off.
+    const sized = succeeded.map((item) => ({ ...item, bytes: serializedBytes(item.record) }));
+    let admitted = 0;
+    let usedBytes = 0;
+    for (const item of sized) {
+      // The first success is admitted unconditionally: a record larger than the
+      // whole budget must still be reachable, or its ID never comes back at all.
+      if (admitted > 0 && usedBytes + item.bytes > BATCH_BUDGET_BYTES) break;
+      usedBytes += item.bytes;
+      admitted++;
+    }
+    const objects = sized.slice(0, admitted).map((item) => item.record);
+    const deferred = sized
+      .slice(admitted)
+      .map((item) => ({ objectID: item.objectID, bytes: item.bytes }));
 
     if (objects.length === 0) {
       const allNotFound = failItems.every((f) => f.kind === 'not_found');
       if (allNotFound) {
         throw ctx.fail(
           'all_not_found',
-          `All ${input.objectIDs.length} requested object ${input.objectIDs.length === 1 ? 'ID' : 'IDs'} not found.`,
+          `All ${objectIDs.length} requested object ${objectIDs.length === 1 ? 'ID' : 'IDs'} not found.`,
           ctx.recoveryFor('all_not_found'),
         );
       }
       throw ctx.fail(
         'all_failed',
-        `All ${input.objectIDs.length} object fetches failed.`,
+        `All ${objectIDs.length} object fetches failed.`,
         ctx.recoveryFor('all_failed'),
       );
     }
 
-    ctx.log.info('Met batch complete', { succeeded: objects.length, failed: failed.length });
-    return { objects, failed };
+    ctx.log.info('Met batch complete', {
+      fetched: succeeded.length,
+      returned: objects.length,
+      failed: failed.length,
+      deferred: deferred.length,
+    });
+    if (deferred.length === 0) return { objects, failed };
+
+    ctx.enrich.notice(
+      `Returned ${objects.length} of ${succeeded.length} fetched records — ${usedBytes} bytes of serialized structuredContent against a ${BATCH_BUDGET_BYTES}-byte budget measured on that surface alone; content[] renders the same records again, so the delivered response is roughly twice that. ` +
+        `The remaining ${deferred.length} would exceed the budget. Re-call met_get_object with the deferred objectIDs to retrieve them; each record's listed size is on the same structuredContent scale, so sum them against the budget before requesting several.`,
+    );
+    return { objects, failed, deferred };
   },
 
   format: (result) => {
@@ -336,9 +512,39 @@ export const metGetObject = tool('met_get_object', {
       lines.push(`**Culture:** ${prose(obj.culture)}`);
       lines.push(`**Period:** ${prose(obj.period)}`);
       lines.push(`**Dynasty:** ${prose(obj.dynasty)}`);
+      // Findspot detail joins the existing country/region line, each sub-field
+      // omitted when empty — nine dashes on a record with no findspot would bury
+      // the two fields that are usually populated.
+      const findspot = (
+        [
+          ['Type', obj.geography.geographyType],
+          ['City', obj.geography.city],
+          ['State', obj.geography.state],
+          ['County', obj.geography.county],
+          ['Subregion', obj.geography.subregion],
+          ['Locale', obj.geography.locale],
+          ['Locus', obj.geography.locus],
+          ['Excavation', obj.geography.excavation],
+          ['River', obj.geography.river],
+        ] as const
+      )
+        .filter(([, value]) => value)
+        .map(([label, value]) => `${label}: ${escapeMarkdown(value)}`)
+        .join('; ');
       lines.push(
-        `**Geography:** ${orDash([obj.country, obj.region].filter(Boolean).map(escapeMarkdown).join(', '))}`,
+        `**Geography:** ${orDash([obj.country, obj.region].filter(Boolean).map(escapeMarkdown).join(', '))}${findspot ? ` (${findspot})` : ''}`,
       );
+      const measurements = obj.measurements?.length
+        ? obj.measurements
+            .map((m) => {
+              const axes = Object.entries(m.elementMeasurements)
+                .map(([axis, value]) => `${escapeMarkdown(axis)} ${value}`)
+                .join(', ');
+              return `${escapeMarkdown(m.elementName)}${m.elementDescription ? ` (${escapeMarkdown(m.elementDescription)})` : ''}${axes ? `: ${axes}` : ''}`;
+            })
+            .join('; ')
+        : '—';
+      lines.push(`**Measurements:** ${measurements}`);
       lines.push(`**Accession:** ${prose(obj.accessionNumber)}`);
       lines.push(`**Credit:** ${prose(obj.creditLine)}`);
       lines.push(`**Gallery:** ${prose(obj.GalleryNumber)}`);
@@ -371,6 +577,17 @@ export const metGetObject = tool('met_get_object', {
       }
     } else {
       lines.push('**Failed fetches:** none');
+    }
+
+    // Rendered on field presence: a batch that fit the budget carries no
+    // deferred[] and `content[]` gains nothing, matching `structuredContent`.
+    // The accompanying re-call guidance rides the enrichment trailer, which the
+    // framework mirrors onto both surfaces without a render here.
+    if (result.deferred?.length) {
+      lines.push('', '## Deferred — batch byte budget');
+      for (const d of result.deferred) {
+        lines.push(`- **${d.objectID}:** ${d.bytes} bytes`);
+      }
     }
 
     return [{ type: 'text', text: lines.join('\n').trim() }];

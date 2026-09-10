@@ -81,6 +81,7 @@ type ZodDef = {
   shape?: Record<string, unknown>;
   element?: unknown;
   innerType?: unknown;
+  valueType?: unknown;
 };
 
 function zodDef(schema: unknown): ZodDef | undefined {
@@ -140,6 +141,21 @@ function synthesize(
     case 'array': {
       const result = synthesize(def.element, urlMode, `${path}[]`, numberSeed);
       return { value: [result.value], probes: result.probes, urls: result.urls };
+    }
+    /**
+     * An open map's KEYS are upstream text too — `measurements[].elementMeasurements`
+     * is keyed by whatever axis names the Met sends — so the key carries the probe,
+     * not just the value. Without this case the walk falls to `default:` and hands
+     * `format()` a null, leaving both the key and the value unexercised.
+     */
+    case 'record': {
+      const keyPath = `${path}{key}`;
+      const value = synthesize(def.valueType, urlMode, `${path}{value}`, numberSeed);
+      return {
+        value: { [proseValueFor(keyPath)]: value.value },
+        probes: [keyPath, ...value.probes],
+        urls: value.urls,
+      };
     }
     case 'string': {
       if (SERVER_COMPOSED_PATHS.has(path)) return { value: urlFor(path), probes: [], urls: [] };

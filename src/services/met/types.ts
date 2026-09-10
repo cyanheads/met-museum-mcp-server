@@ -45,7 +45,7 @@ export interface RawObjectRecord {
   linkResource: string;
   locale: string;
   locus: string;
-  measurements: unknown[] | null;
+  measurements: RawMeasurementElement[] | null;
   medium: string;
   metadataDate: string;
   objectBeginDate: number;
@@ -77,6 +77,20 @@ export interface RawConstituent {
   gender: string;
   name: string;
   role: string;
+}
+
+/**
+ * One measured element of an object. `elementDescription` is nullable on the
+ * wire — the Met sends `null` for the unqualified element (object `544683`'s
+ * `Overall` beside two described `Other` elements) — and `elementMeasurements`
+ * is an open map because the keys vary per element: `Height`/`Width`/`Depth`/
+ * `Thickness`/`Length` all appear, and two elements of the same record can
+ * carry different ones. Spatial values are centimeters, weights kilograms.
+ */
+export interface RawMeasurementElement {
+  elementDescription: string | null;
+  elementMeasurements: Record<string, number>;
+  elementName: string;
 }
 
 /**

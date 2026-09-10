@@ -78,10 +78,38 @@ export interface ObjectRecord {
   dimensions: string;
   dynasty: string;
   GalleryNumber: string;
+  /**
+   * The nine findspot fields the top-level `country`/`region` pair leaves out.
+   * Nested rather than flattened so the nine sparse fields read as one block;
+   * `country` and `region` stay where they are and are not duplicated here.
+   */
+  geography: {
+    geographyType: string;
+    city: string;
+    state: string;
+    county: string;
+    subregion: string;
+    locale: string;
+    locus: string;
+    excavation: string;
+    river: string;
+  };
   hasCC0Image: boolean;
   isHighlight: boolean;
   isPublicDomain: boolean;
   isTimelineWork: boolean;
+  /**
+   * Structured element measurements — the numeric counterpart to the formatted
+   * `dimensions` string. Null when the Met records none; an element's map is
+   * open because which keys it carries varies element to element.
+   */
+  measurements:
+    | {
+        elementName: string;
+        elementDescription: string;
+        elementMeasurements: Record<string, number>;
+      }[]
+    | null;
   medium: string;
   /** Null when the Met has no machine-readable date for the work. */
   objectBeginDate: number | null;
@@ -334,6 +362,25 @@ export class MetService {
       creditLine: raw.creditLine ?? '',
       country: raw.country ?? '',
       region: raw.region ?? '',
+      geography: {
+        geographyType: raw.geographyType ?? '',
+        city: raw.city ?? '',
+        state: raw.state ?? '',
+        county: raw.county ?? '',
+        subregion: raw.subregion ?? '',
+        locale: raw.locale ?? '',
+        locus: raw.locus ?? '',
+        excavation: raw.excavation ?? '',
+        river: raw.river ?? '',
+      },
+      // Per element, like tags below: `elementDescription` is null on the wire for
+      // an unqualified element, and the array-level guard never descends into it.
+      measurements:
+        raw.measurements?.map((element) => ({
+          elementName: element.elementName ?? '',
+          elementDescription: element.elementDescription ?? '',
+          elementMeasurements: element.elementMeasurements ?? {},
+        })) ?? null,
       // Per item, not per array: the Met sends a null AAT_URL/Wikidata_URL for a
       // term with no Getty/Wikidata record, and the array-level guard above never
       // descends into it.
