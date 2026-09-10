@@ -1,6 +1,6 @@
 # met-museum-mcp-server - Directory Structure
 
-Generated on: 2026-09-09 23:59:13
+Generated on: 2026-09-10 01:07:43
 
 ```text
 met-museum-mcp-server/
@@ -26,6 +26,7 @@ met-museum-mcp-server/
 │   ├── 0.2.x/
 │   ├── 0.3.x/
 │   ├── 0.4.x/
+│   ├── 0.5.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md

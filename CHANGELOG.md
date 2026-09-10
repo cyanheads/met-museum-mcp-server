@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.5.0](changelog/0.5.x/0.5.0.md) — 2026-09-09 · ⚠️ Breaking
+
+met_get_object: byte-bounded batch responses with deferred[], de-duplicated objectIDs, new geography and measurements fields
+
 ## [0.4.0](changelog/0.4.x/0.4.0.md) — 2026-09-09 · ⚠️ Breaking
 
 met_get_object: nullable objectBeginDate/objectEndDate, Markdown-escaped content[] text, null tag URLs normalized
