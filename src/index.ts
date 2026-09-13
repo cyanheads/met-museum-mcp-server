@@ -16,6 +16,7 @@ await createApp({
   tools: [metListDepartments, metSearchCollections, metGetObject],
   resources: [],
   prompts: [],
+  sessionMode: 'stateless',
   instructions: [
     'The Metropolitan Museum of Art Collection API — 501,731 artworks spanning 5,000 years.',
     'Typical workflow: met_list_departments → met_search_collections (returns IDs) → met_get_object (full records, up to 20 per call).',
