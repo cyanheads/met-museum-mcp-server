@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.5.2](changelog/0.5.x/0.5.2.md) — 2026-09-13 · ⚠️ Breaking
+
+mcp-ts-core bumps to ^0.13.1: the Bun engines floor rises to >=1.4.0, createApp declares sessionMode: 'stateless', and the dev skill tree moves to framework-skills/.
+
 ## [0.5.1](changelog/0.5.x/0.5.1.md) — 2026-09-09
 
 met_search_collections intersects filtered results against an unfiltered control run, removing objects that don't match the query (#21)
