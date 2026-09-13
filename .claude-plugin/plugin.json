@@ -1,13 +1,17 @@
 {
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "met-museum-mcp-server",
   "version": "0.5.1",
   "description": "Search the Metropolitan Museum of Art collection, fetch full artwork records and open-access images via MCP. STDIO or Streamable HTTP.",
   "author": {
-    "name": "cyanheads"
+    "name": "cyanheads",
+    "email": "casey@caseyjhand.com",
+    "url": "https://github.com/cyanheads"
   },
   "homepage": "https://github.com/cyanheads/met-museum-mcp-server#readme",
   "repository": "https://github.com/cyanheads/met-museum-mcp-server",
   "license": "Apache-2.0",
+  "keywords": ["met", "metropolitan-museum", "art", "museum", "mcp", "mcp-server", "model-context-protocol"],
   "mcpServers": {
     "met-museum-mcp-server": {
       "command": "npx",
