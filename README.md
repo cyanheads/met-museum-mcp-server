@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.5.1-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/met-museum-mcp-server) [![MCP Server](https://img.shields.io/badge/MCP%20Server-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/met-museum-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/met-museum-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.5.1-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/met-museum-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/met-museum-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/met-museum-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0%2B-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -27,9 +27,11 @@
 
 ---
 
-## Tools
+## Overview
 
-Three tools for browsing and fetching Metropolitan Museum of Art collection data:
+The Metropolitan Museum of Art's public Collection API. Search the collection by keyword and filters, then fetch full object records — metadata, provenance, and CC0 open-access images — from any MCP client. Runs as a stdio process, a local Streamable HTTP server, or the public hosted endpoint above.
+
+### Tools
 
 | Tool | Description |
 |:---|:---|
@@ -37,66 +39,43 @@ Three tools for browsing and fetching Metropolitan Museum of Art collection data
 | `met_search_collections` | Search the collection by keyword with filters for department, date range, medium, geography, on-view status, public-domain status, and highlight designation |
 | `met_get_object` | Fetch full records for one or more object IDs — metadata, provenance, artist info, CC0 image URLs, tags, and Wikidata links |
 
-### `met_list_departments`
+## Capability reference
 
-Return the 19 curatorial departments at The Metropolitan Museum of Art with their numeric IDs and display names.
+### `met_list_departments` <sub>tool</sub>
 
-- `departmentId` values are the valid inputs for the `met_search_collections` department filter
-
----
-
-### `met_search_collections`
-
-Search the Met collection by keyword and optional filters.
-
-- Keyword search across title, artist name, culture, medium, tags, and other text fields
-- Filter by department ID (valid IDs from `met_list_departments`)
-- Filter by date range (integer years, negative = BCE)
-- Filter by medium/classification (e.g., `"Paintings"`, `"Sculptures"`, `"Ceramics"`) — maps to the classification field, not material descriptions
-- Filter by geographic origin — country, region, or city; multiple values are AND-combined
-- `isPublicDomain=true` selects CC0 open-access objects — confirm CC0 status per object from `met_get_object`
-- Every filter draws on a partial upstream index: a filtered search omits some objects whose own record satisfies the filter, so absence from the results is not evidence about an object. Drop the filter to widen
-- A filtered search returns only objects that match the keyword. The Met index answers any filter with a fixed set of unrelated objects alongside the real matches, so the server runs the query a second time with no filters and returns the intersection; `total` counts that intersection. The two runs go out in parallel
-- That second run is best-effort. A keyword broad enough to time out on its own (`q=the` alone is 2.7 MB) returns the filtered results unchecked rather than failing the call, with a `notice` on the response saying they were not verified against the keyword — narrow the keyword to let the check run
-- `hasImages=true` includes any object with images (includes copyrighted works without reusable URLs)
-- `isHighlight=true` restricts to collection highlights designated by the Met
-- `isPublicDomain` and `isHighlight` accept `true` only. The upstream index is unsound on the `false` arm — it returns objects whose own record contradicts the filter — so `false` is rejected; omit the filter instead. `hasImages` and `isOnView` are unaffected and remain plain booleans
-- `isOnView=true` restricts to objects currently on display in a Met gallery
-- Paginate past `limit` with `offset` (default 0) — a broad query carries the same timeout risk on every page as on the first; narrow it with filters if paging times out
-- Returns total match count, truncation indicator, `remaining` count, `nextOffset` for the next page (`null` once exhausted), the resolved `offset` this page was read from, and up to `limit` object IDs (default 20, max 500)
-- Returned IDs resolve to full records via `met_get_object` (up to 20 per call)
+- No input required — returns all 19 curatorial departments in one call
+- Each entry pairs `departmentId` (numeric) with `displayName` (e.g., "European Paintings", "Egyptian Art")
+- `departmentId` values are the valid inputs for `met_search_collections`'s `departmentId` filter
 
 ---
 
-### `met_get_object`
+### `met_search_collections` <sub>tool</sub>
 
-Fetch full records for one or more Met Museum object IDs.
+- Keyword `q` (required) matches title, artist name, culture, medium, tags, and other text fields; broad terms return large ID sets
+- Filters: `departmentId` (validated against `met_list_departments`; an unrecognized ID is rejected), `medium` (maps to classification, not material — e.g. `"Paintings"`, not `"Oil on canvas"`), `dateBegin`/`dateEnd` (integer years, negative = BCE, both required together), `geoLocation` (country/region/city, multiple values AND-combined), `hasImages`, `isOnView`
+- `isPublicDomain` and `isHighlight` accept `true` only — the upstream index is unsound on the `false` arm, so omit the filter instead of passing `false`
+- Every filter draws on a partial upstream index: a filtered search can omit objects whose own record satisfies the filter, so absence from the results is not evidence about an object — drop the filter to widen, and confirm per-object status with `met_get_object`
+- A filtered search is cross-checked against the same query run unfiltered so results match the keyword; when that check can't complete in time (a keyword broad enough to time out on its own), the page returns unverified with a `notice`
+- Paginate with `limit` (default 20, max 500) and `offset` (default 0); `nextOffset` continues where a page left off (`null` once exhausted), and `offset >= total` marks a page past the end of the result set rather than an exhausted query
+- Returns `total`, `returned`, `truncated`, `remaining`, `nextOffset`, and the resolved `offset`; object IDs resolve to full records via `met_get_object` (up to 20 per call)
+- Typed errors: `no_results`, `invalid_date_range`, `invalid_filter` (blank `q`, `medium`, or `geoLocation`), `invalid_department`, `search_timeout` — each carries a recovery hint
+
+---
+
+### `met_get_object` <sub>tool</sub>
 
 - Accepts 1–20 IDs per call; a repeated ID is fetched and returned once, at its first position
-- Partial-success — a single 404 does not fail the whole batch; failed IDs are reported per-ID
-- Full metadata: title, department, classification, medium, dimensions, date, culture, period, dynasty, accession number, credit line, gallery number
-- Artist data: display name, biography, nationality, dates, Getty ULAN URL, Wikidata URL
-- Constituents array for all associated persons (null for anonymous/unattributed works)
-- Controlled vocabulary tags with Getty AAT and Wikidata URLs
-- Nested `geography` block with the nine findspot fields beyond `country`/`region` — `geographyType`, `city`, `state`, `county`, `subregion`, `locale`, `locus`, `excavation`, `river` — each an empty string when the Met records nothing
-- Structured `measurements` array: one entry per measured element, each with an open map of axis name to value (centimeters for spatial axes, kilograms for weight). Null when the Met records none
-- Records are returned whole and never truncated. A call whose records together exceed a cumulative budget on serialized `structuredContent` bytes returns fewer of them; the rest are listed in `deferred[]` with their sizes, to re-request in a follow-up call. `content[]` re-renders the admitted records, so the delivered response is roughly twice the budget
-- Canonical metmuseum.org URL for human follow-up
-- CC0 objects return full-resolution and web-display image URLs plus additional image arrays
-- Object-level Wikidata URL for enrichment via external knowledge graph tools
+- Partial-success batching — a 404 or fetch failure doesn't fail the whole call; `failed[]` reports per-ID error detail, and the call fails only when every ID fails (`all_not_found` / `all_failed`)
+- Full record: metadata, provenance, artist/constituent data (Getty ULAN + Wikidata URLs), controlled-vocabulary tags (Getty AAT + Wikidata), a nine-field `geography` findspot block, and structured `measurements` — sparse fields are empty string or null, never fabricated
+- Records are never truncated individually — a call whose combined records exceed a serialized-bytes budget returns fewer of them, listing the rest in `deferred[]` with sizes to re-request; `content[]` re-renders the admitted records, so the delivered response runs roughly twice the budget
+- `isPublicDomain`/`hasCC0Image` gate image URLs — non-public-domain objects return empty `primaryImage`, `primaryImageSmall`, and `additionalImages`
+- Canonical `objectURL` and per-object `objectWikidata_URL` for human follow-up and external enrichment
 
 ## Features
 
-Built on [`@cyanheads/mcp-ts-core`](https://www.npmjs.com/package/@cyanheads/mcp-ts-core):
+Built on [`@cyanheads/mcp-ts-core`](https://github.com/cyanheads/mcp-ts-core): stdio and Streamable HTTP transports, pluggable auth (`none` / `jwt` / `oauth`), swappable storage (`in-memory`, `filesystem`, `Supabase`, `Cloudflare KV/R2/D1`), structured logging with optional OpenTelemetry tracing.
 
-- Declarative tool definitions — single file per tool, framework handles registration and validation
-- Unified error handling — handlers throw, framework catches, classifies, and formats
-- Pluggable auth: `none`, `jwt`, `oauth`
-- Swappable storage backends: `in-memory`, `filesystem`, `Supabase`, `Cloudflare KV/R2/D1`
-- Structured logging with optional OpenTelemetry tracing
-- STDIO and Streamable HTTP transports
-
-Metropolitan Museum of Art collection:
+Met Museum-specific:
 
 - 500K+ artworks spanning 5,000 years from the Met's public collection API
 - CC0 open-access data from [The Metropolitan Museum of Art](https://www.metmuseum.org/) — free to use without permission or attribution
@@ -108,6 +87,7 @@ Agent-friendly output:
 - Provenance on every record — `isPublicDomain` and `hasCC0Image` flags distinguish CC0 objects from works with inaccessible images, so agents can reason about what they can actually display
 - Partial failure reporting — `met_get_object` returns `objects` and `failed` arrays so callers receive successful records alongside structured per-ID error context
 - Truncation signaling — `met_search_collections` returns `total`, `returned`, `truncated`, `remaining`, `nextOffset`, and the resolved `offset` fields so agents know when to refine filters, increase `limit`, or page further with `offset`; `offset >= total` marks a page that is empty because the offset ran past the end rather than because the query is exhausted
+- Byte-budget disclosure — `met_get_object` reports `deferred[]` records with their sizes when a batch exceeds its serialized-response budget, so callers can size a follow-up call precisely
 
 ## Getting started
 
@@ -191,7 +171,7 @@ MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=3010 bun run start:http
 
 ### Prerequisites
 
-- [Bun v1.3.0](https://bun.sh/) or higher (or Node.js v24+).
+- [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
 - No API key required — the Met Collection API is public and unauthenticated.
 
 ### Installation
@@ -229,7 +209,7 @@ All configuration is validated at startup via Zod schemas in `src/config/server-
 |:---|:---|:---|
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http` | `stdio` |
 | `MCP_HTTP_PORT` | HTTP server port | `3010` |
-| `MCP_SESSION_MODE` | HTTP session mode: `auto`, `stateful`, or `stateless`. This server explicitly sets `stateless`; the framework schema default is `auto`. | `stateless` |
+| `MCP_SESSION_MODE` | HTTP session mode: `auto`, `stateful`, or `stateless`. This server declares `stateless` in `createApp()`, so it applies whenever the variable is unset; an explicit value overrides it. (`auto`, the framework schema default, resolves to `stateful`.) | `stateless` |
 | `MCP_AUTH_MODE` | Authentication: `none`, `jwt`, or `oauth` | `none` |
 | `MCP_LOG_LEVEL` | Log level (`debug`, `info`, `warning`, `error`) | `info` |
 | `LOGS_DIR` | Directory for log files (Node.js only) | `<project-root>/logs` |
@@ -294,12 +274,14 @@ See [`CLAUDE.md`](./CLAUDE.md) for development guidelines and architectural rule
 
 ## Contributing
 
-Issues and pull requests are welcome. Run checks and tests before submitting:
+Issues are welcome. Run checks and tests before submitting:
 
 ```sh
 bun run devcheck
 bun run test
 ```
+
+## Data attribution
 
 Data from [The Metropolitan Museum of Art Collection API](https://metmuseum.github.io/) (CC0).
 
