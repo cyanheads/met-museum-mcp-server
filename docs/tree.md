@@ -1,6 +1,6 @@
 # met-museum-mcp-server - Directory Structure
 
-Generated on: 2026-09-13 23:16:32
+Generated on: 2026-09-19 17:00:21
 
 ```text
 met-museum-mcp-server/
@@ -14,6 +14,8 @@ met-museum-mcp-server/
 │   │   ├── bug_report.yml
 │   │   ├── config.yml
 │   │   └── feature_request.yml
+│   ├── workflows/
+│   │   └── codeql.yml
 │   ├── CODE_OF_CONDUCT.md
 │   ├── CONTRIBUTING.md
 │   ├── FUNDING.yml

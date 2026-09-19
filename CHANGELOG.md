@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.5.3](changelog/0.5.x/0.5.3.md) — 2026-09-19
+
+mcp-ts-core bumps to ^0.13.6: met_search_collections and met_get_object accept parameter aliases, an out-of-schema argument returns InvalidParams, tool error text closes with the failure reason, and modeled outcomes like a zero-match search log below error.
+
 ## [0.5.2](changelog/0.5.x/0.5.2.md) — 2026-09-13 · ⚠️ Breaking
 
 mcp-ts-core bumps to ^0.13.1: the Bun engines floor rises to >=1.4.0, createApp declares sessionMode: 'stateless', and the dev skill tree moves to framework-skills/.
