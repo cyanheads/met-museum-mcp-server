@@ -6,6 +6,7 @@
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { z } from 'zod';
 import { metGetObject } from '@/mcp-server/tools/definitions/met-get-object.tool.js';
 import { escapeMarkdown } from '@/utils/markdown.js';
 
@@ -974,6 +975,69 @@ describe('metGetObject', () => {
     it('neutralizes a full link value rendered in a bare position', () => {
       expect(text()).toContain('**URL:** \\[Met\\](https://evil.example)');
       expect(text()).toContain('**Wikidata:** \\[wd\\](https://evil.example)');
+    });
+  });
+
+  // --- inputAliases: `ids` reaches the declared `objectIDs` ---
+  // The rewrite runs in parseToolArguments, above the handler, so the full tool
+  // contract is the only seam that exercises it.
+
+  describe('input aliases', () => {
+    /**
+     * An alias is an off-schema key by construction, so the runner's typed
+     * argument parameter cannot express one — the cast is what lets the test
+     * send the arguments a client actually sends.
+     */
+    const call = (args: Record<string, unknown>) =>
+      runToolContract(metGetObject, args as unknown as z.input<typeof metGetObject.input>);
+
+    const textOf = (result: Awaited<ReturnType<typeof runToolContract>>) =>
+      (result.content ?? [])
+        .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+        .map((block) => block.text)
+        .join('\n');
+
+    it('rewrites ids to objectIDs before validation', async () => {
+      mockRecords([{ ...sampleRecord, objectID: 437980 }]);
+      const result = await call({ ids: [437980] });
+
+      expect(result.isError).toBeFalsy();
+      expect(mockGetObject).toHaveBeenCalledWith(437980, expect.anything());
+      expect((result.structuredContent as { objects: unknown[] }).objects).toHaveLength(1);
+      expect(textOf(result)).toContain('Object 437980');
+    });
+
+    it('resolves a case-style variant of the declared key with nothing declared', async () => {
+      mockRecords([{ ...sampleRecord, objectID: 437980 }]);
+      const result = await call({ object_ids: [437980] });
+
+      expect(result.isError).toBeFalsy();
+      expect(mockGetObject).toHaveBeenCalledWith(437980, expect.anything());
+    });
+
+    it('still rejects an undeclared key that maps to no alias', async () => {
+      const result = await call({ objectIDs: [437980], includeImages: true });
+
+      expect(result.isError).toBe(true);
+      expect(textOf(result)).toContain('includeImages');
+      expect(mockGetObject).not.toHaveBeenCalled();
+    });
+
+    it('delivers all_not_found on both surfaces — the log severity moves, the envelope does not', async () => {
+      mockGetObject.mockResolvedValue(null);
+      const result = await call({ objectIDs: [999999] });
+
+      expect(result.isError).toBe(true);
+      const error = (
+        result.structuredContent as {
+          error: { code: number; data: { reason: string; recovery: { hint: string } } };
+        }
+      ).error;
+      expect(error.code).toBe(JsonRpcErrorCode.NotFound);
+      expect(error.data.reason).toBe('all_not_found');
+      expect(error.data.recovery.hint).toContain('met_search_collections');
+      expect(textOf(result)).toContain('Recovery: Verify the IDs');
+      expect(textOf(result)).toContain('all_not_found');
     });
   });
 });

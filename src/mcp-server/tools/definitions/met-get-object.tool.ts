@@ -277,6 +277,12 @@ export const metGetObject = tool('met_get_object', {
     'The constituents array is null for anonymous or unattributed works; tags and measurements are null when the Met records none. ' +
     'Records are returned whole and never truncated, so a batch of unusually large records may return fewer than requested — any that did not fit are listed in deferred[] with their sizes, to be re-requested in a follow-up call.',
   annotations: { readOnlyHint: true, idempotentHint: true },
+  /**
+   * The tool takes one input, so the shorthand a caller reaches for can only
+   * mean that one. Case-style variants (`object_ids`, `objectIds`) already
+   * resolve without a declaration.
+   */
+  inputAliases: { ids: 'objectIDs' },
   input: z.object({
     objectIDs: z
       .array(z.number().int().positive().describe('A Met object ID from met_search_collections.'))
@@ -338,6 +344,9 @@ export const metGetObject = tool('met_get_object', {
       when: 'Every requested objectID returned a 404 — all IDs are stale or invalid.',
       recovery:
         'Verify the IDs with met_search_collections — they may be stale search-index entries.',
+      // A modeled answer about the IDs the caller sent, not a fault of this
+      // server or the upstream — unlike all_failed, which keeps `error`.
+      severity: 'notice',
     },
     {
       reason: 'all_failed',

@@ -571,6 +571,37 @@ describe('MetService', () => {
       expect(fetchMock).toHaveBeenCalledTimes(1);
       expect(result.objectIDs).toEqual([1, 2, 3]);
     });
+
+    it('carries the search_timeout recovery onto both client surfaces through the tool contract', async () => {
+      // search_timeout is the one declared reason the handler never names — the
+      // service classifies it, which is what the contract entry's
+      // `thrownBy: 'service'` records. Running the real pipeline is what proves
+      // the declared hint still reaches a caller from down there.
+      fetchMock.mockRejectedValue(timeout('Upstream request timed out.'));
+
+      const result = await runToolContract(metSearchCollections, { q: 'the', limit: 20 });
+
+      expect(result.isError).toBe(true);
+      const error = (
+        result.structuredContent as {
+          error: { code: number; data: { reason: string; recovery: { hint: string } } };
+        }
+      ).error;
+      expect(error.code).toBe(JsonRpcErrorCode.Timeout);
+      expect(error.data.reason).toBe('search_timeout');
+      expect(error.data.recovery.hint).toContain('Narrow the query');
+
+      // Containment, not equality: the framework appends the recovery line and a
+      // reason/retryable trailer to the error text, and their wording is its own.
+      const text = (result.content ?? [])
+        .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+        .map((block) => block.text)
+        .join('\n');
+      expect(text).toContain('Recovery: Narrow the query');
+      // The reason and its retryability are what a text-only caller branches on.
+      expect(text).toContain('search_timeout');
+      expect(text).toContain('not retryable');
+    });
   });
 
   /**

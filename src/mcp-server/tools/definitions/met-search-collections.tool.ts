@@ -20,6 +20,13 @@ export const metSearchCollections = tool('met_search_collections', {
     'isPublicDomain and isHighlight are opt-in filters that accept true only; the upstream index is unsound on the false arm. ' +
     'isOnView restricts results to works currently on display in a Met gallery.',
   annotations: { readOnlyHint: true, idempotentHint: true },
+  /**
+   * `q` is the Met API's own parameter name, kept so the tool reads like the
+   * upstream it wraps. It is also a single letter, which is the spelling a
+   * caller is least likely to reach for first — both aliases name the same
+   * single text input this tool accepts, so neither is ambiguous.
+   */
+  inputAliases: { query: 'q', keyword: 'q' },
   input: z.object({
     q: z
       .string()
@@ -180,6 +187,13 @@ export const metSearchCollections = tool('met_search_collections', {
         'Present only when a filtered search could not be checked against the unfiltered query. That check is best-effort; when it does not complete the page is returned uncorrected and may contain objects unrelated to the keyword.',
       ),
   },
+  /**
+   * Severity separates the modeled outcomes from the incidents. A query that
+   * matches nothing and a filter the caller spelled wrong are ordinary answers
+   * this tool is built to give, and logging them at `error` beside a genuine
+   * upstream fault is what makes an error stream unreadable. `search_timeout`
+   * keeps `error`: the upstream download really did blow the request budget.
+   */
   errors: [
     {
       reason: 'no_results',
@@ -187,12 +201,14 @@ export const metSearchCollections = tool('met_search_collections', {
       when: 'total is 0 — the API returned null objectIDs for the query, or nothing the filters returned also matched the query.',
       recovery:
         'Broaden the query, remove filters, or call met_list_departments and set a valid departmentId.',
+      severity: 'notice',
     },
     {
       reason: 'invalid_date_range',
       code: JsonRpcErrorCode.ValidationError,
       when: 'dateBegin or dateEnd is provided without the other, or dateBegin > dateEnd.',
       recovery: 'Provide both dateBegin and dateEnd as integer years, with dateBegin ≤ dateEnd.',
+      severity: 'warning',
     },
     {
       reason: 'invalid_filter',
@@ -200,6 +216,7 @@ export const metSearchCollections = tool('met_search_collections', {
       when: 'q is whitespace-only, or medium or geoLocation was supplied blank — an empty array, or an entry with no non-whitespace characters.',
       recovery:
         'Supply a non-blank value for the named field, or omit the optional filter entirely.',
+      severity: 'warning',
     },
     {
       reason: 'invalid_department',
@@ -207,6 +224,7 @@ export const metSearchCollections = tool('met_search_collections', {
       when: 'departmentId is provided but is not one of the Met department IDs.',
       recovery:
         'Call met_list_departments to get valid department IDs, then retry with one of the returned IDs.',
+      severity: 'warning',
     },
     {
       reason: 'search_timeout',
@@ -214,6 +232,9 @@ export const metSearchCollections = tool('met_search_collections', {
       when: 'The keyword+filter result set is too large to download within the request timeout — a broad query with few or no filters.',
       recovery:
         'Narrow the query: add or tighten filters (departmentId, geoLocation, medium, or dateBegin plus dateEnd), or use a more specific keyword, then retry.',
+      // MetService.search classifies the upstream deadline and throws this; the
+      // handler never names it, so the contract says where it comes from.
+      thrownBy: 'service',
     },
   ],
 

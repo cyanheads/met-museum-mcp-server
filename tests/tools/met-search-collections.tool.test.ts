@@ -4,8 +4,9 @@
  */
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { z } from 'zod';
 import { metSearchCollections } from '@/mcp-server/tools/definitions/met-search-collections.tool.js';
 
 const mockSearch = vi.fn();
@@ -562,5 +563,106 @@ describe('metSearchCollections', () => {
     expect(err.data.recovery.hint).toBe(
       'Broaden the query, remove filters, or call met_list_departments and set a valid departmentId.',
     );
+  });
+
+  // --- inputAliases: `query` and `keyword` reach the declared `q` ---
+  // The rewrite happens in parseToolArguments, above the handler, so the only
+  // seam that exercises it is the full tool contract.
+
+  describe('input aliases', () => {
+    const page = {
+      total: 3,
+      objectIDs: [1, 2, 3],
+      returned: 3,
+      truncated: false,
+      remaining: 0,
+      nextOffset: null,
+      offset: 0,
+    };
+
+    /**
+     * An alias is an off-schema key by construction, so the runner's typed
+     * argument parameter cannot express one — the cast is what lets the test
+     * send the arguments a client actually sends.
+     */
+    const call = (args: Record<string, unknown>) =>
+      runToolContract(
+        metSearchCollections,
+        args as unknown as z.input<typeof metSearchCollections.input>,
+      );
+
+    const textOf = (result: Awaited<ReturnType<typeof runToolContract>>) =>
+      (result.content ?? [])
+        .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+        .map((block) => block.text)
+        .join('\n');
+
+    it.each(['query', 'keyword'])('rewrites %s to q before validation', async (alias) => {
+      mockSearch.mockResolvedValue(page);
+      const result = await call({ [alias]: 'sunflower', limit: 3 });
+
+      expect(result.isError).toBeFalsy();
+      expect(mockSearch).toHaveBeenCalledWith(
+        expect.objectContaining({ q: 'sunflower' }),
+        expect.anything(),
+      );
+      // Both consumption surfaces carry the page, not just structuredContent.
+      expect((result.structuredContent as { total: number }).total).toBe(3);
+      expect(textOf(result)).toContain('**Total matches:** 3');
+    });
+
+    it('leaves a declared q alone when an alias is sent alongside it', async () => {
+      mockSearch.mockResolvedValue(page);
+      const result = await call({ q: 'sunflower', query: 'tulip', limit: 3 });
+
+      // A rewrite applies only when the target is absent, so `query` stays an
+      // unrecognized key and the call is rejected rather than silently choosing.
+      expect(result.isError).toBe(true);
+      expect(textOf(result)).toContain('query');
+      expect(mockSearch).not.toHaveBeenCalled();
+    });
+
+    it('still rejects an undeclared key that maps to no alias', async () => {
+      const result = await call({ q: 'sunflower', sortBy: 'relevance', limit: 3 });
+
+      expect(result.isError).toBe(true);
+      expect(textOf(result)).toContain('sortBy');
+      expect(mockSearch).not.toHaveBeenCalled();
+    });
+
+    it('rejects a missing q as an InvalidParams envelope naming the field', async () => {
+      const result = await call({ limit: 3 });
+
+      expect(result.isError).toBe(true);
+      const error = (result.structuredContent as { error: { code: number } }).error;
+      expect(error.code).toBe(JsonRpcErrorCode.InvalidParams);
+      expect(textOf(result)).toContain('q');
+      expect(mockSearch).not.toHaveBeenCalled();
+    });
+
+    it('delivers no_results on both surfaces — the log severity moves, the envelope does not', async () => {
+      mockSearch.mockResolvedValue({
+        total: 0,
+        objectIDs: [],
+        returned: 0,
+        truncated: false,
+        remaining: 0,
+        nextOffset: null,
+        offset: 0,
+      });
+      const result = await call({ q: 'zzznomatch', limit: 3 });
+
+      expect(result.isError).toBe(true);
+      const error = (
+        result.structuredContent as {
+          error: { code: number; data: { reason: string; recovery: { hint: string } } };
+        }
+      ).error;
+      expect(error.code).toBe(JsonRpcErrorCode.NotFound);
+      expect(error.data.reason).toBe('no_results');
+      expect(error.data.recovery.hint).toContain('met_list_departments');
+      expect(textOf(result)).toContain('Recovery: Broaden the query');
+      expect(textOf(result)).toContain('no_results');
+    });
   });
 });
