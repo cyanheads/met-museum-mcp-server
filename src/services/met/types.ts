@@ -3,7 +3,11 @@
  * @module services/met/types
  */
 
-/** Raw search response from GET /search */
+/**
+ * Raw search response from GET /v1.1/search — one `offset`/`limit` page.
+ * `objectIDs` is null when the page is empty: no match, or an `offset` at or past
+ * the reachable result set. `total` is the full match count either way.
+ */
 export interface RawSearchResponse {
   objectIDs: number[] | null;
   total: number;

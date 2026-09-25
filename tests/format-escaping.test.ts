@@ -11,7 +11,7 @@
 
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import { createInMemoryStorage, createMockContext } from '@cyanheads/mcp-ts-core/testing';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { metGetObject } from '@/mcp-server/tools/definitions/met-get-object.tool.js';
 import { metListDepartments } from '@/mcp-server/tools/definitions/met-list-departments.tool.js';
 import { metSearchCollections } from '@/mcp-server/tools/definitions/met-search-collections.tool.js';
@@ -237,6 +237,14 @@ describe('content[] escaping — every tool, every rendered upstream text field'
 });
 
 describe('structuredContent is untouched by the render-boundary escaping', () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    // Unstaged calls fail loudly; the test layers its own fake on top.
+    fetchMock = vi.fn().mockRejectedValue(new Error('unmocked fetch'));
+    vi.stubGlobal('fetch', fetchMock);
+  });
+
   afterEach(() => {
     vi.unstubAllGlobals();
   });
@@ -290,14 +298,17 @@ describe('structuredContent is untouched by the render-boundary escaping', () =>
       GalleryNumber: '',
     };
 
-    vi.stubGlobal(
-      'fetch',
-      vi
-        .fn()
-        .mockResolvedValue(
-          new Response(JSON.stringify(record), { headers: { 'content-type': 'application/json' } }),
-        ),
-    );
+    fetchMock.mockImplementation((request: unknown) => {
+      const url = new URL(String(request));
+      return url.origin === 'https://collectionapi.metmuseum.org' &&
+        url.pathname === '/public/collection/v1/objects/288322'
+        ? Promise.resolve(
+            new Response(JSON.stringify(record), {
+              headers: { 'content-type': 'application/json' },
+            }),
+          )
+        : Promise.reject(new Error(`unrouted fetch ${url.origin}${url.pathname}`));
+    });
     initMetService({} as AppConfig, createInMemoryStorage());
 
     const ctx = createMockContext({ errors: metGetObject.errors });

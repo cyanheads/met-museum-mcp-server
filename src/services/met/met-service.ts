@@ -5,28 +5,30 @@
 
 import type { Context } from '@cyanheads/mcp-ts-core';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
-import { JsonRpcErrorCode, McpError, timeout } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 import type { RawDepartmentsResponse, RawObjectRecord, RawSearchResponse } from './types.js';
+
+/**
+ * How deep `/v1.1/search` pages. No request reaches past `offset + limit =
+ * 10,000` — upstream clips a page that crosses it and answers `objectIDs: null`
+ * at or beyond it — while `total` still reports the full match count.
+ */
+export const SEARCH_RESULT_WINDOW = 10_000;
 
 /** Input for the search method. */
 export interface SearchInput {
   dateBegin?: number | undefined;
   dateEnd?: number | undefined;
   departmentId?: number | undefined;
+  /** `/v1.1/search` applies only the first repeated value, so callers send one. */
   geoLocation?: string[] | undefined;
   hasImages?: boolean | undefined;
-  /**
-   * Opt-in only. The Met search index is unsound on the `false` arm — it returns
-   * objects whose own record reports `isHighlight: true` — so the type admits
-   * `true` alone and the unsound value can never reach `buildSearchUrl`.
-   */
+  /** Opt-in only: the search index ignores `isHighlight=false`, so the type admits `true` alone. */
   isHighlight?: true | undefined;
   isOnView?: boolean | undefined;
-  /** Opt-in only, for the same reason as `isHighlight`. */
-  isPublicDomain?: true | undefined;
   limit: number;
   medium?: string | undefined;
   offset?: number | undefined;
@@ -35,20 +37,39 @@ export interface SearchInput {
 
 /** Normalized search result. */
 export interface SearchResult {
-  /** The next `offset` to pass to continue paging, or `null` when the result set is exhausted. */
+  /**
+   * The next `offset` to pass to continue paging, or `null` when the page reaches
+   * the end of the reachable result set (`min(total, SEARCH_RESULT_WINDOW)`).
+   */
   nextOffset: number | null;
   objectIDs: number[];
   /**
-   * The resolved offset this page was sliced at (the caller's `offset` after its
-   * default of 0). Echoed so a caller can read `offset >= total` and tell an empty
-   * page caused by an out-of-range offset from a genuine final page.
+   * The resolved offset this page was read from (the caller's `offset` after its
+   * default of 0). Echoed so a caller can tell an empty page caused by an offset
+   * past the reachable result set from a genuine final page.
    */
   offset: number;
-  /** Matching IDs after this page (`total - (offset + returned)`), floored at 0. */
+  /**
+   * Reachable IDs after this page: `min(total, SEARCH_RESULT_WINDOW) - (offset +
+   * returned)`, floored at 0.
+   */
   remaining: number;
   returned: number;
+  /** The full upstream match count, which can exceed what paging reaches. */
   total: number;
   truncated: boolean;
+}
+
+/**
+ * Resolve `MET_BASE_URL` to the collection root the per-endpoint version paths
+ * hang off. A value ending in `/v1` — the shape the variable had when it named
+ * the `v1` API directly — is reduced to its root, so an existing override keeps
+ * resolving every endpoint where it did. `/v1.1` is reduced the same way: kept,
+ * it would put every endpoint under it (`/v1.1/v1/objects/{id}`, a 404 that
+ * reads as "object not found").
+ */
+function toCollectionRoot(baseUrl: string): string {
+  return baseUrl.replace(/\/+$/, '').replace(/\/v1(?:\.1)?$/, '');
 }
 
 /** Normalized object record — subset of the full API record. */
@@ -173,75 +194,49 @@ function resolveDateRange(raw: RawObjectRecord): {
 }
 
 export class MetService {
-  private readonly baseUrl: string;
+  /** The collection root; each endpoint appends its own API version. */
+  private readonly collectionRoot: string;
   private readonly timeoutMs: number;
   private validDepartmentIdsCache?: { ids: Set<number>; expiresAt: number };
 
   constructor(_config: AppConfig, _storage: StorageService) {
     const serverConfig = getServerConfig();
-    this.baseUrl = serverConfig.baseUrl;
+    this.collectionRoot = toCollectionRoot(serverConfig.baseUrl);
     this.timeoutMs = serverConfig.requestTimeoutMs;
   }
 
   /**
-   * Search the Met collection. Returns a normalized result: an offset-sliced page
-   * of IDs plus continuation metadata (`nextOffset`, `remaining`).
+   * Search the Met collection: one `/v1.1/search` request per page, with the
+   * caller's `offset` and `limit` passed straight through. `total` is the full
+   * upstream match count; the continuation fields (`remaining`, `truncated`,
+   * `nextOffset`) are computed against the reachable window,
+   * `min(total, SEARCH_RESULT_WINDOW)`, because no page reaches past it.
    *
-   * The upstream `/search` returns the complete ID array in one response, so paging
-   * is a local slice — no extra upstream capability needed. A broad query can
-   * deterministically exceed the request timeout while that array downloads; because
-   * the same query times out identically on every attempt, the timeout is surfaced
-   * as a non-retryable `search_timeout` (fail-fast) instead of being retried through
-   * the full timeout three more times.
-   *
-   * A filtered search runs twice. The upstream index answers any filter parameter
-   * with the union of the genuine keyword matches and a fixed, query-independent
-   * floor of objects that do not match `q` at all, so a second run carrying `q`
-   * alone is issued in parallel and the filtered IDs are intersected against it.
-   * Intersecting rather than subtracting a known floor is what keeps the floor
-   * members that genuinely do match `q`; the control run must drop every filter,
-   * not just the booleans, because `medium` and the date range have floors of their
-   * own. `total` is the size of the intersection, so the continuation arithmetic
-   * derived from it describes what the caller can actually page through.
+   * Every failure, a Timeout-coded one included (an upstream 504/408/425 or the
+   * request timer), takes the ordinary `withRetry` ladder: a page is at most 500
+   * IDs, so a timeout says nothing about the size of the result set.
    */
   search(input: SearchInput, ctx: Context): Promise<SearchResult> {
     const offset = input.offset ?? 0;
     return withRetry(
       async () => {
-        const url = this.buildSearchUrl(input);
-        /**
-         * Read off the built URL rather than re-listing the filter fields, so this
-         * cannot drift out of step with `buildSearchUrl` when a parameter is added.
-         */
-        const isFiltered = [...url.searchParams.keys()].some((key) => key !== 'q');
-        ctx.log.debug('Met search request', { url: url.toString(), filtered: isFiltered });
-        try {
-          const { ids, total } = isFiltered
-            ? await this.searchIntersected(url, input, ctx)
-            : await this.searchUnfiltered(url, ctx);
-          const sliced = ids.slice(offset, offset + input.limit);
-          const consumed = offset + sliced.length;
-          const remaining = Math.max(0, total - consumed);
-          const truncated = remaining > 0;
-          return {
-            total,
-            objectIDs: sliced,
-            returned: sliced.length,
-            truncated,
-            remaining,
-            nextOffset: truncated ? consumed : null,
-            offset,
-          };
-        } catch (error) {
-          if (error instanceof McpError && error.code === JsonRpcErrorCode.Timeout) {
-            throw timeout(
-              `Met search for "${input.q}" exceeded the ${this.timeoutMs}ms request timeout — the result set is too large to download in time.`,
-              { reason: 'search_timeout', retryable: false, ...ctx.recoveryFor('search_timeout') },
-              { cause: error },
-            );
-          }
-          throw error;
-        }
+        const url = this.buildSearchUrl({ ...input, offset });
+        ctx.log.debug('Met search request', { url: url.toString() });
+        const raw = await this.fetchSearch(url, ctx);
+        const objectIDs = raw.objectIDs ?? [];
+        const reachable = Math.min(raw.total, SEARCH_RESULT_WINDOW);
+        const consumed = offset + objectIDs.length;
+        const remaining = Math.max(0, reachable - consumed);
+        const truncated = remaining > 0;
+        return {
+          total: raw.total,
+          objectIDs,
+          returned: objectIDs.length,
+          truncated,
+          remaining,
+          nextOffset: truncated ? consumed : null,
+          offset,
+        };
       },
       {
         operation: 'MetService.search',
@@ -252,73 +247,31 @@ export class MetService {
     );
   }
 
-  /** One `/search` round-trip, decoded. */
+  /**
+   * How many objects the keyword matches with no filter applied, or `null` when
+   * the request failed. One `limit=1` request, one attempt: the caller uses it to
+   * word a recovery hint, so a failure degrades the hint rather than the call, and
+   * a retry ladder would only delay an answer that is already a miss. A caller
+   * abort is not such a failure — it propagates, so the call ends as cancelled.
+   */
+  async countKeywordMatches(q: string, ctx: Context): Promise<number | null> {
+    const url = this.buildSearchUrl({ q, offset: 0, limit: 1 });
+    try {
+      return (await this.fetchSearch(url, ctx)).total;
+    } catch (error) {
+      if (ctx.signal.aborted) throw error;
+      ctx.log.warning('Met keyword-only count failed', {
+        q,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
+  }
+
+  /** One `/v1.1/search` round-trip, decoded. */
   private async fetchSearch(url: URL, ctx: Context): Promise<RawSearchResponse> {
     const response = await fetchWithTimeout(url, this.timeoutMs, ctx, { signal: ctx.signal });
     return (await response.json()) as RawSearchResponse;
-  }
-
-  /** The single-run path: the upstream ID array and the total it reports. */
-  private async searchUnfiltered(
-    url: URL,
-    ctx: Context,
-  ): Promise<{ ids: number[]; total: number }> {
-    const raw = await this.fetchSearch(url, ctx);
-    return { ids: raw.objectIDs ?? [], total: raw.total };
-  }
-
-  /**
-   * The filtered path: the filtered run intersected with a control run of the same
-   * `q` carrying no filters. Both are issued together, so the wall-clock cost is the
-   * slower of the two rather than their sum.
-   *
-   * Order comes from the filtered run, preserving upstream relevance ranking; the
-   * control run contributes membership only, through a Set because it reaches tens
-   * of thousands of IDs (`q=cat` is 51,873).
-   *
-   * The control run is **best-effort**, and deliberately so: it is the broadest form
-   * of the query, so it can cost far more than the filtered run it corrects.
-   * `q=the&departmentId=11` answers in 0.44s with 132 IDs, while `q=the` alone needs
-   * 12.7s for 2.7 MB — past the default 10s timeout. Failing the search there would
-   * make a fast, working query unreachable in order to strip a floor of 2. So a
-   * control failure falls back to the filtered run uncorrected and discloses that on
-   * `ctx.enrich.notice`, while a failure of the *filtered* run stays fatal and
-   * surfaces as `search_timeout`. Catching on the control promise itself keeps its
-   * rejection away from `Promise.all` and from `withRetry`, so a degraded run never
-   * re-issues the whole search.
-   *
-   * A control run that resolves with a null `objectIDs` is not a failure — it is the
-   * upstream reporting zero matches, which is what makes `no_results` reachable
-   * behind a filter at all. That case intersects to empty rather than degrading.
-   */
-  private async searchIntersected(
-    filteredUrl: URL,
-    input: SearchInput,
-    ctx: Context,
-  ): Promise<{ ids: number[]; total: number }> {
-    const controlUrl = this.buildSearchUrl({ q: input.q, limit: input.limit });
-    const [filtered, control] = await Promise.all([
-      this.fetchSearch(filteredUrl, ctx),
-      this.fetchSearch(controlUrl, ctx).catch((error: unknown) => {
-        ctx.log.warning('Met search control run failed — returning unchecked results', {
-          q: input.q,
-          error: error instanceof Error ? error.message : String(error),
-        });
-        return null;
-      }),
-    ]);
-
-    const filteredIds = filtered.objectIDs ?? [];
-    if (control === null) {
-      ctx.enrich.notice(
-        `Unchecked results: the second, unfiltered run of "${input.q}" that removes filter matches unrelated to the keyword did not complete, so this page may contain unrelated objects and total is the uncorrected upstream count. Retry with a narrower keyword to let the check run, or verify each record with met_get_object.`,
-      );
-      return { ids: filteredIds, total: filtered.total };
-    }
-
-    const matchesQuery = new Set(control.objectIDs ?? []);
-    const ids = filteredIds.filter((objectID) => matchesQuery.has(objectID));
-    return { ids, total: ids.length };
   }
 
   /**
@@ -328,7 +281,7 @@ export class MetService {
   getObject(objectID: number, ctx: Context): Promise<ObjectRecord | null> {
     return withRetry(
       async () => {
-        const url = `${this.baseUrl}/objects/${objectID}`;
+        const url = `${this.collectionRoot}/v1/objects/${objectID}`;
         ctx.log.debug('Met object fetch', { objectID });
         let response: Response;
         try {
@@ -356,7 +309,7 @@ export class MetService {
   getDepartments(ctx: Context): Promise<Department[]> {
     return withRetry(
       async () => {
-        const url = `${this.baseUrl}/departments`;
+        const url = `${this.collectionRoot}/v1/departments`;
         ctx.log.debug('Met departments fetch');
         const response = await fetchWithTimeout(url, this.timeoutMs, ctx, {
           signal: ctx.signal,
@@ -393,12 +346,16 @@ export class MetService {
     return ids;
   }
 
-  private buildSearchUrl(input: SearchInput): URL {
-    const url = new URL(`${this.baseUrl}/search`);
+  /**
+   * `offset` and `limit` are always sent: upstream defaults an absent `limit` to
+   * 100, so leaving it off would page by a size the caller never asked for.
+   */
+  private buildSearchUrl(input: SearchInput & { offset: number }): URL {
+    const url = new URL(`${this.collectionRoot}/v1.1/search`);
     url.searchParams.set('q', input.q);
+    url.searchParams.set('offset', String(input.offset));
+    url.searchParams.set('limit', String(input.limit));
     if (input.hasImages != null) url.searchParams.set('hasImages', String(input.hasImages));
-    if (input.isPublicDomain != null)
-      url.searchParams.set('isPublicDomain', String(input.isPublicDomain));
     if (input.isHighlight != null) url.searchParams.set('isHighlight', String(input.isHighlight));
     if (input.isOnView != null) url.searchParams.set('isOnView', String(input.isOnView));
     if (input.medium) url.searchParams.set('medium', input.medium);

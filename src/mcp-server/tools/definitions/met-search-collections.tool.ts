@@ -5,20 +5,63 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { getMetService } from '@/services/met/met-service.js';
+import {
+  getMetService,
+  SEARCH_RESULT_WINDOW,
+  type SearchInput,
+} from '@/services/met/met-service.js';
+
+/** Thousands-separated, so the window and a large total read alike in prose. */
+const count = (n: number) => n.toLocaleString('en-US');
+
+/** The filter parameters a search input set, by the names a caller passes them under. */
+function filtersUsed(input: Omit<SearchInput, 'q' | 'limit' | 'offset'>): string[] {
+  const names: string[] = [];
+  if (input.hasImages != null) names.push('hasImages');
+  if (input.isHighlight != null) names.push('isHighlight');
+  if (input.isOnView != null) names.push('isOnView');
+  if (input.medium != null) names.push('medium');
+  if (input.departmentId != null) names.push('departmentId');
+  if (input.geoLocation != null) names.push('geoLocation');
+  if (input.dateBegin != null) names.push('dateBegin/dateEnd');
+  return names;
+}
+
+/**
+ * The `no_results` recovery, composed from the levers the call used so one retry
+ * clears it. `keywordMatches` is the keyword's match count with no filter
+ * applied: `0` means the keyword is the problem and no filter is named; a
+ * positive count means the filters removed every match; `null` means that check
+ * failed, so every filter is named because the caller did set them.
+ */
+function noResultsHint(q: string, filters: string[], keywordMatches: number | null): string {
+  if (keywordMatches === 0) {
+    const scope = filters.length > 0 ? ', even with no filter applied' : '';
+    return `The keyword "${q}" matches no object in the collection${scope}. Try a different, broader, or differently spelled keyword.`;
+  }
+  const one = filters.length === 1;
+  const noun = one ? 'filter' : 'filters';
+  const list = filters.join(', ');
+  const lead =
+    keywordMatches === null
+      ? `The ${noun} may have removed every match: ${list} — whether "${q}" matches on its own could not be checked.`
+      : `The keyword "${q}" matches ${count(keywordMatches)} object${keywordMatches === 1 ? '' : 's'} on its own, so the ${noun} removed every match: ${list}.`;
+  const medium = filters.includes('medium')
+    ? ' medium takes an object classification, case-sensitive and spelled as the Met spells it ("Paintings", "Prints", "Sculpture"), not a material description; met_get_object returns an object’s classification.'
+    : '';
+  return `${lead} Correct or drop ${one ? 'it' : 'them'}, then retry.${medium}`;
+}
+
+/** `" with the filter medium"` / `" with the filters medium, departmentId"`, or nothing. */
+function filterScope(filters: string[]): string {
+  if (filters.length === 0) return '';
+  return ` with the ${filters.length === 1 ? 'filter' : 'filters'} ${filters.join(', ')}`;
+}
 
 export const metSearchCollections = tool('met_search_collections', {
   title: 'Search Met Collection',
   description:
-    'Search the Metropolitan Museum of Art collection by keyword and optional filters. ' +
-    'Returns the total match count and a page of matching object IDs, which met_get_object resolves to full records. ' +
-    'Relevance is keyword-based, not semantic; department and geographic filters narrow results more than a longer query. ' +
-    'The medium parameter maps to the classification field (pass "Paintings", "Drawings", etc., not material descriptions like "Oil on canvas"). ' +
-    'Every filter draws on a partial upstream index, so a filtered search omits some objects whose own record satisfies the filter — the results are not exhaustive, and dropping the filter is what widens them. ' +
-    'A filtered search is checked against the same query run unfiltered, so its results match the keyword; when that check is too costly to complete the page is returned unchecked and the response says so in its notice. ' +
-    'isPublicDomain selects CC0-licensed images; hasImages also includes copyrighted works. ' +
-    'isPublicDomain and isHighlight are opt-in filters that accept true only; the upstream index is unsound on the false arm. ' +
-    'isOnView restricts results to works currently on display in a Met gallery.',
+    'Search the Metropolitan Museum of Art collection by keyword and optional filters. Returns the total match count and one page of matching object IDs, which met_get_object resolves to full records. Relevance is keyword-based, not semantic; department and geographic filters narrow results more than a longer query. Paging reaches only the first 10,000 matches of any search, so narrow a larger one with filters. The medium parameter takes an object classification as the Met spells it ("Paintings", "Sculpture"), not a material like "Oil on canvas". hasImages also includes copyrighted works; CC0 status is per object, from the isPublicDomain and hasCC0Image fields on met_get_object. isHighlight accepts true only. isOnView restricts results to works currently on display in a Met gallery.',
   annotations: { readOnlyHint: true, idempotentHint: true },
   /**
    * `q` is the Met API's own parameter name, kept so the tool reads like the
@@ -38,20 +81,7 @@ export const metSearchCollections = tool('met_search_collections', {
       .boolean()
       .optional()
       .describe(
-        'When true, restricts results to objects that have at least one associated image, including copyrighted works whose images cannot be reproduced. ' +
-          'A partial index like every filter here: it omits some objects that do have images, so absence from the results is not evidence an object has none. ' +
-          'isPublicDomain is the nearest filter for freely reusable CC0 images — confirm per object from the isPublicDomain and hasCC0Image fields on met_get_object.',
-      ),
-    isPublicDomain: z
-      .literal(true, {
-        error: 'isPublicDomain accepts true only — omit the filter instead of passing false.',
-      })
-      .optional()
-      .describe(
-        'Opt-in filter, true only — omit it rather than passing false, which the upstream index answers unsoundly. ' +
-          'Selects objects released under CC0 open access, which return direct high-resolution image URLs in met_get_object. ' +
-          'A partial index, not exhaustive coverage: it omits objects whose own record reports isPublicDomain true — object 436580 matches the query "sunflower" and is public domain, yet the filtered search does not return it — so absence from the results is not evidence an object lacks CC0 status. ' +
-          'Combining it with departmentId narrows it further; when a search returns nothing, retry without the filter.',
+        'When true, restricts results to objects that have at least one associated image, including copyrighted works whose images cannot be reproduced; false restricts them to objects with none. For freely reusable CC0 images, confirm per object from the isPublicDomain and hasCC0Image fields on met_get_object.',
       ),
     isHighlight: z
       .literal(true, {
@@ -59,25 +89,19 @@ export const metSearchCollections = tool('met_search_collections', {
       })
       .optional()
       .describe(
-        'Opt-in filter, true only — omit it rather than passing false, which the upstream index answers unsoundly. ' +
-          'Selects objects the Met has designated as highlights — major works central to the collection. ' +
-          'A partial index like isPublicDomain: it omits objects whose own record reports isHighlight true, so absence from the results is not evidence a work is not a highlight.',
+        'Opt-in filter, true only — omit it rather than passing false, which the search ignores. Selects objects the Met has designated as highlights — major works central to the collection.',
       ),
     isOnView: z
       .boolean()
       .optional()
       .describe(
-        'When true, restricts results to objects currently on display in a Met gallery. ' +
-          'A partial index like the other filters — it omits some objects that are on view, so absence from the results is not evidence a work is off display. ' +
-          'The GalleryNumber field on the met_get_object record identifies the specific gallery.',
+        'When true, restricts results to objects currently on display in a Met gallery; false restricts them to objects not on view. The GalleryNumber field on the met_get_object record identifies the specific gallery.',
       ),
     medium: z
       .string()
       .optional()
       .describe(
-        'Filter by object classification (e.g., "Paintings", "Drawings", "Prints", "Ceramics", "Sculpture", "Photographs", "Textiles"). ' +
-          'Maps to the classification field on the object, not the materials/medium text field — pass a classification category name, not a material description like "Oil on canvas". ' +
-          'A partial index like the other filters: it omits some objects that carry the classification on their own record.',
+        'Filter by object classification, case-sensitive and spelled as the Met spells it (e.g., "Paintings", "Drawings", "Prints", "Ceramics", "Sculpture", "Photographs", "Textiles") — "paintings" or "Painting" matches nothing. Maps to the classification field on the object, not the materials text, so a material description like "Oil on canvas" matches nothing either; met_get_object returns an object’s classification.',
       ),
     departmentId: z
       .number()
@@ -85,36 +109,33 @@ export const metSearchCollections = tool('met_search_collections', {
       .min(1)
       .optional()
       .describe(
-        'Restrict results to one curatorial department. Valid IDs come from met_list_departments — the Met exposes a sparse set (roughly 1–21, with gaps); an unrecognized ID is rejected with an invalid_department error rather than silently returning no matches. ' +
-          'A partial index like the other filters: it omits some objects whose own record names the department. ' +
-          'Can be combined with other filters; combining with isPublicDomain works but returns far fewer results than expected.',
+        'Restrict results to one curatorial department. Valid IDs come from met_list_departments — the Met exposes a sparse set (roughly 1–21, with gaps); an unrecognized ID is rejected with an invalid_department error rather than silently widening the search. Can be combined with other filters.',
       ),
     geoLocation: z
       .array(
         z.string().describe('A country, region, or city (e.g., "France", "Egypt", "New York").'),
       )
+      .max(1, {
+        error:
+          'geoLocation takes one location — the Met search applies only the first value, so pass a single location.',
+      })
       .optional()
       .describe(
-        'Filter by geographic origin. Each value is matched broadly against geography fields and artist nationality. ' +
-          'Multiple values are AND-combined — ["France", "Egypt"] returns objects associated with both, not either, so more values narrow the result set. ' +
-          'A partial index like the other filters: it omits some objects whose own geography fields name the location. ' +
-          'Works best with the Egyptian Art, Greek and Roman Art, and similar departments that have well-populated geography fields.',
+        'Filter by geographic origin: one country, region, or city, as a one-element array (e.g., ["France"]). The value is matched broadly against geography fields and artist nationality. Works best with the Egyptian Art, Greek and Roman Art, and similar departments that have well-populated geography fields.',
       ),
     dateBegin: z
       .number()
       .int()
       .optional()
       .describe(
-        'Earliest object date (year, inclusive). Negative integers for BCE (e.g., -500 for 500 BCE). Requires dateEnd. ' +
-          'The range is a partial index like the other filters: it omits some objects whose own record dates them inside it.',
+        'Earliest object date (year, inclusive). Negative integers for BCE (e.g., -500 for 500 BCE). Requires dateEnd.',
       ),
     dateEnd: z
       .number()
       .int()
       .optional()
       .describe(
-        'Latest object date (year, inclusive). Negative integers for BCE. Requires dateBegin. ' +
-          'The range is a partial index like the other filters: it omits some objects whose own record dates them inside it.',
+        'Latest object date (year, inclusive). Negative integers for BCE. Requires dateBegin.',
       ),
     limit: z
       .number()
@@ -123,8 +144,7 @@ export const metSearchCollections = tool('met_search_collections', {
       .max(500)
       .default(20)
       .describe(
-        'Maximum number of object IDs to return from the full result set. ' +
-          'The Met search returns every match (up to tens of thousands); this caps how many IDs are returned.',
+        'Maximum number of object IDs to return in this page. Paging reaches only the first 10,000 matches, so a page that would cross 10,000 is cut short there.',
       ),
     offset: z
       .number()
@@ -132,9 +152,7 @@ export const metSearchCollections = tool('met_search_collections', {
       .min(0)
       .default(0)
       .describe(
-        'Zero-based index into the full result set to start from (default 0). ' +
-          'The nextOffset from a previous response is the value to pass here for the next page; a broad query carries the same timeout risk on every page, so narrow it with filters if paging times out. ' +
-          'An offset at or beyond total returns an empty page, not an error.',
+        'Zero-based index of the first match to return (default 0); pass the nextOffset from a previous response to continue paging. Only the first 10,000 matches are reachable, so an offset at or beyond 10,000, or at or beyond a nonzero total, returns an empty page rather than an error. Matches with tied relevance can change order between requests, so an ID can occasionally repeat or be skipped at a page boundary.',
       ),
   }),
   output: z.object({
@@ -142,41 +160,35 @@ export const metSearchCollections = tool('met_search_collections', {
       .number()
       .int()
       .describe(
-        'Total number of matching objects in the Met collection (may far exceed the returned IDs).',
+        'Total number of objects in the Met collection matching the search. Can exceed 10,000, the most that paging reaches.',
       ),
     objectIDs: z
       .array(z.number().int().describe('A Met object ID.'))
       .describe('Object IDs for this page, up to `limit` results.'),
-    returned: z
-      .number()
-      .int()
-      .describe(
-        'Count of object IDs in this response — may be less than `total` when the full result set was truncated by `limit`.',
-      ),
+    returned: z.number().int().describe('Count of object IDs in this page.'),
     truncated: z
       .boolean()
       .describe(
-        'True when matching IDs remain beyond this page (offset + returned < total); false when this page is the last.',
+        'True when reachable matches remain after this page (offset + returned < the smaller of total and 10,000); false when this page is the last one paging reaches.',
       ),
     remaining: z
       .number()
       .int()
       .describe(
-        'Count of matching object IDs after this page: total − (offset + returned), floored at 0. 0 means this is the last page.',
+        'Count of reachable matches after this page: the smaller of total and 10,000, minus (offset + returned), floored at 0. 0 means no further page exists.',
       ),
     nextOffset: z
       .number()
       .int()
       .nullable()
       .describe(
-        'The offset to pass on the next call to continue paging, or null when the result set is exhausted (truncated is false).',
+        'The offset to pass on the next call to continue paging, or null when no further page is reachable (truncated is false).',
       ),
     offset: z
       .number()
       .int()
       .describe(
-        'The resolved offset this page was read from — the offset input after its default of 0. ' +
-          'Compare it against total: when offset is greater than or equal to total the page is empty because the offset ran past the end of the result set, not because the query has nothing left to return.',
+        'The resolved offset this page was read from — the offset input after its default of 0. When it is at or beyond the smaller of total and 10,000, the page is empty because the offset ran past what paging reaches, not because the search found nothing.',
       ),
   }),
   enrichment: {
@@ -184,23 +196,21 @@ export const metSearchCollections = tool('met_search_collections', {
       .string()
       .optional()
       .describe(
-        'Present only when a filtered search could not be checked against the unfiltered query. That check is best-effort; when it does not complete the page is returned uncorrected and may contain objects unrelated to the keyword.',
+        'Present only when total exceeds 10,000: states that only the first 10,000 matches are reachable by paging, and that filters or a more specific keyword bring the rest into reach.',
       ),
   },
   /**
    * Severity separates the modeled outcomes from the incidents. A query that
    * matches nothing and a filter the caller spelled wrong are ordinary answers
    * this tool is built to give, and logging them at `error` beside a genuine
-   * upstream fault is what makes an error stream unreadable. `search_timeout`
-   * keeps `error`: the upstream download really did blow the request budget.
+   * upstream fault is what makes an error stream unreadable.
    */
   errors: [
     {
       reason: 'no_results',
       code: JsonRpcErrorCode.NotFound,
-      when: 'total is 0 — the API returned null objectIDs for the query, or nothing the filters returned also matched the query.',
-      recovery:
-        'Broaden the query, remove filters, or call met_list_departments and set a valid departmentId.',
+      when: 'total is 0 — no object matches the keyword, or none of its matches survives the filters.',
+      recovery: 'Try a different or broader keyword, or correct or drop the filters, then retry.',
       severity: 'notice',
     },
     {
@@ -226,16 +236,6 @@ export const metSearchCollections = tool('met_search_collections', {
         'Call met_list_departments to get valid department IDs, then retry with one of the returned IDs.',
       severity: 'warning',
     },
-    {
-      reason: 'search_timeout',
-      code: JsonRpcErrorCode.Timeout,
-      when: 'The keyword+filter result set is too large to download within the request timeout — a broad query with few or no filters.',
-      recovery:
-        'Narrow the query: add or tighten filters (departmentId, geoLocation, medium, or dateBegin plus dateEnd), or use a more specific keyword, then retry.',
-      // MetService.search classifies the upstream deadline and throws this; the
-      // handler never names it, so the contract says where it comes from.
-      thrownBy: 'service',
-    },
   ],
 
   async handler(input, ctx) {
@@ -258,13 +258,12 @@ export const metSearchCollections = tool('met_search_collections', {
     }
 
     /**
-     * Reject blank filter values before any upstream call. A blank value is not an
-     * absent one to the Met search index: a forwarded blank parameter returns a
-     * different, smaller result set than the same query unfiltered, and a blank the
-     * URL builder drops silently widens the search instead. Neither outcome is
-     * distinguishable from a correct answer at the call site, so the only safe
-     * handling is to refuse. Ordered after the date-range checks so a request
-     * invalid on both counts reports the same fault it reports today.
+     * Reject blank filter values before any upstream call. The Met search ignores
+     * a blank parameter, and a blank the URL builder drops is skipped the same way,
+     * so either path silently widens the search to unfiltered — indistinguishable
+     * from a correct answer at the call site. The only safe handling is to refuse.
+     * Ordered after the date-range checks so a request invalid on both counts
+     * reports the same fault it reports today.
      */
     if (input.q.trim() === '') {
       throw ctx.fail(
@@ -295,9 +294,11 @@ export const metSearchCollections = tool('met_search_collections', {
       );
     }
 
-    // Validate departmentId against the live (cached) Met department set so an
-    // unknown ID fails fast with actionable guidance instead of falling through to
-    // an ambiguous no_results.
+    /**
+     * Validate departmentId against the live (cached) Met department set. The Met
+     * search ignores an unknown ID and answers unfiltered, so an unchecked typo
+     * would quietly widen the search instead of failing.
+     */
     if (input.departmentId != null) {
       const validDepartmentIds = await getMetService().getValidDepartmentIds(ctx);
       if (!validDepartmentIds.has(input.departmentId)) {
@@ -312,7 +313,6 @@ export const metSearchCollections = tool('met_search_collections', {
     ctx.log.info('Met search', {
       q: input.q,
       hasImages: input.hasImages,
-      isPublicDomain: input.isPublicDomain,
       departmentId: input.departmentId,
       limit: input.limit,
       offset: input.offset,
@@ -324,7 +324,6 @@ export const metSearchCollections = tool('met_search_collections', {
         limit: input.limit,
         offset: input.offset,
         hasImages: input.hasImages,
-        isPublicDomain: input.isPublicDomain,
         isHighlight: input.isHighlight,
         isOnView: input.isOnView,
         medium: input.medium,
@@ -338,22 +337,27 @@ export const metSearchCollections = tool('met_search_collections', {
 
     if (result.total === 0) {
       /**
-       * isPublicDomain is the filter most likely to have zeroed an otherwise-matching
-       * query, and the generic hint doesn't name it — so callers retry new keywords
-       * against the same filter and fail identically. The hint has to be built here
-       * rather than declared: ctx.recoveryFor resolves a static string keyed only by
-       * the reason and cannot branch on an input value.
+       * The hint has to be built here rather than declared: ctx.recoveryFor
+       * resolves a static string keyed only by the reason. Whether the keyword
+       * matches on its own is the one fact that tells a bad keyword from filters
+       * that removed every match, and it costs a request only on this path — an
+       * unfiltered zero already answers it.
        */
+      const filters = filtersUsed(input);
+      const keywordMatches =
+        filters.length > 0 ? await getMetService().countKeywordMatches(input.q, ctx) : 0;
       throw ctx.fail(
         'no_results',
-        `No objects matched the query "${input.q}" with the specified filters.`,
-        input.isPublicDomain === true
-          ? {
-              recovery: {
-                hint: 'Retry without isPublicDomain — the Met search index covers only a subset of public-domain objects and under-reports true matches. CC0 status stays verifiable per object from the isPublicDomain field on met_get_object.',
-              },
-            }
-          : ctx.recoveryFor('no_results'),
+        `No objects matched the query "${input.q}"${filterScope(filters)}.`,
+        {
+          recovery: { hint: noResultsHint(input.q, filters, keywordMatches) },
+        },
+      );
+    }
+
+    if (result.total > SEARCH_RESULT_WINDOW) {
+      ctx.enrich.notice(
+        `Only the first ${count(SEARCH_RESULT_WINDOW)} of ${count(result.total)} matches are reachable by paging. Narrow the search with filters or a more specific keyword to reach the rest.`,
       );
     }
 
@@ -362,17 +366,21 @@ export const metSearchCollections = tool('met_search_collections', {
 
   format: (result) => {
     /**
-     * Three states, not two. `(complete)` claims a page finished the result set,
-     * which is wrong for a page that is empty because the offset ran past the end.
-     * The marker is gated on the resolved `offset` against `total` — the condition
-     * itself — rather than on `returned === 0`, which is also true of a page the
-     * upstream answered with a null ID array against a positive total.
+     * Four states. `(complete)` claims a page finished the result set, which is
+     * wrong for a page that is empty because the offset ran past what paging
+     * reaches, and for a last page that stops at the 10,000 window short of
+     * `total`. The markers are gated on the resolved `offset` against the
+     * reachable count — the condition itself — rather than on `returned === 0`,
+     * which is also true of a page the upstream answered with a null ID array.
      */
+    const reachable = Math.min(result.total, SEARCH_RESULT_WINDOW);
     const marker = result.truncated
       ? ' (truncated)'
-      : result.offset >= result.total
+      : result.offset >= reachable
         ? ' (offset beyond result set)'
-        : ' (complete)';
+        : reachable < result.total
+          ? ' (window end)'
+          : ' (complete)';
     const lines: string[] = [
       `**Total matches:** ${result.total}`,
       `**Returned IDs:** ${result.returned}${marker}`,

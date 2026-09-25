@@ -1,20 +1,22 @@
 /**
- * @fileoverview Tests for MetService — offset paging, fail-fast search timeout,
- * cached department-ID validation, and object normalization. Exercises the real
- * service with a mocked global fetch; this is the only layer that reaches
- * `normalizeObject` (the tool tests mock the service wholesale, above it).
+ * @fileoverview Tests for MetService — `/v1.1/search` paging and its 10,000
+ * window, retry of Timeout-coded failures, the keyword-only count behind the
+ * `no_results` hint, cached department-ID validation, and object normalization.
+ * Exercises the real service with a mocked global fetch; the search-tool cases
+ * here run the tool over that real service through `runToolContract`, the seam
+ * that includes the URL building and window arithmetic under test.
  * @module tests/services/met/met-service.test
  */
 
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
-import { JsonRpcErrorCode, timeout } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import {
   createInMemoryStorage,
   createMockContext,
-  getEnrichment,
   runToolContract,
 } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { z } from 'zod';
 import { metGetObject } from '@/mcp-server/tools/definitions/met-get-object.tool.js';
 import { metSearchCollections } from '@/mcp-server/tools/definitions/met-search-collections.tool.js';
 import { getMetService, initMetService } from '@/services/met/met-service.js';
@@ -31,41 +33,58 @@ function idsResponse(total: number, count = total): Response {
   return jsonResponse({ total, objectIDs: Array.from({ length: count }, (_, i) => i + 1) });
 }
 
-/**
- * True when a `/search` request carries `q` alone — the shape of the unfiltered
- * control run. Mirrors the service's own "any parameter beyond q" test, so a mock
- * can tell the two runs of a filtered search apart.
- */
-function isControlRun(request: unknown): boolean {
-  const url = new URL(String(request));
-  return [...url.searchParams.keys()].every((key) => key === 'q');
-}
+const COLLECTION_ORIGIN = 'https://collectionapi.metmuseum.org';
+const SEARCH_PATH = '/public/collection/v1.1/search';
+const DEPARTMENTS_PATH = '/public/collection/v1/departments';
+
+/** The parameters every search request carries; anything else is a filter. */
+const PAGING_PARAMS = new Set(['q', 'offset', 'limit']);
 
 /**
- * Stage the two responses a filtered search consumes: the filtered run and the
- * unfiltered control run it is intersected against. Routing on the URL rather
- * than call order keeps the mock correct however the two are scheduled.
+ * One `/v1.1/search` page over `total` sequential matches (IDs 1..total), shaped
+ * the way the upstream answers: `offset`/`limit` read off the request, the page
+ * clipped at the 10,000 window, and `objectIDs: null` for an empty page while
+ * `total` stays the full count.
  */
-function routeSearch(filtered: unknown, control: unknown) {
-  return (request: unknown) =>
-    Promise.resolve(jsonResponse(isControlRun(request) ? control : filtered));
+function searchPage(url: URL, total: number): Response {
+  const offset = Number(url.searchParams.get('offset'));
+  const limit = Number(url.searchParams.get('limit'));
+  const end = Math.min(offset + limit, total, 10_000);
+  const objectIDs = Array.from({ length: Math.max(0, end - offset) }, (_, i) => offset + i + 1);
+  return jsonResponse({ total, objectIDs: objectIDs.length > 0 ? objectIDs : null });
 }
 
-/** A `/search` payload carrying exactly these IDs, with a matching total. */
-function idsBody(objectIDs: number[]) {
-  return { total: objectIDs.length, objectIDs };
+/**
+ * A fetch fake over the collection host, dispatching on origin + pathname. Any
+ * request no handler claims rejects, so a stray endpoint fails the test.
+ */
+function routes(handlers: Record<string, (url: URL) => Response>) {
+  return (request: unknown) => {
+    const url = new URL(String(request));
+    const handler = url.origin === COLLECTION_ORIGIN ? handlers[url.pathname] : undefined;
+    return handler
+      ? Promise.resolve(handler(url))
+      : Promise.reject(new Error(`unrouted fetch ${url.origin}${url.pathname}`));
+  };
 }
 
-/** A real streaming response whose body fails after headers with the supplied error. */
-function bodyFailureResponse(error: unknown): Response {
-  return new Response(
-    new ReadableStream<Uint8Array>({
-      start(controller) {
-        controller.error(error);
-      },
-    }),
-    { headers: { 'content-type': 'application/json' } },
-  );
+/** `/v1.1/search` serving `total` sequential matches for every query. */
+const searchUpstream = (total: number) =>
+  routes({ [SEARCH_PATH]: (url) => searchPage(url, total) });
+
+/** The search requests a test issued, parsed. */
+function searchRequests(fetchMock: ReturnType<typeof vi.fn>): URL[] {
+  return fetchMock.mock.calls
+    .map((call) => new URL(String(call[0])))
+    .filter((url) => url.pathname === SEARCH_PATH);
+}
+
+/** Every text block of a tool result's `content[]`, joined. */
+function textOf(result: { content?: { type: string }[] }): string {
+  return (result.content ?? [])
+    .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+    .map((block) => block.text)
+    .join('\n');
 }
 
 /**
@@ -410,337 +429,157 @@ describe('MetService', () => {
 
   beforeEach(() => {
     initMetService({} as AppConfig, createInMemoryStorage());
-    fetchMock = vi.fn();
+    // Unstaged calls fail loudly; each test layers the fakes it needs on top.
+    fetchMock = vi.fn().mockRejectedValue(new Error('unmocked fetch'));
     vi.stubGlobal('fetch', fetchMock);
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
 
-  describe('search — offset paging (#9)', () => {
-    it('slices the first page and reports continuation at offset 0', async () => {
-      fetchMock.mockResolvedValue(idsResponse(100));
-      const result = await getMetService().search({ q: 'cat', limit: 10 }, createMockContext());
-      expect(result.objectIDs).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
-      expect(result.returned).toBe(10);
-      expect(result.truncated).toBe(true);
-      expect(result.remaining).toBe(90);
-      expect(result.nextOffset).toBe(10);
-    });
+  describe('per-endpoint URLs under the default base', () => {
+    it('fetches an object from /v1/objects/{id} on the collection host', async () => {
+      fetchMock.mockResolvedValue(jsonResponse(rawObjects.populated));
+      await getMetService().getObject(436535, createMockContext());
 
-    it('slices a mid window via offset', async () => {
-      fetchMock.mockResolvedValue(idsResponse(100));
-      const result = await getMetService().search(
-        { q: 'cat', limit: 10, offset: 20 },
-        createMockContext(),
-      );
-      expect(result.objectIDs[0]).toBe(21);
-      expect(result.objectIDs.at(-1)).toBe(30);
-      expect(result.returned).toBe(10);
-      expect(result.remaining).toBe(70);
-      expect(result.nextOffset).toBe(30);
-      expect(result.truncated).toBe(true);
-    });
-
-    it('the last partial page ends pagination (truncated false, nextOffset null)', async () => {
-      fetchMock.mockResolvedValue(idsResponse(25));
-      const result = await getMetService().search(
-        { q: 'cat', limit: 10, offset: 20 },
-        createMockContext(),
-      );
-      expect(result.objectIDs).toEqual([21, 22, 23, 24, 25]);
-      expect(result.returned).toBe(5);
-      expect(result.remaining).toBe(0);
-      expect(result.truncated).toBe(false);
-      expect(result.nextOffset).toBeNull();
-    });
-
-    it('an offset at or beyond total returns an empty page, not an error', async () => {
-      fetchMock.mockResolvedValue(idsResponse(25));
-      const result = await getMetService().search(
-        { q: 'cat', limit: 10, offset: 999 },
-        createMockContext(),
-      );
-      expect(result.objectIDs).toEqual([]);
-      expect(result.returned).toBe(0);
-      expect(result.remaining).toBe(0);
-      expect(result.truncated).toBe(false);
-      expect(result.nextOffset).toBeNull();
-    });
-
-    it('default offset 0 with a fully-returned set is not truncated', async () => {
-      fetchMock.mockResolvedValue(idsResponse(5));
-      const result = await getMetService().search({ q: 'rare', limit: 20 }, createMockContext());
-      expect(result.objectIDs).toEqual([1, 2, 3, 4, 5]);
-      expect(result.truncated).toBe(false);
-      expect(result.remaining).toBe(0);
-      expect(result.nextOffset).toBeNull();
-    });
-
-    // --- #17: the resolved offset is echoed on the result ---
-
-    it('echoes the requested offset on the result', async () => {
-      fetchMock.mockResolvedValue(idsResponse(100));
-      const result = await getMetService().search(
-        { q: 'cat', limit: 10, offset: 20 },
-        createMockContext(),
-      );
-      expect(result.offset).toBe(20);
-    });
-
-    it('echoes the applied default of 0 when offset is omitted', async () => {
-      fetchMock.mockResolvedValue(idsResponse(5));
-      const result = await getMetService().search({ q: 'rare', limit: 20 }, createMockContext());
-      expect(result.offset).toBe(0);
-    });
-
-    it('echoes an offset that ran past the end alongside the empty page', async () => {
-      fetchMock.mockResolvedValue(idsResponse(25));
-      const result = await getMetService().search(
-        { q: 'cat', limit: 10, offset: 999 },
-        createMockContext(),
-      );
-      // total is knowable from the same result, so offset >= total is directly readable.
-      expect(result.offset).toBe(999);
-      expect(result.total).toBe(25);
-    });
-  });
-
-  describe('buildSearchUrl — omitted optional filters stay off the request (#13)', () => {
-    it('omits medium and geoLocation entirely when they are not supplied', async () => {
-      fetchMock.mockResolvedValue(idsResponse(3));
-      await getMetService().search({ q: 'cat', limit: 10 }, createMockContext());
       const url = new URL(String(fetchMock.mock.calls[0]?.[0]));
-      expect(url.searchParams.get('q')).toBe('cat');
-      expect(url.searchParams.has('medium')).toBe(false);
-      expect(url.searchParams.has('geoLocation')).toBe(false);
+      expect(url.origin).toBe('https://collectionapi.metmuseum.org');
+      expect(url.pathname).toBe('/public/collection/v1/objects/436535');
     });
 
-    it('appends every geoLocation value when they are supplied', async () => {
-      // A filtered search consumes two responses concurrently, so the mock has to
-      // mint a fresh one per call — a single Response body cannot be read twice.
-      fetchMock.mockImplementation(() => Promise.resolve(idsResponse(3)));
-      await getMetService().search(
-        { q: 'cat', limit: 10, geoLocation: ['France', 'Egypt'] },
-        createMockContext(),
-      );
-      const filteredUrl = fetchMock.mock.calls
-        .map((call) => new URL(String(call[0])))
-        .find((url) => !isControlRun(url));
-      expect(filteredUrl?.searchParams.getAll('geoLocation')).toEqual(['France', 'Egypt']);
-    });
-  });
+    it('fetches departments from /v1/departments on the collection host', async () => {
+      fetchMock.mockResolvedValue(jsonResponse({ departments: [] }));
+      await getMetService().getDepartments(createMockContext());
 
-  describe('search — fail-fast on a deterministic timeout (#11)', () => {
-    it('does not retry an aborted (timed-out) search and surfaces search_timeout with recovery', async () => {
-      // fetchWithTimeout classifies its own deadline before the service adds the
-      // search-specific reason and non-retryable recovery contract.
-      fetchMock.mockRejectedValue(timeout('Upstream request timed out.'));
-      const ctx = createMockContext({ errors: metSearchCollections.errors });
-
-      const err = await getMetService()
-        .search({ q: 'the', limit: 20 }, ctx)
-        .catch((e) => e);
-
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-      expect(err.code).toBe(JsonRpcErrorCode.Timeout);
-      expect(err.data.reason).toBe('search_timeout');
-      expect(err.data.retryable).toBe(false);
-      // search_timeout only fires on the filtered run — the control run is
-      // best-effort — so filters genuinely do shrink the download that timed out.
-      expect(err.data.recovery.hint).toContain('Narrow the query');
-      expect(err.data.recovery.hint).toContain('filters');
-    });
-
-    it('also classifies a timeout while reading the response body as search_timeout', async () => {
-      fetchMock.mockResolvedValue(bodyFailureResponse(timeout('Upstream request timed out.')));
-      const ctx = createMockContext({ errors: metSearchCollections.errors });
-
-      await expect(getMetService().search({ q: 'the', limit: 20 }, ctx)).rejects.toMatchObject({
-        code: JsonRpcErrorCode.Timeout,
-        data: { reason: 'search_timeout', retryable: false },
-      });
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-    });
-
-    it('a normal-latency search still succeeds in one fetch (no retry-behavior regression)', async () => {
-      fetchMock.mockResolvedValue(jsonResponse({ total: 3, objectIDs: [1, 2, 3] }));
-      const result = await getMetService().search({ q: 'vermeer', limit: 20 }, createMockContext());
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-      expect(result.objectIDs).toEqual([1, 2, 3]);
-    });
-
-    it('carries the search_timeout recovery onto both client surfaces through the tool contract', async () => {
-      // search_timeout is the one declared reason the handler never names — the
-      // service classifies it, which is what the contract entry's
-      // `thrownBy: 'service'` records. Running the real pipeline is what proves
-      // the declared hint still reaches a caller from down there.
-      fetchMock.mockRejectedValue(timeout('Upstream request timed out.'));
-
-      const result = await runToolContract(metSearchCollections, { q: 'the', limit: 20 });
-
-      expect(result.isError).toBe(true);
-      const error = (
-        result.structuredContent as {
-          error: { code: number; data: { reason: string; recovery: { hint: string } } };
-        }
-      ).error;
-      expect(error.code).toBe(JsonRpcErrorCode.Timeout);
-      expect(error.data.reason).toBe('search_timeout');
-      expect(error.data.recovery.hint).toContain('Narrow the query');
-
-      // Containment, not equality: the framework appends the recovery line and a
-      // reason/retryable trailer to the error text, and their wording is its own.
-      const text = (result.content ?? [])
-        .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
-        .map((block) => block.text)
-        .join('\n');
-      expect(text).toContain('Recovery: Narrow the query');
-      // The reason and its retryability are what a text-only caller branches on.
-      expect(text).toContain('search_timeout');
-      expect(text).toContain('not retryable');
+      const url = new URL(String(fetchMock.mock.calls[0]?.[0]));
+      expect(url.origin).toBe('https://collectionapi.metmuseum.org');
+      expect(url.pathname).toBe('/public/collection/v1/departments');
     });
   });
 
   /**
-   * The upstream `/search` answers any filter parameter with the union of the real
-   * keyword matches and a fixed, query-independent floor. Every case below is drawn
-   * from the live measurements in #21: `q=sunflower&isPublicDomain=true` returns
-   * `[437261, 436529, 228990, 436043]`, of which only `436529` is in the 97-result
-   * unfiltered run.
+   * An upstream 504/408/425 and the server's own timer abort all arrive as a
+   * `Timeout`-coded `McpError`. Each is transient, so each takes the same retry
+   * ladder `met_list_departments` uses rather than a non-retryable relabel.
    */
-  describe('search — filtered runs are intersected with an unfiltered control (#21)', () => {
-    const SUNFLOWER_FILTERED = [437261, 436529, 228990, 436043];
-
-    it('drops the floor IDs the unfiltered control run does not contain', async () => {
-      fetchMock.mockImplementation(
-        routeSearch(
-          { total: 4, objectIDs: SUNFLOWER_FILTERED },
-          { total: 97, objectIDs: [436529, 436580, 337700] },
-        ),
-      );
-      const result = await getMetService().search(
-        { q: 'sunflower', isPublicDomain: true, limit: 20 },
-        createMockContext(),
+  describe('search — a Timeout-coded failure is retried like any transient error (#28)', () => {
+    /** A real 504 exchange, minted per call so every retry reads a fresh body. */
+    const gatewayTimeout = () =>
+      Promise.resolve(
+        new Response('<html>gateway timeout</html>', {
+          status: 504,
+          statusText: 'Gateway Timeout',
+          headers: { 'content-type': 'text/html' },
+        }),
       );
 
-      expect(result.objectIDs).toEqual([436529]);
-      expect(result.total).toBe(1);
-      expect(result.returned).toBe(1);
-      expect(result.truncated).toBe(false);
-      expect(result.remaining).toBe(0);
-      expect(result.nextOffset).toBeNull();
+    /** A request that never answers until its signal aborts — the timer-abort shape. */
+    const neverAnswers = (_request: unknown, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(init.signal?.reason));
+      });
+
+    it('retries an upstream 504 on the ordinary ladder and surfaces it as the upstream error', async () => {
+      vi.useFakeTimers();
+      fetchMock.mockImplementation(gatewayTimeout);
+      const ctx = createMockContext({ errors: metSearchCollections.errors });
+
+      const pending = getMetService()
+        .search({ q: 'cat', limit: 20 }, ctx)
+        .catch((e: unknown) => e);
+      await vi.runAllTimersAsync();
+      const err = (await pending) as {
+        code: number;
+        message: string;
+        data: Record<string, unknown>;
+      };
+
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+      expect(err.code).toBe(JsonRpcErrorCode.Timeout);
+      expect(err.message).toContain('Status: 504');
+      expect(err.data.status).toBe(504);
+      expect(err.data.errorSource).toBe('FetchHttpError');
+      expect(err.data.retryAttempts).toBe(4);
+      expect(err.data.reason).toBeUndefined();
+      expect(err.data.retryable).toBeUndefined();
     });
 
-    it('retains a floor member that genuinely matches the query', async () => {
-      // 437261 is a floor member for isPublicDomain, but it is a true match for a
-      // query it actually relates to — subtracting a cached floor would lose it.
-      fetchMock.mockImplementation(
-        routeSearch(
-          { total: 4, objectIDs: SUNFLOWER_FILTERED },
-          { total: 3, objectIDs: [437261, 436529, 500000] },
-        ),
-      );
-      const result = await getMetService().search(
-        { q: 'jerome', isPublicDomain: true, limit: 20 },
-        createMockContext(),
-      );
+    it('retries a request-timer abort (FetchTimeout) the same way', async () => {
+      vi.useFakeTimers();
+      fetchMock.mockImplementation(neverAnswers);
+      const ctx = createMockContext({ errors: metSearchCollections.errors });
 
-      expect(result.objectIDs).toEqual([437261, 436529]);
-      expect(result.total).toBe(2);
+      const pending = getMetService()
+        .search({ q: 'cat', limit: 20 }, ctx)
+        .catch((e: unknown) => e);
+      await vi.runAllTimersAsync();
+      const err = (await pending) as { code: number; data: Record<string, unknown> };
+
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+      expect(err.code).toBe(JsonRpcErrorCode.Timeout);
+      expect(err.data.errorSource).toBe('FetchTimeout');
+      expect(err.data.retryAttempts).toBe(4);
+      expect(err.data.reason).toBeUndefined();
     });
 
-    it('preserves the filtered run’s ordering, not the control run’s', async () => {
-      fetchMock.mockImplementation(routeSearch(idsBody([30, 10, 20]), idsBody([10, 20, 30, 40])));
-      const result = await getMetService().search(
-        { q: 'cat', hasImages: true, limit: 20 },
-        createMockContext(),
-      );
+    it('recovers when a retry after a 504 succeeds', async () => {
+      vi.useFakeTimers();
+      fetchMock
+        .mockImplementationOnce(gatewayTimeout)
+        .mockImplementationOnce(() => Promise.resolve(idsResponse(3)));
 
-      expect(result.objectIDs).toEqual([30, 10, 20]);
+      const pending = getMetService().search({ q: 'cat', limit: 20 }, createMockContext());
+      await vi.runAllTimersAsync();
+      const result = await pending;
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(result.total).toBe(3);
     });
 
-    it('derives total, remaining, truncated, and nextOffset from the intersection', async () => {
-      fetchMock.mockImplementation(
-        routeSearch(idsBody([1, 2, 3, 4, 5, 6]), idsBody([2, 3, 5, 6, 99])),
-      );
-      const result = await getMetService().search(
-        { q: 'cat', medium: 'Paintings', limit: 2 },
-        createMockContext(),
-      );
+    it('reaches the caller through the tool contract as the 504, with no search_timeout reason', async () => {
+      vi.useFakeTimers();
+      fetchMock.mockImplementation(gatewayTimeout);
 
-      // Intersection is [2, 3, 5, 6]; the upstream filtered total of 6 is discarded.
-      expect(result.total).toBe(4);
-      expect(result.objectIDs).toEqual([2, 3]);
-      expect(result.returned).toBe(2);
-      expect(result.truncated).toBe(true);
-      expect(result.remaining).toBe(2);
-      expect(result.nextOffset).toBe(2);
+      const pending = runToolContract(metSearchCollections, { q: 'cat', limit: 20 });
+      await vi.runAllTimersAsync();
+      const result = await pending;
+
+      expect(result.isError).toBe(true);
+      const error = (
+        result.structuredContent as { error: { code: number; data: Record<string, unknown> } }
+      ).error;
+      expect(error.code).toBe(JsonRpcErrorCode.Timeout);
+      expect(error.data.status).toBe(504);
+      expect(error.data.reason).toBeUndefined();
+      const text = (result.content ?? [])
+        .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+        .map((block) => block.text)
+        .join('\n');
+      expect(text).toContain('Status: 504');
+      expect(text).not.toContain('search_timeout');
+      expect(text).not.toContain('too large');
     });
+  });
 
-    it('slices the intersection by offset and limit, not the raw filtered array', async () => {
-      fetchMock.mockImplementation(routeSearch(idsBody([1, 2, 3, 4, 5, 6]), idsBody([2, 3, 5, 6])));
-      const result = await getMetService().search(
-        { q: 'cat', isOnView: true, limit: 2, offset: 1 },
-        createMockContext(),
-      );
-
-      // Offset 1 of the intersection [2, 3, 5, 6] — not offset 1 of [1..6].
-      expect(result.objectIDs).toEqual([3, 5]);
-      expect(result.offset).toBe(1);
-      expect(result.total).toBe(4);
-      expect(result.remaining).toBe(1);
-      expect(result.nextOffset).toBe(3);
-    });
-
-    it('an offset past the end of the intersection returns an empty page, not an error', async () => {
-      fetchMock.mockImplementation(routeSearch(idsBody([1, 2, 3, 4, 5, 6]), idsBody([2, 3])));
-      const result = await getMetService().search(
-        { q: 'cat', isHighlight: true, limit: 10, offset: 5 },
-        createMockContext(),
-      );
-
-      // Offset 5 runs past the 2-ID intersection even though the filtered run had 6.
-      expect(result.objectIDs).toEqual([]);
-      expect(result.returned).toBe(0);
-      expect(result.total).toBe(2);
-      expect(result.offset).toBe(5);
-      expect(result.remaining).toBe(0);
-      expect(result.nextOffset).toBeNull();
-    });
-
-    it('reports total 0 when nothing in the filtered run matched the query', async () => {
-      // The #21 reproduction: a nonsense keyword whose filtered run is the floor alone.
-      fetchMock.mockImplementation(
-        routeSearch(
-          { total: 3, objectIDs: [437261, 228990, 436043] },
-          { total: 0, objectIDs: null },
-        ),
-      );
-      const result = await getMetService().search(
-        { q: 'zzzqqqxyz', isPublicDomain: true, limit: 5 },
-        createMockContext(),
-      );
-
-      expect(result.total).toBe(0);
-      expect(result.objectIDs).toEqual([]);
-      expect(result.returned).toBe(0);
-      expect(result.truncated).toBe(false);
-      expect(result.nextOffset).toBeNull();
-    });
-
-    it('issues the control run with q alone, stripping every filter parameter', async () => {
-      fetchMock.mockImplementation(routeSearch(idsBody([1]), idsBody([1])));
+  /**
+   * `/v1.1/search` pages upstream: one request per page, `offset`/`limit` passed
+   * through, nothing past `offset + limit = 10,000`, and `total` still the full
+   * count. The fake mirrors those measured behaviors, so every case below runs
+   * the service's real URL building and window arithmetic.
+   */
+  describe('search — /v1.1 paging (#27)', () => {
+    it('requests /v1.1/search once, carrying offset, limit, and every filter', async () => {
+      fetchMock.mockImplementation(searchUpstream(3));
       await getMetService().search(
         {
           q: 'cat',
           limit: 20,
           hasImages: true,
-          isPublicDomain: true,
           isHighlight: true,
-          isOnView: true,
+          isOnView: false,
           medium: 'Paintings',
           departmentId: 11,
           geoLocation: ['France'],
@@ -750,284 +589,599 @@ describe('MetService', () => {
         createMockContext(),
       );
 
-      expect(fetchMock).toHaveBeenCalledTimes(2);
-      const urls = fetchMock.mock.calls.map((call) => new URL(String(call[0])));
-      const control = urls.find((url) => isControlRun(url));
-      const filtered = urls.find((url) => !isControlRun(url));
-
-      expect([...(control?.searchParams.keys() ?? [])]).toEqual(['q']);
-      expect(control?.searchParams.get('q')).toBe('cat');
-      // The filtered run is untouched — the control run is an addition, not a rewrite.
-      expect(filtered?.searchParams.get('medium')).toBe('Paintings');
-      expect(filtered?.searchParams.get('dateBegin')).toBe('1800');
-      expect(filtered?.searchParams.getAll('geoLocation')).toEqual(['France']);
-    });
-
-    it.each([
-      ['hasImages true', { hasImages: true }],
-      ['hasImages false', { hasImages: false }],
-      ['isOnView', { isOnView: true }],
-      ['isPublicDomain', { isPublicDomain: true as const }],
-      ['isHighlight', { isHighlight: true as const }],
-      ['medium', { medium: 'Paintings' }],
-      ['departmentId', { departmentId: 11 }],
-      ['geoLocation', { geoLocation: ['France'] }],
-      ['date range', { dateBegin: 1800, dateEnd: 1900 }],
-    ])('issues a control run for %s', async (_label, filter) => {
-      fetchMock.mockImplementation(routeSearch(idsBody([1, 2]), idsBody([1])));
-      const result = await getMetService().search(
-        { q: 'cat', limit: 20, ...filter },
-        createMockContext(),
-      );
-
-      expect(fetchMock).toHaveBeenCalledTimes(2);
-      expect(result.objectIDs).toEqual([1]);
-    });
-
-    it('an unfiltered search issues exactly one upstream request and keeps the upstream total', async () => {
-      fetchMock.mockResolvedValue(jsonResponse({ total: 97, objectIDs: [1, 2, 3] }));
-      const result = await getMetService().search(
-        { q: 'sunflower', limit: 20 },
-        createMockContext(),
-      );
-
       expect(fetchMock).toHaveBeenCalledTimes(1);
-      expect([...new URL(String(fetchMock.mock.calls[0]?.[0])).searchParams.keys()]).toEqual(['q']);
-      // Unfiltered behavior is untouched: the upstream total stands as reported.
-      expect(result.total).toBe(97);
-      expect(result.objectIDs).toEqual([1, 2, 3]);
+      const url = new URL(String(fetchMock.mock.calls[0]?.[0]));
+      expect(url.origin).toBe(COLLECTION_ORIGIN);
+      expect(url.pathname).toBe(SEARCH_PATH);
+      expect([...url.searchParams.entries()]).toEqual([
+        ['q', 'cat'],
+        ['offset', '0'],
+        ['limit', '20'],
+        ['hasImages', 'true'],
+        ['isHighlight', 'true'],
+        ['isOnView', 'false'],
+        ['medium', 'Paintings'],
+        ['departmentId', '11'],
+        ['geoLocation', 'France'],
+        ['dateBegin', '1800'],
+        ['dateEnd', '1900'],
+      ]);
+      expect(url.searchParams.has('isPublicDomain')).toBe(false);
     });
 
-    it('issues the two runs in parallel rather than one after the other', async () => {
-      let releaseFiltered!: () => void;
-      const filteredGate = new Promise<void>((resolve) => {
-        releaseFiltered = resolve;
-      });
-      fetchMock.mockImplementation(async (request: unknown) => {
-        if (isControlRun(request)) {
-          // Only reachable while the filtered run is still pending — a sequential
-          // implementation would block here forever and time the test out.
-          releaseFiltered();
-          return jsonResponse(idsBody([1, 2]));
-        }
-        await filteredGate;
-        return jsonResponse(idsBody([1, 2, 9]));
-      });
+    it('sends q, offset, and limit alone when no filter is set (#13: omitted filters stay off)', async () => {
+      fetchMock.mockImplementation(searchUpstream(3));
+      await getMetService().search({ q: 'cat', limit: 10, offset: 40 }, createMockContext());
 
+      const url = new URL(String(fetchMock.mock.calls[0]?.[0]));
+      expect([...url.searchParams.entries()]).toEqual([
+        ['q', 'cat'],
+        ['offset', '40'],
+        ['limit', '10'],
+      ]);
+    });
+
+    it('returns the first page with continuation at offset 0', async () => {
+      fetchMock.mockImplementation(searchUpstream(100));
+      const result = await getMetService().search({ q: 'cat', limit: 10 }, createMockContext());
+
+      expect(result).toEqual({
+        total: 100,
+        objectIDs: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+        returned: 10,
+        truncated: true,
+        remaining: 90,
+        nextOffset: 10,
+        offset: 0,
+      });
+    });
+
+    it('returns a mid-window page of a result set larger than the window', async () => {
+      fetchMock.mockImplementation(searchUpstream(14_398));
       const result = await getMetService().search(
-        { q: 'cat', hasImages: true, limit: 20 },
+        { q: 'horse', limit: 500, offset: 5000 },
         createMockContext(),
       );
 
-      expect(result.objectIDs).toEqual([1, 2]);
-      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(result.objectIDs[0]).toBe(5001);
+      expect(result.objectIDs.at(-1)).toBe(5500);
+      expect(result.returned).toBe(500);
+      expect(result.total).toBe(14_398);
+      // Against the 10,000 window, not the 14,398 total.
+      expect(result.remaining).toBe(4500);
+      expect(result.truncated).toBe(true);
+      expect(result.nextOffset).toBe(5500);
     });
 
-    // A control-run failure does not fail the search — that path is covered in the
-    // degraded-control block below, alongside the filtered-run timeout that does.
-
-    it('raises no_results through the tool when the intersection is empty', async () => {
-      // End to end over the real service: the upstream filtered response is a
-      // populated page, and the tool still has to report no_results.
-      fetchMock.mockImplementation(
-        routeSearch(
-          { total: 3, objectIDs: [437261, 228990, 436043] },
-          { total: 0, objectIDs: null },
-        ),
+    it('ends paging on the page that crosses the 10,000 window', async () => {
+      fetchMock.mockImplementation(searchUpstream(14_398));
+      const result = await getMetService().search(
+        { q: 'horse', limit: 500, offset: 9900 },
+        createMockContext(),
       );
-      const ctx = createMockContext({ errors: metSearchCollections.errors });
-      const input = metSearchCollections.input.parse({
-        q: 'zzzqqqxyz',
-        isPublicDomain: true,
-        limit: 5,
-      });
 
-      const err = await Promise.resolve(metSearchCollections.handler(input, ctx)).catch((e) => e);
-      expect(err.code).toBe(JsonRpcErrorCode.NotFound);
-      expect(err.data.reason).toBe('no_results');
-      // The targeted #20 hint still fires — now reachable behind a filter.
-      expect(err.data.recovery.hint).toContain('isPublicDomain');
+      expect(new URL(String(fetchMock.mock.calls[0]?.[0])).searchParams.get('offset')).toBe('9900');
+      expect(result.returned).toBe(100);
+      expect(result.objectIDs.at(-1)).toBe(10_000);
+      expect(result.total).toBe(14_398);
+      expect(result.remaining).toBe(0);
+      expect(result.truncated).toBe(false);
+      expect(result.nextOffset).toBeNull();
     });
 
-    it('an intersected page satisfies the output schema and renders through format()', async () => {
-      fetchMock.mockImplementation(
-        routeSearch(
-          { total: 4, objectIDs: SUNFLOWER_FILTERED },
-          { total: 97, objectIDs: [436529, 436580] },
-        ),
+    it('returns an empty page, not an error, at an offset of exactly 10,000', async () => {
+      fetchMock.mockImplementation(searchUpstream(14_398));
+      const result = await getMetService().search(
+        { q: 'horse', limit: 20, offset: 10_000 },
+        createMockContext(),
       );
-      const ctx = createMockContext({ errors: metSearchCollections.errors });
-      const input = metSearchCollections.input.parse({
-        q: 'sunflower',
-        isPublicDomain: true,
-        limit: 20,
+
+      expect(result).toEqual({
+        total: 14_398,
+        objectIDs: [],
+        returned: 0,
+        truncated: false,
+        remaining: 0,
+        nextOffset: null,
+        offset: 10_000,
       });
+    });
 
-      const result = await metSearchCollections.handler(input, ctx);
-      const parsed = metSearchCollections.output.safeParse(result);
-      expect(parsed.error?.message).toBeUndefined();
-      expect(parsed.success).toBe(true);
+    it('returns an empty page, not an error, at an offset of exactly total', async () => {
+      fetchMock.mockImplementation(searchUpstream(178));
+      const result = await getMetService().search(
+        { q: 'sunflower', limit: 20, offset: 178 },
+        createMockContext(),
+      );
 
-      // content[] carries the intersected count, not the upstream filtered total.
-      const text = (metSearchCollections.format!(result)[0] as { text: string }).text;
-      expect(text).toContain('**Total matches:** 1');
-      expect(text).toContain('436529');
-      expect(text).not.toContain('228990');
-      expect(text).toContain('(complete)');
+      expect(result.objectIDs).toEqual([]);
+      expect(result.total).toBe(178);
+      expect(result.offset).toBe(178);
+      expect(result.remaining).toBe(0);
+      expect(result.nextOffset).toBeNull();
+    });
+
+    it('returns an empty page for an offset far past total', async () => {
+      fetchMock.mockImplementation(searchUpstream(25));
+      const result = await getMetService().search(
+        { q: 'cat', limit: 10, offset: 999 },
+        createMockContext(),
+      );
+
+      expect(result.objectIDs).toEqual([]);
+      expect(result.offset).toBe(999);
+      expect(result.total).toBe(25);
+      expect(result.truncated).toBe(false);
+    });
+
+    it('ends paging on the last partial page of a result set inside the window', async () => {
+      fetchMock.mockImplementation(searchUpstream(25));
+      const result = await getMetService().search(
+        { q: 'cat', limit: 10, offset: 20 },
+        createMockContext(),
+      );
+
+      expect(result.objectIDs).toEqual([21, 22, 23, 24, 25]);
+      expect(result.remaining).toBe(0);
+      expect(result.truncated).toBe(false);
+      expect(result.nextOffset).toBeNull();
+    });
+
+    it('treats a total of exactly 10,000 as fully reachable', async () => {
+      fetchMock.mockImplementation(searchUpstream(10_000));
+      const result = await getMetService().search(
+        { q: 'cat', limit: 500, offset: 9500 },
+        createMockContext(),
+      );
+
+      expect(result.returned).toBe(500);
+      expect(result.remaining).toBe(0);
+      expect(result.nextOffset).toBeNull();
+    });
+
+    it('normalizes an upstream objectIDs: null with total 0 to an empty page', async () => {
+      fetchMock.mockResolvedValue(jsonResponse({ total: 0, objectIDs: null }));
+      const result = await getMetService().search(
+        { q: 'zzzqqqxyz', limit: 20 },
+        createMockContext(),
+      );
+
+      expect(result.objectIDs).toEqual([]);
+      expect(result.total).toBe(0);
+      expect(result.nextOffset).toBeNull();
+    });
+
+    it('echoes the applied default of 0 when offset is omitted (#17)', async () => {
+      fetchMock.mockImplementation(searchUpstream(5));
+      const result = await getMetService().search({ q: 'rare', limit: 20 }, createMockContext());
+      expect(result.offset).toBe(0);
+    });
+
+    it('walks the whole reachable window by following nextOffset', async () => {
+      fetchMock.mockImplementation(searchUpstream(14_398));
+      const seen = new Set<number>();
+      let offset: number | null = 0;
+      let pages = 0;
+      while (offset !== null) {
+        const page = await getMetService().search(
+          { q: 'horse', limit: 500, offset },
+          createMockContext(),
+        );
+        for (const id of page.objectIDs) seen.add(id);
+        offset = page.nextOffset;
+        pages++;
+      }
+
+      expect(pages).toBe(20);
+      expect(seen.size).toBe(10_000);
+      expect(fetchMock).toHaveBeenCalledTimes(20);
+    });
+  });
+
+  describe('countKeywordMatches — the keyword-only count behind the no_results hint (#25)', () => {
+    it('sends one limit=1 request carrying q alone and returns the upstream total', async () => {
+      fetchMock.mockImplementation(searchUpstream(178));
+      const total = await getMetService().countKeywordMatches('sunflower', createMockContext());
+
+      expect(total).toBe(178);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const url = new URL(String(fetchMock.mock.calls[0]?.[0]));
+      expect(url.pathname).toBe(SEARCH_PATH);
+      expect([...url.searchParams.entries()]).toEqual([
+        ['q', 'sunflower'],
+        ['offset', '0'],
+        ['limit', '1'],
+      ]);
+    });
+
+    it('returns null after one failed attempt instead of throwing or retrying', async () => {
+      fetchMock.mockImplementation(() =>
+        Promise.resolve(new Response('<html>busy</html>', { status: 503 })),
+      );
+      const total = await getMetService().countKeywordMatches('sunflower', createMockContext());
+
+      expect(total).toBeNull();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('rethrows a caller abort as cancellation rather than degrading it to null', async () => {
+      fetchMock.mockImplementation(
+        (_request: unknown, init?: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener('abort', () => reject(init.signal?.reason));
+          }),
+      );
+      const controller = new AbortController();
+      const pending = getMetService().countKeywordMatches(
+        'sunflower',
+        createMockContext({ signal: controller.signal }),
+      );
+      controller.abort();
+
+      await expect(pending).rejects.toMatchObject({ code: JsonRpcErrorCode.RequestCancelled });
     });
   });
 
   /**
-   * The control run is the broadest form of the query and can take far longer than
-   * the filtered one it corrects: `q=the&departmentId=11` answers in 0.44s with 132
-   * IDs, while `q=the` alone needs 12.7s to deliver 2.7 MB — past the default 10s
-   * request timeout. Failing the whole search on that would make a fast, working,
-   * narrow query unusable in order to strip a floor of 2, so a control failure
-   * degrades to the uncorrected behavior and discloses it.
+   * The tool over the real service and a fake upstream, through `runToolContract`
+   * — schema, handler, output parse, `format()`, and the enrichment trailer — so
+   * each case asserts what a client reads on both surfaces.
    */
-  describe('search — a failed control run degrades instead of failing the search (#21)', () => {
-    /** Filtered run succeeds; the unfiltered control run fails with `error`. */
-    function controlFails(error: unknown, filtered: unknown = { total: 3, objectIDs: [1, 2, 3] }) {
-      return (request: unknown) =>
-        isControlRun(request) ? Promise.reject(error) : Promise.resolve(jsonResponse(filtered));
-    }
+  describe('met_search_collections — the reachable window on both surfaces (#27)', () => {
+    type Structured = Record<string, unknown> & { notice?: string };
 
-    it('returns the filtered IDs and the upstream total when the control run times out', async () => {
-      fetchMock.mockImplementation(controlFails(timeout('Upstream request timed out.')));
-      const result = await getMetService().search(
-        { q: 'the', isPublicDomain: true, limit: 20 },
-        createMockContext(),
-      );
+    it('discloses the window when total exceeds 10,000, on a truncated page', async () => {
+      fetchMock.mockImplementation(searchUpstream(14_398));
+      const result = await runToolContract(metSearchCollections, { q: 'horse', limit: 20 });
 
-      // Uncorrected — exactly what this tool returns today, rather than an error.
-      expect(result.objectIDs).toEqual([1, 2, 3]);
-      expect(result.total).toBe(3);
-      expect(result.returned).toBe(3);
-      expect(result.truncated).toBe(false);
+      expect(result.isError).toBeFalsy();
+      const structured = result.structuredContent as Structured;
+      expect(structured.total).toBe(14_398);
+      expect(structured.remaining).toBe(9980);
+      expect(structured.notice).toContain('first 10,000 of 14,398');
+      const text = textOf(result);
+      expect(text).toContain('(truncated)');
+      expect(text).toContain('first 10,000 of 14,398');
     });
 
-    it('does not raise search_timeout when only the control run timed out', async () => {
-      fetchMock.mockImplementation(controlFails(timeout('Upstream request timed out.')));
-      const ctx = createMockContext({ errors: metSearchCollections.errors });
-
-      await expect(
-        getMetService().search({ q: 'the', hasImages: true, limit: 20 }, ctx),
-      ).resolves.toMatchObject({ objectIDs: [1, 2, 3] });
-    });
-
-    it('still raises search_timeout when the filtered run itself times out', async () => {
-      fetchMock.mockImplementation((request: unknown) =>
-        isControlRun(request)
-          ? Promise.resolve(jsonResponse(idsBody([1, 2, 3])))
-          : Promise.reject(timeout('Upstream request timed out.')),
-      );
-      const ctx = createMockContext({ errors: metSearchCollections.errors });
-
-      const err = await getMetService()
-        .search({ q: 'the', hasImages: true, limit: 20 }, ctx)
-        .catch((e) => e);
-
-      expect(err.code).toBe(JsonRpcErrorCode.Timeout);
-      expect(err.data.reason).toBe('search_timeout');
-      expect(err.data.retryable).toBe(false);
-    });
-
-    it('degrades on a non-timeout control failure too', async () => {
-      fetchMock.mockImplementation(controlFails(new Error('socket hang up')));
-      const result = await getMetService().search(
-        { q: 'the', medium: 'Paintings', limit: 20 },
-        createMockContext(),
-      );
-
-      expect(result.objectIDs).toEqual([1, 2, 3]);
-      expect(result.total).toBe(3);
-    });
-
-    it('does not re-run the whole search through withRetry when the control run fails', async () => {
-      fetchMock.mockImplementation(controlFails(new Error('socket hang up')));
-      await getMetService().search({ q: 'the', hasImages: true, limit: 20 }, createMockContext());
-
-      // One filtered call and one control call — a retried search would show more.
-      expect(fetchMock).toHaveBeenCalledTimes(2);
-    });
-
-    it('attaches a notice naming the query, the risk, and the way to get the check to run', async () => {
-      fetchMock.mockImplementation(controlFails(timeout('Upstream request timed out.')));
-      const ctx = createMockContext({ errors: metSearchCollections.errors });
-      await getMetService().search({ q: 'the', isPublicDomain: true, limit: 20 }, ctx);
-
-      const notice = String(getEnrichment(ctx).notice ?? '');
-      expect(notice).toContain('"the"');
-      expect(notice).toContain('unrelated');
-      expect(notice).toContain('narrower keyword');
-      expect(notice).toContain('met_get_object');
-    });
-
-    it('attaches no notice when the control run succeeded', async () => {
-      fetchMock.mockImplementation(routeSearch(idsBody([1, 2, 3]), idsBody([1, 2])));
-      const ctx = createMockContext({ errors: metSearchCollections.errors });
-      const result = await getMetService().search(
-        { q: 'cat', isPublicDomain: true, limit: 20 },
-        ctx,
-      );
-
-      expect(result.objectIDs).toEqual([1, 2]);
-      expect(getEnrichment(ctx).notice).toBeUndefined();
-    });
-
-    it('attaches no notice to an unfiltered search', async () => {
-      fetchMock.mockResolvedValue(jsonResponse({ total: 97, objectIDs: [1, 2, 3] }));
-      const ctx = createMockContext({ errors: metSearchCollections.errors });
-      await getMetService().search({ q: 'sunflower', limit: 20 }, ctx);
-
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-      expect(getEnrichment(ctx).notice).toBeUndefined();
-    });
-
-    it('a control run that legitimately matched nothing still empties the intersection', async () => {
-      // A resolved `objectIDs: null` is the upstream's "zero matches", not a failure
-      // — degrading here would put no_results back out of reach, the whole defect.
-      fetchMock.mockImplementation(
-        routeSearch(
-          { total: 3, objectIDs: [437261, 228990, 436043] },
-          { total: 0, objectIDs: null },
-        ),
-      );
-      const ctx = createMockContext({ errors: metSearchCollections.errors });
-      const result = await getMetService().search(
-        { q: 'zzzqqqxyz', isPublicDomain: true, limit: 5 },
-        ctx,
-      );
-
-      expect(result.total).toBe(0);
-      expect(getEnrichment(ctx).notice).toBeUndefined();
-    });
-
-    it('carries the notice onto structuredContent and content[] through the tool contract', async () => {
-      // runToolContract runs the real pipeline — output parse, format(), enrichment
-      // merge and trailer — so this proves the notice lands where clients read it,
-      // on both surfaces, rather than merely having been requested.
-      fetchMock.mockImplementation(controlFails(timeout('Upstream request timed out.')));
-
+    it('marks the page that stops at the window short of total as (window end)', async () => {
+      fetchMock.mockImplementation(searchUpstream(14_398));
       const result = await runToolContract(metSearchCollections, {
-        q: 'the',
-        isPublicDomain: true,
+        q: 'horse',
+        offset: 9900,
+        limit: 500,
+      });
+
+      const structured = result.structuredContent as Structured;
+      expect(structured.returned).toBe(100);
+      expect(structured.remaining).toBe(0);
+      expect(structured.nextOffset).toBeNull();
+      expect(structured.notice).toContain('10,000');
+      const text = textOf(result);
+      expect(text).toContain('**Returned IDs:** 100 (window end)');
+      expect(text).not.toContain('(complete)');
+    });
+
+    it('marks an offset of exactly 10,000 as beyond the result set, not an error', async () => {
+      fetchMock.mockImplementation(searchUpstream(14_398));
+      const result = await runToolContract(metSearchCollections, { q: 'horse', offset: 10_000 });
+
+      expect(result.isError).toBeFalsy();
+      const structured = result.structuredContent as Structured;
+      expect(structured.objectIDs).toEqual([]);
+      expect(structured.offset).toBe(10_000);
+      expect(textOf(result)).toContain('**Returned IDs:** 0 (offset beyond result set)');
+    });
+
+    it('marks an offset of exactly total as beyond the result set, with no window notice', async () => {
+      fetchMock.mockImplementation(searchUpstream(178));
+      const result = await runToolContract(metSearchCollections, { q: 'sunflower', offset: 178 });
+
+      expect(result.isError).toBeFalsy();
+      const structured = result.structuredContent as Structured;
+      expect(structured.total).toBe(178);
+      expect(structured.notice).toBeUndefined();
+      const text = textOf(result);
+      expect(text).toContain('(offset beyond result set)');
+      expect(text).not.toContain('10,000');
+    });
+
+    it('renders the last page of a result set inside the window as (complete), with no notice', async () => {
+      fetchMock.mockImplementation(searchUpstream(178));
+      const result = await runToolContract(metSearchCollections, {
+        q: 'sunflower',
+        offset: 170,
         limit: 20,
       });
 
-      expect(result.isError).toBeFalsy();
-      const structured = result.structuredContent as Record<string, unknown>;
-      expect(structured.total).toBe(3);
-      expect(structured.objectIDs).toEqual([1, 2, 3]);
-      expect(String(structured.notice)).toContain('unrelated');
+      const structured = result.structuredContent as Structured;
+      expect(structured.returned).toBe(8);
+      expect(structured.notice).toBeUndefined();
+      expect(textOf(result)).toContain('**Returned IDs:** 8 (complete)');
+    });
 
-      const text = (result.content ?? [])
-        .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
-        .map((block) => block.text)
-        .join('\n');
-      expect(text).toContain('**Total matches:** 3');
-      expect(text).toContain('unrelated');
-      expect(text).toContain('narrower keyword');
+    it('renders a total of exactly 10,000 as (complete) on its last page, with no notice', async () => {
+      fetchMock.mockImplementation(searchUpstream(10_000));
+      const result = await runToolContract(metSearchCollections, {
+        q: 'cat',
+        offset: 9500,
+        limit: 500,
+      });
+
+      const structured = result.structuredContent as Structured;
+      expect(structured.notice).toBeUndefined();
+      expect(textOf(result)).toContain('**Returned IDs:** 500 (complete)');
+    });
+
+    /**
+     * The window matrix: every boundary cell, asserted on both surfaces. `notice`
+     * is whether the window disclosure appears — on `structuredContent` and in the
+     * `content[]` trailer alike.
+     */
+    it.each([
+      // total, offset, limit → returned, remaining, nextOffset, marker, notice
+      [5, 0, 20, 5, 0, null, '(complete)', false],
+      [20, 0, 20, 20, 0, null, '(complete)', false],
+      [10_000, 9500, 500, 500, 0, null, '(complete)', false],
+      [10_001, 9500, 500, 500, 0, null, '(window end)', true],
+      [10_001, 9000, 500, 500, 500, 9500, '(truncated)', true],
+      [14_398, 9800, 500, 200, 0, null, '(window end)', true],
+      [178, 500, 20, 0, 0, null, '(offset beyond result set)', false],
+      [14_398, 12_000, 20, 0, 0, null, '(offset beyond result set)', true],
+    ] as const)(
+      'total %i, offset %i, limit %i → %i IDs, remaining %i, nextOffset %s, %s',
+      async (total, offset, limit, returned, remaining, nextOffset, marker, notice) => {
+        fetchMock.mockImplementation(searchUpstream(total));
+        const result = await runToolContract(metSearchCollections, { q: 'horse', offset, limit });
+
+        expect(result.isError).toBeFalsy();
+        const structured = result.structuredContent as Structured;
+        expect(structured).toMatchObject({ total, offset, returned, remaining, nextOffset });
+        expect(structured.truncated).toBe(nextOffset !== null);
+        const text = textOf(result);
+        expect(text).toContain(`**Returned IDs:** ${returned} ${marker}`);
+        if (notice) {
+          expect(structured.notice).toContain('first 10,000 of');
+          expect(text).toContain('first 10,000 of');
+        } else {
+          expect(structured.notice).toBeUndefined();
+          expect(text).not.toContain('reachable by paging');
+        }
+      },
+    );
+
+    it('continues from the delivered count when a mid-window page comes back short', async () => {
+      // A page shorter than requested inside the window: continuation keys on what
+      // was delivered, so following nextOffset can re-read a position but never skip one.
+      fetchMock.mockImplementation(
+        routes({
+          [SEARCH_PATH]: (url) =>
+            jsonResponse({
+              total: 14_398,
+              objectIDs: Array.from(
+                { length: 499 },
+                (_, i) => Number(url.searchParams.get('offset')) + i + 1,
+              ),
+            }),
+        }),
+      );
+      const result = await runToolContract(metSearchCollections, {
+        q: 'horse',
+        offset: 5000,
+        limit: 500,
+      });
+
+      expect(result.structuredContent).toMatchObject({
+        returned: 499,
+        remaining: 4501,
+        truncated: true,
+        nextOffset: 5499,
+      });
+      expect(textOf(result)).toContain('**Returned IDs:** 499 (truncated)');
+    });
+
+    it('rejects isPublicDomain at the schema, naming the key, before any request', async () => {
+      // An undeclared key by construction, so the typed argument cannot express it.
+      const result = await runToolContract(metSearchCollections, {
+        q: 'sunflower',
+        isPublicDomain: true,
+      } as unknown as z.input<typeof metSearchCollections.input>);
+
+      expect(result.isError).toBe(true);
+      const error = (result.structuredContent as { error: { code: number } }).error;
+      expect(error.code).toBe(JsonRpcErrorCode.InvalidParams);
+      expect(textOf(result)).toContain('isPublicDomain');
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it('rejects a two-element geoLocation at the schema and accepts one location', async () => {
+      const rejected = await runToolContract(metSearchCollections, {
+        q: 'sunflower',
+        geoLocation: ['France', 'Japan'],
+      });
+      expect(rejected.isError).toBe(true);
+      expect((rejected.structuredContent as { error: { code: number } }).error.code).toBe(
+        JsonRpcErrorCode.InvalidParams,
+      );
+      expect(textOf(rejected)).toContain('geoLocation takes one location');
+      expect(fetchMock).not.toHaveBeenCalled();
+
+      fetchMock.mockImplementation(searchUpstream(35));
+      const accepted = await runToolContract(metSearchCollections, {
+        q: 'sunflower',
+        geoLocation: ['France'],
+      });
+      expect(accepted.isError).toBeFalsy();
+      expect(searchRequests(fetchMock)[0]?.searchParams.getAll('geoLocation')).toEqual(['France']);
+    });
+  });
+
+  /**
+   * The `no_results` recovery is composed from the levers the call used. Whether
+   * the keyword matches on its own separates "bad keyword" from "filters removed
+   * every match", and it costs one extra `limit=1` request, only when a filtered
+   * search comes back empty.
+   */
+  describe('met_search_collections — no_results names the levers that zeroed the query (#25)', () => {
+    /**
+     * `/v1.1/search` whose filtered requests match `filteredTotal` and whose
+     * keyword-only requests match `keywordTotal` — or answer 503 on `'fail'`.
+     */
+    function searchByShape(filteredTotal: number, keywordTotal: number | 'fail') {
+      return (url: URL) => {
+        const filtered = [...url.searchParams.keys()].some((key) => !PAGING_PARAMS.has(key));
+        if (filtered) return searchPage(url, filteredTotal);
+        return keywordTotal === 'fail'
+          ? new Response('<html>busy</html>', { status: 503 })
+          : searchPage(url, keywordTotal);
+      };
+    }
+
+    const departmentsRoute = () =>
+      jsonResponse({ departments: [{ departmentId: 11, displayName: 'European Paintings' }] });
+
+    type NoResults = {
+      code: number;
+      data: { reason: string; recovery: { hint: string } };
+    };
+    const errorOf = (result: { structuredContent?: unknown }) =>
+      (result.structuredContent as { error: NoResults }).error;
+
+    const OTHER_FILTERS = ['hasImages', 'isHighlight', 'isOnView', 'geoLocation', 'dateBegin'];
+
+    it('an unfiltered miss gets the keyword hint and issues no extra request', async () => {
+      fetchMock.mockImplementation(routes({ [SEARCH_PATH]: searchByShape(0, 0) }));
+      const result = await runToolContract(metSearchCollections, { q: 'zzzqqqxyz' });
+
+      const error = errorOf(result);
+      expect(error.code).toBe(JsonRpcErrorCode.NotFound);
+      expect(error.data.reason).toBe('no_results');
+      expect(error.data.recovery.hint).toContain('"zzzqqqxyz" matches no object');
+      expect(error.data.recovery.hint).not.toContain('departmentId');
+      expect(error.data.recovery.hint).not.toContain('met_list_departments');
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      // The text surface carries the same hint and the reason a caller branches on.
+      const text = textOf(result);
+      expect(text).toContain('Recovery: The keyword "zzzqqqxyz" matches no object');
+      expect(text).toContain('no_results');
+    });
+
+    it('a keyword that matches nothing even unfiltered names no filter', async () => {
+      fetchMock.mockImplementation(routes({ [SEARCH_PATH]: searchByShape(0, 0) }));
+      const result = await runToolContract(metSearchCollections, {
+        q: 'zzzqqqxyz',
+        medium: 'Paintings',
+      });
+
+      const { hint } = errorOf(result).data.recovery;
+      expect(errorOf(result).data.reason).toBe('no_results');
+      expect(hint).toContain('even with no filter applied');
+      expect(hint).not.toContain('medium');
+      expect(hint).not.toContain('classification');
+
+      // Exactly one extra request: q alone, limit 1.
+      const requests = searchRequests(fetchMock);
+      expect(requests).toHaveLength(2);
+      expect([...(requests[1]?.searchParams.entries() ?? [])]).toEqual([
+        ['q', 'zzzqqqxyz'],
+        ['offset', '0'],
+        ['limit', '1'],
+      ]);
+    });
+
+    it('a medium that zeroed a matching keyword is named with its correction, alone', async () => {
+      fetchMock.mockImplementation(routes({ [SEARCH_PATH]: searchByShape(0, 178) }));
+      const result = await runToolContract(metSearchCollections, {
+        q: 'sunflower',
+        medium: 'Painting',
+      });
+
+      const { hint } = errorOf(result).data.recovery;
+      expect(errorOf(result).data.reason).toBe('no_results');
+      expect(hint).toContain('matches 178 objects on its own');
+      expect(hint).toContain('so the filter removed every match: medium. Correct or drop it,');
+      expect(hint).toContain('case-sensitive');
+      expect(hint).toContain('classification');
+      expect(hint).toContain('not a material');
+      for (const other of [...OTHER_FILTERS, 'departmentId']) expect(hint).not.toContain(other);
+      expect(searchRequests(fetchMock)).toHaveLength(2);
+      const text = textOf(result);
+      expect(text).toContain('No objects matched the query "sunflower" with the filter medium.');
+      expect(text).toContain('removed every match: medium.');
+    });
+
+    it('names every filter the call set in one hint', async () => {
+      fetchMock.mockImplementation(
+        routes({ [SEARCH_PATH]: searchByShape(0, 178), [DEPARTMENTS_PATH]: departmentsRoute }),
+      );
+      const result = await runToolContract(metSearchCollections, {
+        q: 'sunflower',
+        medium: 'Painting',
+        departmentId: 11,
+      });
+
+      const { hint } = errorOf(result).data.recovery;
+      expect(errorOf(result).data.reason).toBe('no_results');
+      expect(hint).toContain(
+        'the filters removed every match: medium, departmentId. Correct or drop them,',
+      );
+      expect(hint).toContain('case-sensitive');
+      for (const other of OTHER_FILTERS) expect(hint).not.toContain(other);
+      expect(textOf(result)).toContain('with the filters medium, departmentId.');
+    });
+
+    it('names the filters used when the keyword-only request fails, and still returns no_results', async () => {
+      fetchMock.mockImplementation(routes({ [SEARCH_PATH]: searchByShape(0, 'fail') }));
+      const result = await runToolContract(metSearchCollections, {
+        q: 'sunflower',
+        medium: 'Painting',
+        isOnView: true,
+      });
+
+      const error = errorOf(result);
+      expect(error.code).toBe(JsonRpcErrorCode.NotFound);
+      expect(error.data.reason).toBe('no_results');
+      expect(error.data.recovery.hint).toContain('may have removed every match: isOnView, medium');
+      expect(error.data.recovery.hint).toContain('could not be checked');
+      // One filtered request, one keyword-only attempt — no retry ladder on the hint.
+      expect(searchRequests(fetchMock)).toHaveLength(2);
+    });
+
+    it('a caller abort during the keyword-only request surfaces as cancellation, not no_results', async () => {
+      const controller = new AbortController();
+      fetchMock.mockImplementation((request: unknown, init?: RequestInit) => {
+        const url = new URL(String(request));
+        if ([...url.searchParams.keys()].some((key) => !PAGING_PARAMS.has(key))) {
+          return Promise.resolve(searchPage(url, 0));
+        }
+        // The keyword-only request is in flight when the caller goes away.
+        queueMicrotask(() => controller.abort());
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(init.signal?.reason));
+        });
+      });
+      const ctx = createMockContext({
+        errors: metSearchCollections.errors,
+        signal: controller.signal,
+      });
+      const input = metSearchCollections.input.parse({ q: 'sunflower', medium: 'Painting' });
+
+      const err = await Promise.resolve(metSearchCollections.handler(input, ctx)).catch((e) => e);
+      expect(err).toMatchObject({ code: JsonRpcErrorCode.RequestCancelled });
+      expect(err.data?.reason).toBeUndefined();
+      expect(searchRequests(fetchMock)).toHaveLength(2);
+    });
+
+    it('a filtered search with results issues no extra request', async () => {
+      fetchMock.mockImplementation(routes({ [SEARCH_PATH]: searchByShape(11, 178) }));
+      const result = await runToolContract(metSearchCollections, {
+        q: 'sunflower',
+        medium: 'Paintings',
+      });
+
+      expect(result.isError).toBeFalsy();
+      expect((result.structuredContent as { total: number }).total).toBe(11);
+      expect(searchRequests(fetchMock)).toHaveLength(1);
     });
   });
 
@@ -1052,7 +1206,7 @@ describe('MetService', () => {
       expect([...second].sort((a, b) => a - b)).toEqual([1, 11, 21]);
       // Memoized: the second lookup reads the cache instead of re-fetching /departments.
       expect(fetchMock).toHaveBeenCalledTimes(1);
-      expect(String(fetchMock.mock.calls[0]?.[0])).toContain('/departments');
+      expect(new URL(String(fetchMock.mock.calls[0]?.[0])).pathname).toBe(DEPARTMENTS_PATH);
     });
   });
 

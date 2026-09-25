@@ -11,11 +11,19 @@ import { metSearchCollections } from '@/mcp-server/tools/definitions/met-search-
 
 const mockSearch = vi.fn();
 const mockGetValidDepartmentIds = vi.fn();
+const mockCountKeywordMatches = vi.fn();
 
-vi.mock('@/services/met/met-service.js', () => ({
+/**
+ * The service is stubbed at its accessor; the module's constants (the search
+ * window `format()` reads) stay real. The URL building, window arithmetic, and
+ * no_results hint over a real service are covered in the service suite.
+ */
+vi.mock('@/services/met/met-service.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/services/met/met-service.js')>()),
   getMetService: () => ({
     search: mockSearch,
     getValidDepartmentIds: mockGetValidDepartmentIds,
+    countKeywordMatches: mockCountKeywordMatches,
   }),
 }));
 
@@ -169,6 +177,7 @@ describe('metSearchCollections', () => {
       nextOffset: null,
       offset: 0,
     });
+    mockCountKeywordMatches.mockResolvedValue(0);
     const ctx = createMockContext({ errors: metSearchCollections.errors });
     const input = metSearchCollections.input.parse({
       q: 'zzznomatch',
@@ -216,7 +225,7 @@ describe('metSearchCollections', () => {
     expect(mockSearch).toHaveBeenCalledWith(expect.objectContaining({ offset: 0 }), ctx);
   });
 
-  it('passes geoLocation array to service (AND-combined by API)', async () => {
+  it('passes a one-location geoLocation array to the service', async () => {
     mockSearch.mockResolvedValue({
       total: 12,
       objectIDs: [1, 2, 3],
@@ -230,16 +239,23 @@ describe('metSearchCollections', () => {
     const ctx = createMockContext({ errors: metSearchCollections.errors });
     const input = metSearchCollections.input.parse({
       q: 'painting',
-      geoLocation: ['France', 'Spain'],
+      geoLocation: ['France'],
       limit: 5,
     });
-    // Multiple geoLocation values are AND-combined by the Met API (not OR) — passing two narrows results
     const result = await metSearchCollections.handler(input, ctx);
     expect(mockSearch).toHaveBeenCalledWith(
-      expect.objectContaining({ geoLocation: ['France', 'Spain'] }),
+      expect.objectContaining({ geoLocation: ['France'] }),
       ctx,
     );
     expect(result.total).toBe(12);
+  });
+
+  it('rejects a second geoLocation value at the input schema, naming the remedy', () => {
+    // The Met search applies only the first repeated value, so a second one would
+    // be silently ignored — the schema refuses it instead.
+    expect(() =>
+      metSearchCollections.input.parse({ q: 'painting', geoLocation: ['France', 'Spain'] }),
+    ).toThrow(/geoLocation takes one location/);
   });
 
   it('passes isOnView to service', async () => {
@@ -296,45 +312,16 @@ describe('metSearchCollections', () => {
     expect(text).toContain('Remaining:** 0');
   });
 
-  // --- #12: isPublicDomain and isHighlight are true-only opt-ins ---
-  // The Met search index is only sound on the `true` arm of each; the `false` arm
-  // returns objects whose own record contradicts the filter. Narrowing at the
-  // schema is what puts the constraint in `tools/list`, so a model never builds
-  // the bad call in the first place.
-
-  it('rejects isPublicDomain: false at the input schema, naming the remedy', () => {
-    // The schema rejection surfaces as a bare -32602 with no recovery hint, so the
-    // Zod message is the only guidance the caller gets — it has to say what to do.
-    expect(() =>
-      metSearchCollections.input.parse({ q: 'sunflower', isPublicDomain: false }),
-    ).toThrow(/isPublicDomain accepts true only — omit the filter/);
-  });
+  // --- #12: isHighlight is a true-only opt-in ---
+  // The search ignores `isHighlight=false`. Narrowing at the schema is what puts
+  // the constraint in `tools/list`, so a model never builds the dead call.
 
   it('rejects isHighlight: false at the input schema, naming the remedy', () => {
+    // The schema rejection surfaces as a bare -32602 with no recovery hint, so the
+    // Zod message is the only guidance the caller gets — it has to say what to do.
     expect(() => metSearchCollections.input.parse({ q: 'sunflower', isHighlight: false })).toThrow(
       /isHighlight accepts true only — omit the filter/,
     );
-  });
-
-  it('still accepts isPublicDomain: true and forwards it to the service', async () => {
-    mockSearch.mockResolvedValue({
-      total: 4,
-      objectIDs: [437261, 436529],
-      returned: 2,
-      truncated: true,
-      remaining: 2,
-      nextOffset: 2,
-      offset: 0,
-    });
-    const ctx = createMockContext({ errors: metSearchCollections.errors });
-    const input = metSearchCollections.input.parse({
-      q: 'sunflower',
-      isPublicDomain: true,
-      limit: 2,
-    });
-    const result = await metSearchCollections.handler(input, ctx);
-    expect(mockSearch).toHaveBeenCalledWith(expect.objectContaining({ isPublicDomain: true }), ctx);
-    expect(result.total).toBe(4);
   });
 
   it('still accepts isHighlight: true and forwards it to the service', async () => {
@@ -354,15 +341,15 @@ describe('metSearchCollections', () => {
   });
 
   it('leaves hasImages and isOnView as plain two-valued booleans', () => {
-    // #12 narrows only the two filters with a reproduced false-arm defect.
+    // The search honors both arms of each.
     expect(() =>
       metSearchCollections.input.parse({ q: 'vase', hasImages: false, isOnView: false }),
     ).not.toThrow();
   });
 
   // --- #13: blank filter values are rejected in the handler ---
-  // A blank value is not an absent one upstream: the Met index answers a blank
-  // parameter with a different result set, so there is no safe value to forward.
+  // The Met search ignores a blank parameter, silently widening the search, so
+  // there is no safe blank to forward.
 
   const expectInvalidFilter = async (raw: Record<string, unknown>, field: string) => {
     const ctx = createMockContext({ errors: metSearchCollections.errors });
@@ -401,12 +388,12 @@ describe('metSearchCollections', () => {
     await expectInvalidFilter({ q: 'sunflower', geoLocation: [''], limit: 3 }, 'geoLocation');
   });
 
-  it('rejects a geoLocation array mixing a valid element with a blank one', async () => {
-    // Depth case: the blank hides behind a valid sibling, so an all-blank check misses it.
-    await expectInvalidFilter(
-      { q: 'sunflower', geoLocation: ['France', ''], limit: 3 },
-      'geoLocation',
-    );
+  it('rejects a geoLocation array mixing a valid element with a blank one at the schema', () => {
+    // geoLocation takes one element, so a blank hiding behind a valid sibling never
+    // reaches the handler's blank check — the one-element cap refuses it first.
+    expect(() =>
+      metSearchCollections.input.parse({ q: 'sunflower', geoLocation: ['France', ''], limit: 3 }),
+    ).toThrow(/geoLocation takes one location/);
   });
 
   it('accepts a q with meaningful content and incidental surrounding whitespace', async () => {
@@ -521,48 +508,96 @@ describe('metSearchCollections', () => {
     expect(text).toContain('Offset:** 50');
   });
 
-  // --- #20: no_results names isPublicDomain when it zeroed the query ---
+  // --- #27: the 10,000 window adds a fourth format state ---
 
-  it('no_results with isPublicDomain: true names the filter in the recovery hint', async () => {
-    mockSearch.mockResolvedValue({
-      total: 0,
-      objectIDs: [],
-      returned: 0,
+  it('format marks a last page that stops at the window short of total as (window end)', () => {
+    const blocks = metSearchCollections.format!({
+      total: 14_398,
+      objectIDs: [9999, 10_000],
+      returned: 2,
       truncated: false,
       remaining: 0,
       nextOffset: null,
-      offset: 0,
+      offset: 9998,
     });
-    const ctx = createMockContext({ errors: metSearchCollections.errors });
-    const input = metSearchCollections.input.parse({
-      q: 'vase',
-      departmentId: 13,
-      isPublicDomain: true,
-      limit: 20,
-    });
-    const err = await Promise.resolve(metSearchCollections.handler(input, ctx)).catch((e) => e);
-    expect(err.data.reason).toBe('no_results');
-    expect(err.data.recovery.hint).toContain('isPublicDomain');
-    expect(err.data.recovery.hint).toContain('met_get_object');
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).toContain('(window end)');
+    expect(text).not.toContain('(complete)');
+    expect(text).not.toContain('offset beyond result set');
   });
 
-  it('no_results without isPublicDomain keeps the generic recovery hint', async () => {
-    mockSearch.mockResolvedValue({
-      total: 0,
+  it('format marks an offset at the window, short of total, as past the end', () => {
+    const blocks = metSearchCollections.format!({
+      total: 14_398,
       objectIDs: [],
       returned: 0,
       truncated: false,
       remaining: 0,
       nextOffset: null,
-      offset: 0,
+      offset: 10_000,
     });
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).toContain('offset beyond result set');
+    expect(text).not.toContain('(window end)');
+  });
+
+  it('format marks the final page of a total of exactly 10,000 as (complete)', () => {
+    const blocks = metSearchCollections.format!({
+      total: 10_000,
+      objectIDs: [10_000],
+      returned: 1,
+      truncated: false,
+      remaining: 0,
+      nextOffset: null,
+      offset: 9999,
+    });
+    expect((blocks[0] as { text: string }).text).toContain('(complete)');
+  });
+
+  // --- #25: the keyword-only count is issued only for a filtered miss ---
+
+  const emptyPage = {
+    total: 0,
+    objectIDs: [],
+    returned: 0,
+    truncated: false,
+    remaining: 0,
+    nextOffset: null,
+    offset: 0,
+  };
+
+  it('an unfiltered miss does not ask for the keyword-only count', async () => {
+    mockSearch.mockResolvedValue(emptyPage);
     const ctx = createMockContext({ errors: metSearchCollections.errors });
     const input = metSearchCollections.input.parse({ q: 'zzznomatch', limit: 20 });
     const err = await Promise.resolve(metSearchCollections.handler(input, ctx)).catch((e) => e);
+
     expect(err.data.reason).toBe('no_results');
-    expect(err.data.recovery.hint).toBe(
-      'Broaden the query, remove filters, or call met_list_departments and set a valid departmentId.',
-    );
+    expect(err.data.recovery.hint).toContain('"zzznomatch" matches no object');
+    expect(mockCountKeywordMatches).not.toHaveBeenCalled();
+  });
+
+  it('a filtered miss asks for the keyword-only count once, with the keyword', async () => {
+    mockSearch.mockResolvedValue(emptyPage);
+    mockCountKeywordMatches.mockResolvedValue(1);
+    const ctx = createMockContext({ errors: metSearchCollections.errors });
+    const input = metSearchCollections.input.parse({ q: 'sunflower', hasImages: false });
+    const err = await Promise.resolve(metSearchCollections.handler(input, ctx)).catch((e) => e);
+
+    expect(mockCountKeywordMatches).toHaveBeenCalledExactlyOnceWith('sunflower', ctx);
+    expect(err.data.recovery.hint).toContain('matches 1 object on its own');
+    expect(err.data.recovery.hint).toContain('removed every match: hasImages.');
+    // No medium correction when medium was not set.
+    expect(err.data.recovery.hint).not.toContain('classification');
+  });
+
+  it('a non-empty filtered page never asks for the keyword-only count', async () => {
+    mockSearch.mockResolvedValue({ ...emptyPage, total: 3, objectIDs: [1, 2, 3], returned: 3 });
+    const ctx = createMockContext({ errors: metSearchCollections.errors });
+    const input = metSearchCollections.input.parse({ q: 'vase', medium: 'Ceramics' });
+    await metSearchCollections.handler(input, ctx);
+
+    expect(mockCountKeywordMatches).not.toHaveBeenCalled();
   });
 
   // --- inputAliases: `query` and `keyword` reach the declared `q` ---
@@ -660,8 +695,8 @@ describe('metSearchCollections', () => {
       ).error;
       expect(error.code).toBe(JsonRpcErrorCode.NotFound);
       expect(error.data.reason).toBe('no_results');
-      expect(error.data.recovery.hint).toContain('met_list_departments');
-      expect(textOf(result)).toContain('Recovery: Broaden the query');
+      expect(error.data.recovery.hint).not.toContain('met_list_departments');
+      expect(textOf(result)).toContain('Recovery: The keyword "zzznomatch" matches no object');
       expect(textOf(result)).toContain('no_results');
     });
   });

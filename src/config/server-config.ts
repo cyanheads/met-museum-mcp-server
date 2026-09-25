@@ -10,8 +10,10 @@ const ServerConfigSchema = z.object({
   baseUrl: z
     .string()
     .url()
-    .default('https://collectionapi.metmuseum.org/public/collection/v1')
-    .describe('Met Collection API base URL. Override for local stubs in tests.'),
+    .default('https://collectionapi.metmuseum.org/public/collection')
+    .describe(
+      'Met Collection API root; each endpoint appends its own version (/v1.1/search, /v1/objects, /v1/departments). A value ending in /v1 or /v1.1 is read as its root. Override for local stubs in tests.',
+    ),
   requestTimeoutMs: z.coerce
     .number()
     .int()

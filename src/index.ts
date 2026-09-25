@@ -18,11 +18,10 @@ await createApp({
   prompts: [],
   sessionMode: 'stateless',
   instructions: [
-    'The Metropolitan Museum of Art Collection API — 501,731 artworks spanning 5,000 years.',
+    'The Metropolitan Museum of Art Collection API — over 500,000 artworks spanning 5,000 years.',
     'Typical workflow: met_list_departments → met_search_collections (returns IDs) → met_get_object (full records, up to 20 per call).',
-    'Every met_search_collections filter draws on a partial index: a filtered search omits some objects whose own record satisfies the filter, so absence from the results proves nothing — drop the filter to widen, and confirm the attribute per object with met_get_object. A filtered search is also checked against the same query run unfiltered, so its results match the keyword; that check is best-effort, and a response whose check could not complete says so in its notice.',
-    'isPublicDomain and isHighlight accept true only. hasImages=true includes copyrighted works without usable image URLs.',
-    'The medium filter maps to classification categories ("Paintings", "Sculptures") — not material descriptions.',
+    'met_search_collections pages through at most the first 10,000 matches of a search; narrow a larger one with filters. CC0 status is per object, from the isPublicDomain field on met_get_object — hasImages=true includes copyrighted works without usable image URLs. isHighlight accepts true only.',
+    'The medium filter takes a case-sensitive classification as the Met spells it ("Paintings", "Sculpture") — not a material description.',
   ].join('\n'),
   setup(core) {
     initMetService(core.config, core.storage);
