@@ -36,7 +36,7 @@ The Metropolitan Museum of Art's public Collection API. Search the collection by
 | Tool | Description |
 |:---|:---|
 | `met_list_departments` | Return all 19 curatorial departments with their numeric IDs and display names |
-| `met_search_collections` | Search the collection by keyword with filters for department, date range, medium, geography, on-view status, public-domain status, and highlight designation |
+| `met_search_collections` | Search the collection by keyword with filters for department, date range, medium, geography, image availability, on-view status, and highlight designation |
 | `met_get_object` | Fetch full records for one or more object IDs — metadata, provenance, artist info, CC0 image URLs, tags, and Wikidata links |
 
 ## Capability reference
@@ -52,13 +52,11 @@ The Metropolitan Museum of Art's public Collection API. Search the collection by
 ### `met_search_collections` <sub>tool</sub>
 
 - Keyword `q` (required) matches title, artist name, culture, medium, tags, and other text fields; broad terms return large ID sets
-- Filters: `departmentId` (validated against `met_list_departments`; an unrecognized ID is rejected), `medium` (maps to classification, not material — e.g. `"Paintings"`, not `"Oil on canvas"`), `dateBegin`/`dateEnd` (integer years, negative = BCE, both required together), `geoLocation` (country/region/city, multiple values AND-combined), `hasImages`, `isOnView`
-- `isPublicDomain` and `isHighlight` accept `true` only — the upstream index is unsound on the `false` arm, so omit the filter instead of passing `false`
-- Every filter draws on a partial upstream index: a filtered search can omit objects whose own record satisfies the filter, so absence from the results is not evidence about an object — drop the filter to widen, and confirm per-object status with `met_get_object`
-- A filtered search is cross-checked against the same query run unfiltered so results match the keyword; when that check can't complete in time (a keyword broad enough to time out on its own), the page returns unverified with a `notice`
-- Paginate with `limit` (default 20, max 500) and `offset` (default 0); `nextOffset` continues where a page left off (`null` once exhausted), and `offset >= total` marks a page past the end of the result set rather than an exhausted query
+- Filters: `departmentId` (validated against `met_list_departments`; an unrecognized ID is rejected), `medium` (a case-sensitive classification as the Met spells it — `"Paintings"`, `"Sculpture"` — not a material like `"Oil on canvas"`), `dateBegin`/`dateEnd` (integer years, negative = BCE, both required together), `geoLocation` (one country/region/city), `hasImages`, `isOnView`
+- `isHighlight` accepts `true` only — the search ignores `false`, so omit the filter instead of passing it. Public-domain (CC0) status is read per object from `met_get_object`, not filtered at search
+- Paginate with `limit` (default 20, max 500) and `offset` (default 0); `nextOffset` continues where a page left off (`null` once no further page is reachable). Paging reaches only the first 10,000 matches of a search — `total` still reports the full count, and a response whose `total` exceeds 10,000 says so in a `notice`
 - Returns `total`, `returned`, `truncated`, `remaining`, `nextOffset`, and the resolved `offset`; object IDs resolve to full records via `met_get_object` (up to 20 per call)
-- Typed errors: `no_results`, `invalid_date_range`, `invalid_filter` (blank `q`, `medium`, or `geoLocation`), `invalid_department`, `search_timeout` — each carries a recovery hint
+- Typed errors: `no_results` (its recovery names the filters that removed every match, or points at the keyword when it matches nothing on its own), `invalid_date_range`, `invalid_filter` (blank `q`, `medium`, or `geoLocation`), `invalid_department` — each carries a recovery hint
 
 ---
 
@@ -86,7 +84,7 @@ Agent-friendly output:
 
 - Provenance on every record — `isPublicDomain` and `hasCC0Image` flags distinguish CC0 objects from works with inaccessible images, so agents can reason about what they can actually display
 - Partial failure reporting — `met_get_object` returns `objects` and `failed` arrays so callers receive successful records alongside structured per-ID error context
-- Truncation signaling — `met_search_collections` returns `total`, `returned`, `truncated`, `remaining`, `nextOffset`, and the resolved `offset` fields so agents know when to refine filters, increase `limit`, or page further with `offset`; `offset >= total` marks a page that is empty because the offset ran past the end rather than because the query is exhausted
+- Truncation signaling — `met_search_collections` returns `total`, `returned`, `truncated`, `remaining`, `nextOffset`, and the resolved `offset` fields so agents know when to refine filters, increase `limit`, or page further with `offset`; the text rendering marks each page `(truncated)`, `(complete)`, `(window end)` when paging stops at the 10,000-match window short of `total`, or `(offset beyond result set)` when the offset ran past what paging reaches
 - Byte-budget disclosure — `met_get_object` reports `deferred[]` records with their sizes when a batch exceeds its serialized-response budget, so callers can size a follow-up call precisely
 
 ## Getting started
@@ -214,7 +212,7 @@ All configuration is validated at startup via Zod schemas in `src/config/server-
 | `MCP_LOG_LEVEL` | Log level (`debug`, `info`, `warning`, `error`) | `info` |
 | `LOGS_DIR` | Directory for log files (Node.js only) | `<project-root>/logs` |
 | `OTEL_ENABLED` | Enable OpenTelemetry instrumentation | `false` |
-| `MET_BASE_URL` | Met Collection API base URL (override for local stubs) | `https://collectionapi.metmuseum.org/public/collection/v1` |
+| `MET_BASE_URL` | Met Collection API root; each endpoint appends its own version (`/v1.1/search`, `/v1/objects/{id}`, `/v1/departments`). A value ending in `/v1` or `/v1.1` is read as its root. Override for local stubs. | `https://collectionapi.metmuseum.org/public/collection` |
 | `MET_REQUEST_TIMEOUT_MS` | Per-request HTTP timeout in milliseconds | `10000` |
 | `MET_BATCH_CONCURRENCY` | Max parallel fetches in `met_get_object` | `5` |
 
