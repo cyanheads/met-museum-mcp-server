@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.6.0](changelog/0.6.x/0.6.0.md) — 2026-09-24 · ⚠️ Breaking
+
+met_search_collections moves to the Met's /v1.1/search before /v1 retires on 2026-10-01: upstream paging within a 10,000-match window, isPublicDomain and the search_timeout reason removed, and a no_results hint that names the filters that zeroed the query.
+
 ## [0.5.3](changelog/0.5.x/0.5.3.md) — 2026-09-19
 
 mcp-ts-core bumps to ^0.13.6: met_search_collections and met_get_object accept parameter aliases, an out-of-schema argument returns InvalidParams, tool error text closes with the failure reason, and modeled outcomes like a zero-match search log below error.
