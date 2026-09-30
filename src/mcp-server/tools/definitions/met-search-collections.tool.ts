@@ -9,6 +9,7 @@ import {
   getMetService,
   SEARCH_RESULT_WINDOW,
   type SearchInput,
+  startCallDeadline,
 } from '@/services/met/met-service.js';
 
 /** Thousands-separated, so the window and a large total read alike in prose. */
@@ -236,6 +237,22 @@ export const metSearchCollections = tool('met_search_collections', {
         'Call met_list_departments to get valid department IDs, then retry with one of the returned IDs.',
       severity: 'warning',
     },
+    {
+      reason: 'upstream_blocked',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      retryable: false,
+      thrownBy: 'service',
+      when: "The Met API's firewall refused the request with HTTP 403 — it blocks this server's address, not one endpoint.",
+      recovery: 'Wait several minutes before retrying, and send fewer requests.',
+    },
+    {
+      reason: 'retry_deadline_exceeded',
+      code: JsonRpcErrorCode.Timeout,
+      thrownBy: 'service',
+      when: "The call's time budget ran out, retries and backoff included, before the Met API returned a successful response to the department lookup or the search.",
+      recovery:
+        "The call's time budget ran out before the Met API returned a successful response, retries included. Retry after a short wait; if it keeps happening, the Met API is likely down or overloaded.",
+    },
   ],
 
   async handler(input, ctx) {
@@ -246,14 +263,12 @@ export const metSearchCollections = tool('met_search_collections', {
       throw ctx.fail(
         'invalid_date_range',
         'dateBegin and dateEnd must both be provided or both omitted.',
-        ctx.recoveryFor('invalid_date_range'),
       );
     }
     if (hasBegin && hasEnd && (input.dateBegin ?? 0) > (input.dateEnd ?? 0)) {
       throw ctx.fail(
         'invalid_date_range',
         `dateBegin (${input.dateBegin}) must be ≤ dateEnd (${input.dateEnd}).`,
-        ctx.recoveryFor('invalid_date_range'),
       );
     }
 
@@ -269,30 +284,29 @@ export const metSearchCollections = tool('met_search_collections', {
       throw ctx.fail(
         'invalid_filter',
         'q is whitespace-only — it must contain at least one non-whitespace character.',
-        ctx.recoveryFor('invalid_filter'),
       );
     }
     if (input.medium?.trim() === '') {
       throw ctx.fail(
         'invalid_filter',
         'medium is blank — supply a classification name such as "Paintings", or omit the filter.',
-        ctx.recoveryFor('invalid_filter'),
       );
     }
     if (input.geoLocation?.length === 0) {
       throw ctx.fail(
         'invalid_filter',
         'geoLocation is an empty array — supply at least one location, or omit the filter.',
-        ctx.recoveryFor('invalid_filter'),
       );
     }
     if (input.geoLocation?.some((location) => location.trim() === '')) {
       throw ctx.fail(
         'invalid_filter',
         'geoLocation contains a blank entry — every value must be a non-blank location name.',
-        ctx.recoveryFor('invalid_filter'),
       );
     }
+
+    // One budget for every request below: the department lookup, the search, and the keyword count.
+    const deadline = startCallDeadline(ctx.signal);
 
     /**
      * Validate departmentId against the live (cached) Met department set. The Met
@@ -300,12 +314,11 @@ export const metSearchCollections = tool('met_search_collections', {
      * would quietly widen the search instead of failing.
      */
     if (input.departmentId != null) {
-      const validDepartmentIds = await getMetService().getValidDepartmentIds(ctx);
+      const validDepartmentIds = await getMetService().getValidDepartmentIds(ctx, deadline);
       if (!validDepartmentIds.has(input.departmentId)) {
         throw ctx.fail(
           'invalid_department',
           `departmentId ${input.departmentId} is not a valid Met department.`,
-          ctx.recoveryFor('invalid_department'),
         );
       }
     }
@@ -333,19 +346,20 @@ export const metSearchCollections = tool('met_search_collections', {
         dateEnd: input.dateEnd,
       },
       ctx,
+      deadline,
     );
 
     if (result.total === 0) {
       /**
-       * The hint has to be built here rather than declared: ctx.recoveryFor
-       * resolves a static string keyed only by the reason. Whether the keyword
+       * The hint has to be built here rather than declared: the declared
+       * recovery is a static string keyed only by the reason. Whether the keyword
        * matches on its own is the one fact that tells a bad keyword from filters
        * that removed every match, and it costs a request only on this path — an
        * unfiltered zero already answers it.
        */
       const filters = filtersUsed(input);
       const keywordMatches =
-        filters.length > 0 ? await getMetService().countKeywordMatches(input.q, ctx) : 0;
+        filters.length > 0 ? await getMetService().countKeywordMatches(input.q, ctx, deadline) : 0;
       throw ctx.fail(
         'no_results',
         `No objects matched the query "${input.q}"${filterScope(filters)}.`,

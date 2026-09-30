@@ -12,15 +12,26 @@ import { escapeMarkdown } from '@/utils/markdown.js';
 
 const mockGetObject = vi.fn();
 
-vi.mock('@/services/met/met-service.js', () => ({
+/** The service is stubbed at its accessor; `startCallDeadline` stays real. */
+vi.mock('@/services/met/met-service.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/services/met/met-service.js')>()),
   getMetService: () => ({
     getObject: mockGetObject,
   }),
 }));
 
 vi.mock('@/config/server-config.js', () => ({
-  getServerConfig: () => ({ batchConcurrency: 5, requestTimeoutMs: 10000, baseUrl: 'http://test' }),
+  getServerConfig: () => ({
+    batchConcurrency: 5,
+    requestTimeoutMs: 10000,
+    callDeadlineMs: 30000,
+    baseUrl: 'http://test',
+  }),
 }));
+
+/** The per-call deadline every service call receives as its third argument. */
+const aDeadline = () =>
+  expect.objectContaining({ deadlineAt: expect.any(Number), signal: expect.any(AbortSignal) });
 
 const sampleRecord = {
   objectID: 437980,
@@ -247,6 +258,28 @@ describe('metGetObject', () => {
     });
   });
 
+  it('words a single-ID all_not_found for the one object it names', async () => {
+    mockGetObject.mockResolvedValue(null);
+
+    const ctx = createMockContext({ errors: metGetObject.errors });
+    const input = metGetObject.input.parse({ objectIDs: [999999] });
+    await expect(metGetObject.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'all_not_found' },
+      message: 'Object 999999 was not found.',
+    });
+  });
+
+  it('words a multi-ID all_not_found with the count', async () => {
+    mockGetObject.mockResolvedValue(null);
+
+    const ctx = createMockContext({ errors: metGetObject.errors });
+    const input = metGetObject.input.parse({ objectIDs: [888888, 999999] });
+    await expect(metGetObject.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'all_not_found' },
+      message: 'All 2 requested object IDs not found.',
+    });
+  });
+
   it('throws all_failed when every fetch throws a network error', async () => {
     mockGetObject.mockRejectedValue(new Error('network error'));
 
@@ -255,6 +288,17 @@ describe('metGetObject', () => {
     await expect(metGetObject.handler(input, ctx)).rejects.toMatchObject({
       code: JsonRpcErrorCode.ServiceUnavailable,
       data: { reason: 'all_failed' },
+    });
+  });
+
+  it('words a single-ID all_failed for the one object it names', async () => {
+    mockGetObject.mockRejectedValue(new Error('network error'));
+
+    const ctx = createMockContext({ errors: metGetObject.errors });
+    const input = metGetObject.input.parse({ objectIDs: [999999] });
+    await expect(metGetObject.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'all_failed' },
+      message: 'Object 999999 could not be fetched.',
     });
   });
 
@@ -591,7 +635,7 @@ describe('metGetObject', () => {
       ).rejects.toMatchObject({
         code: JsonRpcErrorCode.NotFound,
         data: { reason: 'all_not_found' },
-        message: expect.stringContaining('All 1 requested object ID not found'),
+        message: 'Object 11207 was not found.',
       });
     });
 
@@ -791,6 +835,39 @@ describe('metGetObject', () => {
       const text = (blocks[0] as { text: string }).text;
 
       expect(text).toContain('**Date:** 1889 (1889–1889)');
+    });
+  });
+
+  describe('format — artist dates with one or no bound (#29)', () => {
+    const artistDatesLine = (artistBeginDate: string, artistEndDate: string) => {
+      const text = (
+        metGetObject.format!({
+          objects: [{ ...sampleRecord, artistBeginDate, artistEndDate }],
+          failed: [],
+        })[0] as { text: string }
+      ).text;
+      return text.split('\n').find((line) => line.startsWith('**Artist dates:**'));
+    };
+
+    it('renders a genuine range with both bounds', () => {
+      expect(artistDatesLine('1853', '1890')).toBe('**Artist dates:** 1853–1890');
+    });
+
+    it('renders a begin-only range open, with nothing after the dash', () => {
+      expect(artistDatesLine('1837', '')).toBe('**Artist dates:** 1837–');
+    });
+
+    it('renders an end-only range open, with nothing before the dash', () => {
+      expect(artistDatesLine('', '1890')).toBe('**Artist dates:** –1890');
+    });
+
+    it('renders a single placeholder when both bounds are empty', () => {
+      expect(artistDatesLine('', '')).toBe('**Artist dates:** —');
+    });
+
+    it('still escapes a bound rendered on its own', () => {
+      expect(artistDatesLine('[1837]', '')).toBe('**Artist dates:** \\[1837\\]–');
+      expect(artistDatesLine('', '1890*')).toBe('**Artist dates:** –1890\\*');
     });
   });
 
@@ -1002,7 +1079,7 @@ describe('metGetObject', () => {
       const result = await call({ ids: [437980] });
 
       expect(result.isError).toBeFalsy();
-      expect(mockGetObject).toHaveBeenCalledWith(437980, expect.anything());
+      expect(mockGetObject).toHaveBeenCalledWith(437980, expect.anything(), aDeadline());
       expect((result.structuredContent as { objects: unknown[] }).objects).toHaveLength(1);
       expect(textOf(result)).toContain('Object 437980');
     });
@@ -1012,7 +1089,7 @@ describe('metGetObject', () => {
       const result = await call({ object_ids: [437980] });
 
       expect(result.isError).toBeFalsy();
-      expect(mockGetObject).toHaveBeenCalledWith(437980, expect.anything());
+      expect(mockGetObject).toHaveBeenCalledWith(437980, expect.anything(), aDeadline());
     });
 
     it('still rejects an undeclared key that maps to no alias', async () => {

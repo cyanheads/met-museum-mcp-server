@@ -13,6 +13,22 @@ export interface RawSearchResponse {
   total: number;
 }
 
+/**
+ * Raw ID list from GET /v1/objects — every matching ID in one response, in an
+ * order that changes from call to call. `total` equals `objectIDs.length`, and a
+ * filter set that matches nothing answers `objectIDs: []` (observed for a
+ * `metadataDate` after the newest update).
+ */
+export interface RawObjectsResponse {
+  /**
+   * `[]` is the only empty answer observed here, but the Met's search endpoint
+   * answers an empty result with `null`, so `null` is typed and read as the
+   * empty list rather than failing the call.
+   */
+  objectIDs: number[] | null;
+  total: number;
+}
+
 /** Raw object record from GET /objects/{id} */
 export interface RawObjectRecord {
   accessionNumber: string;
@@ -79,6 +95,11 @@ export interface RawConstituent {
   constituentULAN_URL: string;
   constituentWikidata_URL: string;
   gender: string;
+  /**
+   * Entity-encoded on the wire (`Tiffany &amp; Co.`, `World&#39;s Views
+   * Series`), unlike `artistDisplayName` on the same record, which carries the
+   * decoded spelling. No other field the tool returns arrives encoded.
+   */
   name: string;
   role: string;
 }

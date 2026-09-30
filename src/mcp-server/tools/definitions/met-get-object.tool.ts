@@ -4,9 +4,9 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { getServerConfig } from '@/config/server-config.js';
-import { getMetService } from '@/services/met/met-service.js';
+import { getMetService, startCallDeadline } from '@/services/met/met-service.js';
 import { escapeMarkdown, isHttpUrl } from '@/utils/markdown.js';
 
 const ConstituentSchema = z
@@ -161,10 +161,14 @@ const ObjectSchema = z
       .describe('Artist\'s nationality (e.g., "Dutch", "French"). Empty for anonymous works.'),
     artistBeginDate: z
       .string()
-      .describe('Artist birth year as a string (e.g., "1853"). Empty for anonymous works.'),
+      .describe(
+        'Artist birth year, or a firm\'s founding year, as a string (e.g., "1853"). Occasionally a full date (e.g., "1928-01-10"). Empty for anonymous works.',
+      ),
     artistEndDate: z
       .string()
-      .describe('Artist death year as a string. Empty for living or anonymous.'),
+      .describe(
+        'Artist death year, or a firm\'s closing year, as a string (e.g., "1890"). Occasionally a full date (e.g., "1928-01-10"). Empty for a living artist, a firm still active, or an anonymous work.',
+      ),
     constituents: z
       .array(ConstituentSchema)
       .nullable()
@@ -273,7 +277,7 @@ export const metGetObject = tool('met_get_object', {
   title: 'Get Met Objects',
   description:
     'Fetch full records for one or more Met Museum object IDs. Accepts up to 20 IDs per call and returns partial success — a single 404 does not fail the whole batch; per-ID failures are reported separately. ' +
-    'Object IDs come from met_search_collections. Non-public-domain objects return empty image URLs. ' +
+    'Object IDs come from met_search_collections (keyword search) or met_list_objects (browse by department or update date). Non-public-domain objects return empty image URLs. ' +
     'The constituents array is null for anonymous or unattributed works; tags and measurements are null when the Met records none. ' +
     'Records are returned whole and never truncated, so a batch of unusually large records may return fewer than requested — any that did not fit are listed in deferred[] with their sizes, to be re-requested in a follow-up call.',
   annotations: { readOnlyHint: true, idempotentHint: true },
@@ -285,11 +289,17 @@ export const metGetObject = tool('met_get_object', {
   inputAliases: { ids: 'objectIDs' },
   input: z.object({
     objectIDs: z
-      .array(z.number().int().positive().describe('A Met object ID from met_search_collections.'))
+      .array(
+        z
+          .number()
+          .int()
+          .positive()
+          .describe('A Met object ID from met_search_collections or met_list_objects.'),
+      )
       .min(1)
       .max(20)
       .describe(
-        'One or more Met object IDs to fetch. Maximum 20 per call. IDs come from met_search_collections. ' +
+        'One or more Met object IDs to fetch. Maximum 20 per call. IDs come from met_search_collections or met_list_objects. ' +
           'A repeated ID is fetched and returned once, at its first position. ' +
           'Partial failures are reported per ID rather than failing the whole batch.',
       ),
@@ -355,11 +365,27 @@ export const metGetObject = tool('met_get_object', {
       recovery:
         'Retry after a brief delay. If one ID fails repeatedly, verify it with met_search_collections.',
     },
+    {
+      reason: 'upstream_blocked',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      retryable: false,
+      when: "No object was fetched and the Met API's firewall refused requests with HTTP 403 — it blocks this server's address, not one object.",
+      recovery: 'Wait several minutes before retrying, and send fewer requests.',
+    },
+    {
+      reason: 'retry_deadline_exceeded',
+      code: JsonRpcErrorCode.Timeout,
+      when: "No object was fetched and every fetch ran out of the call's time budget, retries and backoff included — an ID whose fetch would have started after the budget was spent counts too.",
+      recovery:
+        "The call's time budget ran out before the Met API returned a successful response, retries included. Retry after a short wait; if it keeps happening, the Met API is likely down or overloaded.",
+    },
   ],
 
   async handler(input, ctx) {
     const { batchConcurrency } = getServerConfig();
     const service = getMetService();
+    // One budget for the whole batch, shared by every wave of fetches.
+    const deadline = startCallDeadline(ctx.signal);
 
     // De-duplicated up front, first occurrence winning its position. A repeated
     // ID would otherwise be fetched twice, charged to the byte budget twice —
@@ -375,7 +401,13 @@ export const metGetObject = tool('met_get_object', {
       objectID: number;
       record: NonNullable<Awaited<ReturnType<typeof service.getObject>>>;
     };
-    type FailItem = { ok: false; objectID: number; error: string; kind: 'not_found' | 'error' };
+    /** `deadline`: the call's budget ran out on this ID, or before its fetch started. */
+    type FailItem = {
+      ok: false;
+      objectID: number;
+      error: string;
+      kind: 'not_found' | 'deadline' | 'error';
+    };
     // Index-addressed, not push-ordered: each result is written at its input position so
     // objects[] and failed[] follow the caller's objectIDs order regardless of the order
     // fetches complete in under concurrency. A shared cursor claims positions; `nextIndex++`
@@ -383,13 +415,32 @@ export const metGetObject = tool('met_get_object', {
     const results = new Array<SuccessItem | FailItem>(objectIDs.length);
     let nextIndex = 0;
 
+    /**
+     * The first `upstream_blocked` failure's message. The firewall refuses this
+     * server's address, not one object, so the IDs not yet started fail with it
+     * instead of each sending one more request into the block.
+     */
+    let blockMessage: string | undefined;
+    const blockedHint = ctx.recoveryFor('upstream_blocked').recovery.hint;
+    /** A failure's detail, which may already end in a period, then its recovery. */
+    const withHint = (detail: string, hint: string) => `${detail.replace(/\.+$/, '')}. ${hint}`;
+
     const processNext = async (): Promise<void> => {
       while (nextIndex < objectIDs.length) {
         const index = nextIndex++;
         const objectID = objectIDs[index];
         if (objectID == null) break;
+        if (blockMessage !== undefined) {
+          results[index] = {
+            ok: false,
+            objectID,
+            kind: 'error',
+            error: withHint(`Object ${objectID} was not requested. ${blockMessage}`, blockedHint),
+          };
+          continue;
+        }
         try {
-          const record = await service.getObject(objectID, ctx);
+          const record = await service.getObject(objectID, ctx, deadline);
           if (record == null) {
             results[index] = {
               ok: false,
@@ -401,11 +452,21 @@ export const metGetObject = tool('met_get_object', {
             results[index] = { ok: true, objectID, record };
           }
         } catch (err) {
+          // A cancelled call ends as cancelled, never as a partial success whose
+          // failed[] lists the IDs the cancellation cut off.
+          if (ctx.signal.aborted) throw err;
+          const message = err instanceof Error ? err.message : String(err);
+          const reason = err instanceof McpError ? err.data?.reason : undefined;
+          const blocked = reason === 'upstream_blocked';
+          if (blocked) blockMessage ??= message;
           results[index] = {
             ok: false,
             objectID,
-            kind: 'error',
-            error: `Failed to fetch object ${objectID}: ${err instanceof Error ? err.message : String(err)}. Retry after a brief delay.`,
+            kind: reason === 'retry_deadline_exceeded' ? 'deadline' : 'error',
+            error: withHint(
+              `Failed to fetch object ${objectID}: ${message}`,
+              blocked ? blockedHint : 'Retry after a brief delay.',
+            ),
           };
         }
       }
@@ -444,14 +505,29 @@ export const metGetObject = tool('met_get_object', {
       if (allNotFound) {
         throw ctx.fail(
           'all_not_found',
-          `All ${objectIDs.length} requested object ${objectIDs.length === 1 ? 'ID' : 'IDs'} not found.`,
-          ctx.recoveryFor('all_not_found'),
+          objectIDs.length === 1
+            ? `Object ${objectIDs[0]} was not found.`
+            : `All ${objectIDs.length} requested object IDs not found.`,
+        );
+      }
+      if (blockMessage !== undefined) {
+        throw ctx.fail('upstream_blocked', `No object could be fetched. ${blockMessage}`);
+      }
+      // A batch the budget ran out on is one expiry, not N upstream faults — but
+      // only when nothing else failed: a 404 or an upstream error beside it stays all_failed.
+      if (failItems.every((f) => f.kind === 'deadline')) {
+        throw ctx.fail(
+          'retry_deadline_exceeded',
+          objectIDs.length === 1
+            ? `Object ${objectIDs[0]} could not be fetched before the call's time budget ran out.`
+            : `All ${objectIDs.length} object fetches ran out of the call's time budget.`,
         );
       }
       throw ctx.fail(
         'all_failed',
-        `All ${objectIDs.length} object fetches failed.`,
-        ctx.recoveryFor('all_failed'),
+        objectIDs.length === 1
+          ? `Object ${objectIDs[0]} could not be fetched.`
+          : `All ${objectIDs.length} object fetches failed.`,
       );
     }
 
@@ -503,8 +579,10 @@ export const metGetObject = tool('met_get_object', {
         `**Artist:** ${prose(obj.artistDisplayName)}${obj.artistDisplayBio ? ` (${escapeMarkdown(obj.artistDisplayBio)})` : ''}`,
       );
       lines.push(`**Nationality:** ${prose(obj.artistNationality)}`);
+      // One empty bound beside a set one renders as nothing, so the range reads
+      // open (`1837–`, `–1890`); the placeholder stands only for no dates at all.
       lines.push(
-        `**Artist dates:** ${obj.artistBeginDate || obj.artistEndDate ? `${prose(obj.artistBeginDate)}–${prose(obj.artistEndDate)}` : '—'}`,
+        `**Artist dates:** ${obj.artistBeginDate || obj.artistEndDate ? `${escapeMarkdown(obj.artistBeginDate)}–${escapeMarkdown(obj.artistEndDate)}` : '—'}`,
       );
       lines.push(
         `**Department:** ${prose(obj.department)} | **Object name:** ${prose(obj.objectName)} | **Classification:** ${prose(obj.classification)}`,

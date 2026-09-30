@@ -27,6 +27,10 @@ vi.mock('@/services/met/met-service.js', async (importOriginal) => ({
   }),
 }));
 
+/** The per-call deadline every service call receives as its third argument. */
+const aDeadline = () =>
+  expect.objectContaining({ deadlineAt: expect.any(Number), signal: expect.any(AbortSignal) });
+
 /** The live-verified Met department ID set (gaps at 2 and 20, nothing ≥ 22). */
 const VALID_DEPARTMENT_IDS = new Set([
   1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 21,
@@ -88,14 +92,33 @@ describe('metSearchCollections', () => {
     });
   });
 
-  // --- #6: invalid_date_range now carries the declared recovery hint ---
+  /**
+   * The error envelope a failing call returns. The declared recovery hint is
+   * filled by the tool pipeline from the `errors[]` contract, not by the
+   * handler's throw, so hint assertions run through `runToolContract` — the
+   * seam that applies the fill, as production does.
+   */
+  const contractError = async (args: z.input<typeof metSearchCollections.input>) => {
+    const result = await runToolContract(metSearchCollections, args);
+    expect(result.isError).toBe(true);
+    return (
+      result.structuredContent as {
+        error: {
+          code: number;
+          message: string;
+          data: { reason: string; recovery: { hint: string } };
+        };
+      }
+    ).error;
+  };
+
+  // --- #6: invalid_date_range carries the declared recovery hint ---
   // The framework mirrors data.recovery.hint into the content[] "Recovery:" line,
   // so asserting the hint reaches data.recovery.hint covers both client surfaces.
 
   it('invalid_date_range (missing pair) carries the recovery hint on data.recovery.hint', async () => {
-    const ctx = createMockContext({ errors: metSearchCollections.errors });
-    const input = metSearchCollections.input.parse({ q: 'test', limit: 20, dateBegin: 1800 });
-    await expect(Promise.resolve(metSearchCollections.handler(input, ctx))).rejects.toMatchObject({
+    const error = await contractError({ q: 'test', limit: 20, dateBegin: 1800 });
+    expect(error).toMatchObject({
       code: JsonRpcErrorCode.ValidationError,
       data: {
         reason: 'invalid_date_range',
@@ -107,14 +130,8 @@ describe('metSearchCollections', () => {
   });
 
   it('invalid_date_range (dateBegin > dateEnd) carries the recovery hint on data.recovery.hint', async () => {
-    const ctx = createMockContext({ errors: metSearchCollections.errors });
-    const input = metSearchCollections.input.parse({
-      q: 'test',
-      limit: 20,
-      dateBegin: 1900,
-      dateEnd: 1800,
-    });
-    await expect(Promise.resolve(metSearchCollections.handler(input, ctx))).rejects.toMatchObject({
+    const error = await contractError({ q: 'test', limit: 20, dateBegin: 1900, dateEnd: 1800 });
+    expect(error).toMatchObject({
       code: JsonRpcErrorCode.ValidationError,
       data: {
         reason: 'invalid_date_range',
@@ -141,14 +158,19 @@ describe('metSearchCollections', () => {
     const input = metSearchCollections.input.parse({ q: 'painting', departmentId: 11, limit: 2 });
     const result = await metSearchCollections.handler(input, ctx);
     expect(mockGetValidDepartmentIds).toHaveBeenCalledOnce();
-    expect(mockSearch).toHaveBeenCalledWith(expect.objectContaining({ departmentId: 11 }), ctx);
+    expect(mockSearch).toHaveBeenCalledWith(
+      expect.objectContaining({ departmentId: 11 }),
+      ctx,
+      aDeadline(),
+    );
+    // One budget: the lookup and the search share the deadline the handler started.
+    expect(mockGetValidDepartmentIds.mock.calls[0]?.[1]).toBe(mockSearch.mock.calls[0]?.[2]);
     expect(result.total).toBe(42);
   });
 
   it('rejects a gap departmentId (2) with invalid_department and never searches', async () => {
-    const ctx = createMockContext({ errors: metSearchCollections.errors });
-    const input = metSearchCollections.input.parse({ q: 'painting', departmentId: 2, limit: 3 });
-    await expect(Promise.resolve(metSearchCollections.handler(input, ctx))).rejects.toMatchObject({
+    const error = await contractError({ q: 'painting', departmentId: 2, limit: 3 });
+    expect(error).toMatchObject({
       code: JsonRpcErrorCode.ValidationError,
       data: {
         reason: 'invalid_department',
@@ -204,7 +226,11 @@ describe('metSearchCollections', () => {
     const ctx = createMockContext({ errors: metSearchCollections.errors });
     const input = metSearchCollections.input.parse({ q: 'cat', limit: 2, offset: 50 });
     const result = await metSearchCollections.handler(input, ctx);
-    expect(mockSearch).toHaveBeenCalledWith(expect.objectContaining({ offset: 50, limit: 2 }), ctx);
+    expect(mockSearch).toHaveBeenCalledWith(
+      expect.objectContaining({ offset: 50, limit: 2 }),
+      ctx,
+      aDeadline(),
+    );
     expect(result.nextOffset).toBe(52);
     expect(result.remaining).toBe(48);
   });
@@ -222,7 +248,11 @@ describe('metSearchCollections', () => {
     const ctx = createMockContext({ errors: metSearchCollections.errors });
     const input = metSearchCollections.input.parse({ q: 'rare', limit: 20 });
     await metSearchCollections.handler(input, ctx);
-    expect(mockSearch).toHaveBeenCalledWith(expect.objectContaining({ offset: 0 }), ctx);
+    expect(mockSearch).toHaveBeenCalledWith(
+      expect.objectContaining({ offset: 0 }),
+      ctx,
+      aDeadline(),
+    );
   });
 
   it('passes a one-location geoLocation array to the service', async () => {
@@ -246,6 +276,7 @@ describe('metSearchCollections', () => {
     expect(mockSearch).toHaveBeenCalledWith(
       expect.objectContaining({ geoLocation: ['France'] }),
       ctx,
+      aDeadline(),
     );
     expect(result.total).toBe(12);
   });
@@ -272,7 +303,11 @@ describe('metSearchCollections', () => {
     const ctx = createMockContext({ errors: metSearchCollections.errors });
     const input = metSearchCollections.input.parse({ q: 'Rembrandt', isOnView: true, limit: 3 });
     const result = await metSearchCollections.handler(input, ctx);
-    expect(mockSearch).toHaveBeenCalledWith(expect.objectContaining({ isOnView: true }), ctx);
+    expect(mockSearch).toHaveBeenCalledWith(
+      expect.objectContaining({ isOnView: true }),
+      ctx,
+      aDeadline(),
+    );
     expect(result.objectIDs).toEqual([437392, 437389, 436929]);
   });
 
@@ -337,7 +372,11 @@ describe('metSearchCollections', () => {
     const ctx = createMockContext({ errors: metSearchCollections.errors });
     const input = metSearchCollections.input.parse({ q: 'vase', isHighlight: true, limit: 20 });
     await metSearchCollections.handler(input, ctx);
-    expect(mockSearch).toHaveBeenCalledWith(expect.objectContaining({ isHighlight: true }), ctx);
+    expect(mockSearch).toHaveBeenCalledWith(
+      expect.objectContaining({ isHighlight: true }),
+      ctx,
+      aDeadline(),
+    );
   });
 
   it('leaves hasImages and isOnView as plain two-valued booleans', () => {
@@ -351,10 +390,11 @@ describe('metSearchCollections', () => {
   // The Met search ignores a blank parameter, silently widening the search, so
   // there is no safe blank to forward.
 
-  const expectInvalidFilter = async (raw: Record<string, unknown>, field: string) => {
-    const ctx = createMockContext({ errors: metSearchCollections.errors });
-    const input = metSearchCollections.input.parse(raw);
-    const err = await Promise.resolve(metSearchCollections.handler(input, ctx)).catch((e) => e);
+  const expectInvalidFilter = async (
+    args: z.input<typeof metSearchCollections.input>,
+    field: string,
+  ) => {
+    const err = await contractError(args);
     expect(err).toMatchObject({
       code: JsonRpcErrorCode.ValidationError,
       data: {
@@ -409,7 +449,11 @@ describe('metSearchCollections', () => {
     const ctx = createMockContext({ errors: metSearchCollections.errors });
     const input = metSearchCollections.input.parse({ q: '  sunflower  ', limit: 1 });
     const result = await metSearchCollections.handler(input, ctx);
-    expect(mockSearch).toHaveBeenCalledWith(expect.objectContaining({ q: '  sunflower  ' }), ctx);
+    expect(mockSearch).toHaveBeenCalledWith(
+      expect.objectContaining({ q: '  sunflower  ' }),
+      ctx,
+      aDeadline(),
+    );
     expect(result.total).toBe(97);
   });
 
@@ -429,6 +473,7 @@ describe('metSearchCollections', () => {
     expect(mockSearch).toHaveBeenCalledWith(
       expect.objectContaining({ medium: undefined, geoLocation: undefined }),
       ctx,
+      aDeadline(),
     );
   });
 
@@ -584,7 +629,8 @@ describe('metSearchCollections', () => {
     const input = metSearchCollections.input.parse({ q: 'sunflower', hasImages: false });
     const err = await Promise.resolve(metSearchCollections.handler(input, ctx)).catch((e) => e);
 
-    expect(mockCountKeywordMatches).toHaveBeenCalledExactlyOnceWith('sunflower', ctx);
+    expect(mockCountKeywordMatches).toHaveBeenCalledExactlyOnceWith('sunflower', ctx, aDeadline());
+    expect(mockCountKeywordMatches.mock.calls[0]?.[2]).toBe(mockSearch.mock.calls[0]?.[2]);
     expect(err.data.recovery.hint).toContain('matches 1 object on its own');
     expect(err.data.recovery.hint).toContain('removed every match: hasImages.');
     // No medium correction when medium was not set.
@@ -640,6 +686,7 @@ describe('metSearchCollections', () => {
       expect(mockSearch).toHaveBeenCalledWith(
         expect.objectContaining({ q: 'sunflower' }),
         expect.anything(),
+        aDeadline(),
       );
       // Both consumption surfaces carry the page, not just structuredContent.
       expect((result.structuredContent as { total: number }).total).toBe(3);

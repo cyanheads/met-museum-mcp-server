@@ -6,6 +6,9 @@
 import { z } from '@cyanheads/mcp-ts-core';
 import { parseEnvConfig } from '@cyanheads/mcp-ts-core/config';
 
+/** The largest delay a timer accepts; past it, the timer overflows and fires at once. */
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
 const ServerConfigSchema = z.object({
   baseUrl: z
     .string()
@@ -18,8 +21,18 @@ const ServerConfigSchema = z.object({
     .number()
     .int()
     .positive()
+    .max(MAX_TIMER_DELAY_MS)
     .default(10_000)
     .describe('Per-request timeout in milliseconds.'),
+  callDeadlineMs: z.coerce
+    .number()
+    .int()
+    .positive()
+    .max(MAX_TIMER_DELAY_MS)
+    .default(30_000)
+    .describe(
+      "Wall-clock budget in milliseconds for one tool call, shared by every Met API request the call makes — retries and backoff included. Each request's timeout is capped by what remains of it.",
+    ),
   batchConcurrency: z.coerce
     .number()
     .int()
@@ -37,6 +50,7 @@ export function getServerConfig(): ServerConfig {
   _config ??= parseEnvConfig(ServerConfigSchema, {
     baseUrl: 'MET_BASE_URL',
     requestTimeoutMs: 'MET_REQUEST_TIMEOUT_MS',
+    callDeadlineMs: 'MET_CALL_DEADLINE_MS',
     batchConcurrency: 'MET_BATCH_CONCURRENCY',
   });
   return _config;

@@ -7,7 +7,9 @@ import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { metListDepartments } from '@/mcp-server/tools/definitions/met-list-departments.tool.js';
 
-vi.mock('@/services/met/met-service.js', () => ({
+/** The service is stubbed at its accessor; `startCallDeadline` stays real. */
+vi.mock('@/services/met/met-service.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/services/met/met-service.js')>()),
   getMetService: () => ({
     getDepartments: vi.fn().mockResolvedValue([
       { departmentId: 11, displayName: 'European Paintings' },
@@ -22,7 +24,7 @@ describe('metListDepartments', () => {
   });
 
   it('returns departments from the service', async () => {
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: metListDepartments.errors });
     const input = metListDepartments.input.parse({});
     const result = await metListDepartments.handler(input, ctx);
     expect(result.departments).toHaveLength(2);
