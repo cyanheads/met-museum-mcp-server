@@ -1,6 +1,6 @@
 # met-museum-mcp-server - Directory Structure
 
-Generated on: 2026-09-25 04:42:35
+Generated on: 2026-09-30 16:00:46
 
 ```text
 met-museum-mcp-server/
@@ -30,6 +30,7 @@ met-museum-mcp-server/
 │   ├── 0.4.x/
 │   ├── 0.5.x/
 │   ├── 0.6.x/
+│   ├── 0.7.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
@@ -132,6 +133,7 @@ met-museum-mcp-server/
 │   ├── clean-mcpb.ts
 │   ├── clean.ts
 │   ├── devcheck.ts
+│   ├── install-otel.ts
 │   ├── lint-mcp.ts
 │   ├── lint-packaging.ts
 │   ├── list-skills.ts
@@ -149,12 +151,14 @@ met-museum-mcp-server/
 │   │       └── definitions/
 │   │           ├── met-get-object.tool.ts
 │   │           ├── met-list-departments.tool.ts
+│   │           ├── met-list-objects.tool.ts
 │   │           └── met-search-collections.tool.ts
 │   ├── services/
 │   │   └── met/
 │   │       ├── met-service.ts
 │   │       └── types.ts
 │   ├── utils/
+│   │   ├── html-entities.ts
 │   │   └── markdown.ts
 │   └── index.ts
 ├── tests/
@@ -163,12 +167,16 @@ met-museum-mcp-server/
 │   ├── services/
 │   │   └── met/
 │   │       ├── met-service-base-url.test.ts
+│   │       ├── met-service-deadline.test.ts
+│   │       ├── met-service-upstream-blocked.test.ts
 │   │       └── met-service.test.ts
 │   ├── tools/
 │   │   ├── met-get-object.tool.test.ts
 │   │   ├── met-list-departments.tool.test.ts
+│   │   ├── met-list-objects.tool.test.ts
 │   │   └── met-search-collections.tool.test.ts
 │   ├── utils/
+│   │   ├── html-entities.test.ts
 │   │   └── markdown.test.ts
 │   └── format-escaping.test.ts
 ├── .dockerignore

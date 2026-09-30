@@ -1,6 +1,6 @@
 {
   "name": "@cyanheads/met-museum-mcp-server",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "mcpName": "io.github.cyanheads/met-museum-mcp-server",
   "description": "Search the Metropolitan Museum of Art collection, browse it by department or update date, fetch full artwork records and open-access images via MCP. STDIO or Streamable HTTP.",
   "type": "module",

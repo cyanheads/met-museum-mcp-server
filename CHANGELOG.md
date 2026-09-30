@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.7.0](changelog/0.7.x/0.7.0.md) — 2026-09-30
+
+met_list_objects browses the collection by department and update date with no paging limit, every tool call runs under one MET_CALL_DEADLINE_MS budget, and a Met firewall 403 fails as upstream_blocked instead of inviting a retry.
+
 ## [0.6.0](changelog/0.6.x/0.6.0.md) — 2026-09-24 · ⚠️ Breaking
 
 met_search_collections moves to the Met's /v1.1/search before /v1 retires on 2026-10-01: upstream paging within a 10,000-match window, isPublicDomain and the search_timeout reason removed, and a no_results hint that names the filters that zeroed the query.

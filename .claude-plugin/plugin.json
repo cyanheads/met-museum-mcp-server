@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "met-museum-mcp-server",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Search the Metropolitan Museum of Art collection, browse it by department or update date, fetch full artwork records and open-access images via MCP. STDIO or Streamable HTTP.",
   "author": {
     "name": "cyanheads",
