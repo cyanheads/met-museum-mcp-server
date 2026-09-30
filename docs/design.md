@@ -7,6 +7,7 @@
 | Name | Description | Key Inputs | Annotations |
 |:-----|:------------|:-----------|:------------|
 | `met_search_collections` | Search the Met collection by keyword and filters; returns total count and one page of matched object IDs | `q`, `hasImages`, `isHighlight`, `isOnView`, `medium`, `departmentId`, `geoLocation`, `dateBegin`, `dateEnd`, `limit`, `offset` | `readOnlyHint: true`, `idempotentHint: true` |
+| `met_list_objects` | Browse without a keyword: every object ID in one department, every object created or revised on or after a date, or both; ascending, paged with no depth limit | `departmentId`, `updatedSince`, `limit`, `offset` | `readOnlyHint: true`, `idempotentHint: true` |
 | `met_get_object` | Fetch full records for one or more object IDs (batch, concurrency-limited, partial-success) | `objectIDs` (array, max 20) | `readOnlyHint: true`, `idempotentHint: true` |
 | `met_list_departments` | Return the 19 curatorial departments with their IDs and display names | — | `readOnlyHint: true`, `idempotentHint: true` |
 
@@ -31,10 +32,10 @@ Target users: art researchers, educators, students, designers sourcing CC0 image
 ## Requirements
 
 - No API key required — fully public, keyless REST
-- Collection root: `https://collectionapi.metmuseum.org/public/collection/`; each endpoint carries its own version (`/v1.1/search`, `/v1/objects/{id}`, `/v1/departments`)
+- Collection root: `https://collectionapi.metmuseum.org/public/collection/`; each endpoint carries its own version (`/v1.1/search`, `/v1/objects`, `/v1/objects/{id}`, `/v1/departments`)
 - Search returns object IDs only, one `offset`/`limit` page at a time; full records require a per-ID fetch (`/v1/objects/{id}`)
-- Batch-fetch pattern (array input + `Promise.allSettled` + concurrency limit) is essential to avoid N+1 after a search
-- No rate limit published; service has been stable at moderate request volumes — apply a reasonable concurrency cap (5 parallel) to be a polite caller
+- Batch-fetch pattern (array input + a concurrency-limited worker pool that records each ID's outcome) is essential to avoid N+1 after a search
+- The documented rate limit is 80 requests per second, but the Met's firewall has blocked a burst far below it (Decision #19) — cap concurrency (5 parallel by default) and keep bursts small
 - `hasImages=true` includes copyrighted works with restricted images. CC0 status is not a search filter (`/v1.1/search` ignores `isPublicDomain`); it is read per object from `isPublicDomain`/`hasCC0Image` on `met_get_object`
 - Attribution: CC0 means no attribution is legally required, but crediting "The Metropolitan Museum of Art" is courteous
 
@@ -44,7 +45,7 @@ Target users: art researchers, educators, students, designers sourcing CC0 image
 
 | Service | Wraps | Used By |
 |:--------|:------|:--------|
-| `MetService` | Met Collection API — search, object fetch, departments | All three tools |
+| `MetService` | Met Collection API — search, object ID lists, object fetch, departments | All four tools |
 
 ---
 
@@ -54,6 +55,7 @@ Target users: art researchers, educators, students, designers sourcing CC0 image
 |:--------|:---------|:------------|
 | `MET_BASE_URL` | No | Override the API root (default: `https://collectionapi.metmuseum.org/public/collection`); each endpoint appends its own version. A value ending in `/v1` or `/v1.1` is read as its root. Useful for local stubs in tests. |
 | `MET_REQUEST_TIMEOUT_MS` | No | Per-request timeout in milliseconds (default: `10000`). |
+| `MET_CALL_DEADLINE_MS` | No | Wall-clock budget in milliseconds for one tool call, shared by every Met API request it makes, retries and backoff included (default: `30000`). See Decision #18. |
 | `MET_BATCH_CONCURRENCY` | No | Max parallel fetches in `met_get_object` (default: `5`). |
 
 No API keys. The server needs no auth env vars for normal operation.
@@ -62,12 +64,13 @@ No API keys. The server needs no auth env vars for normal operation.
 
 ## Implementation Order
 
-1. Config (`src/config/server-config.ts`) — three optional env vars with defaults
-2. `MetService` (`src/services/met/met-service.ts`) — `search()`, `getObject()`, `getDepartments()` methods with retry, timeout, concurrency pooling
+1. Config (`src/config/server-config.ts`) — four optional env vars with defaults
+2. `MetService` (`src/services/met/met-service.ts`) — `search()`, `listObjects()`, `getObject()`, `getDepartments()`, `getValidDepartmentIds()`, and `countKeywordMatches()`, with retry, the per-call deadline, firewall-block classification, and the cached object-ID lists
 3. `met_list_departments` — trivial; validates the service layer works end-to-end
 4. `met_search_collections` — exercises the search endpoint and output shaping
-5. `met_get_object` — batch path, partial-success output, concurrency gate
-6. Tests (`tests/`)
+5. `met_list_objects` — the keyword-less browse over `/v1/objects`, paged from the sorted, cached list
+6. `met_get_object` — batch path, partial-success output, concurrency gate
+7. Tests (`tests/`)
 
 ---
 
@@ -159,6 +162,21 @@ errors: [
     when: 'departmentId is provided but is not one of the Met department IDs',
     recovery: 'Call met_list_departments to get valid department IDs, then retry with one of the returned IDs.',
   },
+  {
+    reason: 'upstream_blocked',
+    code: JsonRpcErrorCode.ServiceUnavailable,
+    retryable: false,
+    thrownBy: 'service', // Decision #19
+    when: "The Met API's firewall refused the request with HTTP 403 — it blocks this server's address, not one endpoint.",
+    recovery: 'Wait several minutes before retrying, and send fewer requests.',
+  },
+  {
+    reason: 'retry_deadline_exceeded',
+    code: JsonRpcErrorCode.Timeout,
+    thrownBy: 'service', // Decision #18
+    when: "The call's time budget ran out, retries and backoff included, before the Met API returned a successful response to the department lookup or the search.",
+    recovery: "The call's time budget ran out before the Met API returned a successful response, retries included. Retry after a short wait; if it keeps happening, the Met API is likely down or overloaded.",
+  },
 ]
 ```
 
@@ -174,9 +192,102 @@ errors: [
 
 ---
 
+### `met_list_objects`
+
+**Purpose:** Browse the collection without a keyword — every object ID in one curatorial department, every object whose record was created or revised on or after a date, or both. Chain to `met_get_object` for full records.
+
+**Upstream endpoint:** `GET /v1/objects?[departmentIds=…]&[metadataDate=…]` — one request per filter set, sorted and cached; pages are sliced locally
+
+**Input schema** (describes abbreviated; the definition file carries the full text):
+
+```ts
+// inputAliases: { metadataDate: 'updatedSince' } — the Met API's name for the same filter
+z.object({
+  departmentId: z.number().int().min(1).optional()
+    .describe('One curatorial department; valid IDs come from met_list_departments, and an unknown ID is rejected (invalid_department).'),
+  updatedSince: blankAsUnset(z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional())
+    .describe('Objects whose record was created or revised on or after this date, the day itself included, as YYYY-MM-DD with no time part. A date later than the newest update returns an empty list, not an error.'),
+  limit: z.number().int().min(1).max(500).default(20)
+    .describe('Maximum number of object IDs to return in this page.'),
+  offset: z.number().int().min(0).default(0)
+    .describe('Zero-based index of the first ID; pass nextOffset to continue. Every ID is reachable; an offset at or past total returns an empty page, not an error.'),
+})
+```
+
+**Output schema:**
+
+```ts
+z.object({
+  total: z.number().int()
+    .describe('Objects matching the filters. Paging reaches every one — there is no 10,000 window here.'),
+  objectIDs: z.array(z.number().int())
+    .describe('Object IDs for this page in ascending order, up to `limit` results.'),
+  returned: z.number().int()
+    .describe('Count of object IDs in this page.'),
+  offset: z.number().int()
+    .describe('The resolved offset. At or beyond a nonzero total the page is empty because the offset ran past the list.'),
+  remaining: z.number().int()
+    .describe('IDs after this page: total − (offset + returned), floored at 0.'),
+  truncated: z.boolean()
+    .describe('True when IDs remain after this page: offset + returned < total.'),
+  nextOffset: z.number().int().nullable()
+    .describe('The offset to pass on the next call, or null when this page ends the list.'),
+})
+// enrichment: { notice?: string } — present only when total is 0, naming the filters that matched nothing and how to widen the list.
+```
+
+**Error contract:**
+
+```ts
+errors: [
+  {
+    reason: 'invalid_department',
+    code: JsonRpcErrorCode.ValidationError,
+    when: 'departmentId is provided but is not one of the Met department IDs.',
+    recovery: 'Call met_list_departments to get valid department IDs, then retry with one of the returned IDs.',
+  },
+  {
+    reason: 'invalid_date',
+    code: JsonRpcErrorCode.ValidationError,
+    when: 'updatedSince has the YYYY-MM-DD shape but names no calendar day, such as 2026-02-30.',
+    recovery: 'Pass updatedSince as a real calendar date in YYYY-MM-DD form, such as 2026-09-01.',
+  },
+  {
+    reason: 'upstream_blocked',
+    code: JsonRpcErrorCode.ServiceUnavailable,
+    retryable: false,
+    thrownBy: 'service', // Decision #19
+    when: "The Met API's firewall refused the request with HTTP 403 — it blocks this server's address, not one endpoint.",
+    recovery: 'Wait several minutes before retrying, and send fewer requests.',
+  },
+  {
+    reason: 'retry_deadline_exceeded',
+    code: JsonRpcErrorCode.Timeout,
+    thrownBy: 'service', // Decision #18
+    when: "The call's time budget ran out, retries and backoff included, before the Met API returned a successful response to the department lookup or the ID list.",
+    recovery: "The call's time budget ran out before the Met API returned a successful response, retries included. Retry after a short wait; if it keeps happening, the Met API is likely down or overloaded.",
+  },
+]
+```
+
+**Format markers:** `content[]` marks the page `(truncated)` when IDs remain after it, `(offset beyond result set)` when `offset` is nonzero and at or past `total` — an empty list read from offset 50 included — and `(complete)` otherwise, including an empty list read from offset 0, whose `notice` says why it is empty.
+
+**Annotations:** `{ readOnlyHint: true, idempotentHint: true }`
+
+**Implementation notes:**
+- `departmentId` is checked against the cached department set (`getValidDepartmentIds()`) before any `/v1/objects` request: upstream answers an unknown department with an empty list, indistinguishable from a real department with nothing to show.
+- `updatedSince` is shape-checked by the schema — a time part or any other date format is rejected there — and calendar-checked in the handler (`2026-02-30` → `invalid_date`). A future date is not an error; it returns `total: 0` with the notice. A blank value from a form client is read as unset (`blankAsUnset`), but the advertised pattern still rejects `""`, so the description does not offer it.
+- An empty list arrives as `objectIDs: []`; a `null` in its place is read the same way rather than failing the load.
+- `/v1/objects` returns the whole ID set in a different order on every call, so the service sorts each list ascending into an `Int32Array` and slices every page from it. That gives a stable order across pages and no depth limit.
+- Sorted lists are cached per `departmentId` + `updatedSince` for one hour, bounded to 16 MiB of retained `Int32Array` bytes with least-recently-used eviction. A list larger than the whole bound is returned but not retained.
+- Concurrent callers of one filter set share one in-flight load. The load runs under its own `MET_CALL_DEADLINE_MS` budget and a signal no caller owns, so a caller that cancels or runs out of budget ends alone while the load finishes for the rest. A failed load fails every waiting caller and is not cached. A caller whose signal has already aborted starts no load, so every load has a caller attached and none can reject unobserved.
+- One call deadline (Decision #18) covers both the department lookup and the list request.
+
+---
+
 ### `met_get_object`
 
-**Purpose:** Fetch full records for one or more object IDs. Batch-fetches up to 20 at a time with concurrency limiting and partial-success — the intended follow-on to `met_search_collections`.
+**Purpose:** Fetch full records for one or more object IDs. Batch-fetches up to 20 at a time with concurrency limiting and partial-success — the intended follow-on to `met_search_collections` and `met_list_objects`.
 
 **Upstream endpoint:** `GET /v1/objects/{id}` (per ID)
 
@@ -185,7 +296,7 @@ errors: [
 ```ts
 z.object({
   objectIDs: z.array(z.number().int().positive()).min(1).max(20)
-    .describe('One or more Met object IDs to fetch. Maximum 20 per call. IDs come from met_search_collections. Fetches run in parallel (concurrency-limited); partial failures are reported per ID rather than failing the whole batch.'),
+    .describe('One or more Met object IDs to fetch. Maximum 20 per call. IDs come from met_search_collections or met_list_objects. Fetches run in parallel (concurrency-limited); partial failures are reported per ID rather than failing the whole batch.'),
 })
 ```
 
@@ -227,9 +338,9 @@ z.object({
     artistNationality: z.string()
       .describe('Artist\'s nationality (e.g., "Dutch", "French"). Empty for anonymous works.'),
     artistBeginDate: z.string()
-      .describe('Artist birth year as a string (e.g., "1853"). Empty for anonymous works.'),
+      .describe('Artist birth year, or a firm\'s founding year, as a string (e.g., "1853"). Occasionally a full date (e.g., "1928-01-10"). Empty for anonymous works.'),
     artistEndDate: z.string()
-      .describe('Artist death year as a string. Empty for living or anonymous.'),
+      .describe('Artist death year, or a firm\'s closing year, as a string (e.g., "1890"). Occasionally a full date (e.g., "1928-01-10"). Empty for a living artist, a firm still active, or an anonymous work.'),
     constituents: z.array(z.object({
       constituentID: z.number().int()
         .describe('Constituent identifier for cross-referencing.'),
@@ -340,10 +451,32 @@ enrichment: {
 ```ts
 errors: [
   {
+    reason: 'all_not_found',
+    code: JsonRpcErrorCode.NotFound,
+    when: 'Every requested objectID returned a 404 — all IDs are stale or invalid.',
+    recovery: 'Verify the IDs with met_search_collections — they may be stale search-index entries.',
+    severity: 'notice',
+  },
+  {
     reason: 'all_failed',
     code: JsonRpcErrorCode.ServiceUnavailable,
-    when: 'Every requested objectID failed (network errors, API downtime)',
+    when: 'Every requested objectID failed due to network errors or API downtime.',
     recovery: 'Retry after a brief delay. If one ID fails repeatedly, verify it with met_search_collections.',
+  },
+  {
+    reason: 'upstream_blocked',
+    code: JsonRpcErrorCode.ServiceUnavailable,
+    retryable: false,
+    // Raised by the handler with ctx.fail once the batch fetched nothing — Decision #19
+    when: "No object was fetched and the Met API's firewall refused requests with HTTP 403 — it blocks this server's address, not one object.",
+    recovery: 'Wait several minutes before retrying, and send fewer requests.',
+  },
+  {
+    reason: 'retry_deadline_exceeded',
+    code: JsonRpcErrorCode.Timeout,
+    // Raised by the handler with ctx.fail — Decision #18
+    when: "No object was fetched and every fetch ran out of the call's time budget, retries and backoff included — an ID whose fetch would have started after the budget was spent counts too.",
+    recovery: "The call's time budget ran out before the Met API returned a successful response, retries included. Retry after a short wait; if it keeps happening, the Met API is likely down or overloaded.",
   },
 ]
 ```
@@ -351,26 +484,29 @@ errors: [
 **Annotations:** `{ readOnlyHint: true, idempotentHint: true }`
 
 **Implementation notes:**
-- Use `Promise.allSettled` over all IDs (not `Promise.all`) so one 404 doesn't fail the batch.
-- Apply a concurrency pool (default 5, configurable via `MET_BATCH_CONCURRENCY`) to avoid hammering the API.
+- A fixed pool of workers (default 5, configurable via `MET_BATCH_CONCURRENCY`) drains the IDs; each fetch runs in its own `try`/`catch`, so one 404 or failed fetch becomes that ID's outcome instead of failing the batch.
 - A 404 from the API returns `{"message":"ObjectID not found"}` with HTTP 404 — classify as a per-item failure in `failed[]`, not a tool-level throw.
 - Non-public-domain objects (`isPublicDomain: false`) return empty strings for `primaryImage`, `primaryImageSmall`, and `additionalImages` — normalize and derive `hasCC0Image: Boolean(primaryImage)`.
 - `constituents` and `tags` are `null` on the wire for anonymous/untagged objects — pass through as nullable; don't coerce to `[]`.
-- Inside a populated `tags[]`, `AAT_URL` and `Wikidata_URL` are themselves nullable on the wire (a term with no Getty/Wikidata record) — normalize each item's URLs to `''`, matching every other absent string. `constituents[]` sub-fields send `''` and need no per-item guard.
+- Inside a populated `tags[]`, `AAT_URL` and `Wikidata_URL` are themselves nullable on the wire (a term with no Getty/Wikidata record) — normalize each item's URLs to `''`, matching every other absent string. `constituents[]` sub-fields send `''` and need no per-item guard, but `name` alone arrives entity-encoded (`Tiffany &amp; Co.` on object `20121`, whose `artistDisplayName` reads `Tiffany & Co.`; `World&#39;s Views Series` on `288322`). Each item's `name` is decoded with `decodeHtmlEntities` (`src/utils/html-entities.ts`): one left-to-right pass over the five predefined names and decimal/hex numeric references, refusing U+0000, control characters, surrogates, and code points past U+10FFFF; everything else stays literal. `escapeMarkdown` escapes the decoded text again in `content[]`.
 - `objectBeginDate`/`objectEndDate` are `0`/`0` when the Met has no machine-readable date. The Met's date model skips year zero (object `250240` encodes "1st century BCE" as `-100` to `-1`), so zero is never a real year and is free to carry the sentinel. Normalize that pair to `null`/`null` and render `objectDate` alone in `content[]`; a single zero bound is left as sent.
+- `artistEndDate` carries `9999` for a maker still living or active (object `20121`, "1837–present") and occasionally another future year (object `79199`, `2112`). No death or closing year lies in the future, so a bare integer later than the current UTC year normalizes to `''`, the field's documented empty value; a year up to the current one and a full date (`2005-08-01`) pass through. `artistBeginDate` is left as sent. `content[]` renders a range with one bound open (`1837–`, `–1890`) and `—` only when both are empty.
+- Free-text fields can carry raw `<i>…</i>` pairs marking foreign terms (object `21814`'s title: `Sword guard (<i>Tsuba</i>) …`). The exact `<i>` and `</i>` tokens, either case, are removed from every free-text string of the record — URL-shaped fields, `accessionNumber`, `GalleryNumber`, and the artist date bounds excepted. Both surfaces are plain text and Markdown, never HTML, so this is presentation cleanup, not sanitization: any other `<` text stays literal and is escaped at render, and a value with no token is unchanged. For `constituents[].name` the entity decode runs first: the name arrives encoded as a whole, markup included, so its `<i>` pair reaches the server as `&lt;i&gt;` and is stripped once decoded.
 - Upstream catalog text is escaped at the `content[]` render boundary (`escapeMarkdown`, `src/utils/markdown.ts`) — real titles carry complete Markdown sequences. `structuredContent` keeps the raw value.
 - The nine URL-shaped fields (`objectURL`, `primaryImage`, `primaryImageSmall`, `additionalImages[]`, `objectWikidata_URL`, `tags[].AAT_URL`, `tags[].Wikidata_URL`, `constituents[].constituentULAN_URL`, `constituents[].constituentWikidata_URL`) are free catalog text, not identifiers — object `288322` sends `(not assigned)` in a constituent's ULAN field. Validate each with `isHttpUrl` before rendering: an `http`/`https` value becomes a link destination unescaped, anything else renders through the prose escaper. Escaping a destination is not an option — a backslash inside one breaks the link.
 - The nine findspot fields beyond `country`/`region` ship as a nested `geography` block, each defaulting to `''` when absent (see Decision #7). `country` and `region` stay top-level and are not duplicated into the block.
 - `measurements` is `null` on the wire when the Met records none — pass through as nullable like `tags`/`constituents`. Within a populated array, `elementDescription` is itself nullable on the wire (object `544683`'s `Overall` element) and normalizes to `''`; `elementMeasurements` is an open `Record<string, number>` because sibling elements of one record carry different axis keys, and its keys are upstream text, so `format()` escapes them alongside the element name and description.
 - The records a single call returns are bounded by a cumulative budget on serialized `structuredContent` bytes (see Decision #12). The budget is spent in request order and admits whole records only; anything that does not fit is reported in `deferred[]` with its size, never truncated or dropped. `content[]` re-renders the admitted records, so the delivered response is roughly twice the budget — the disclosure states this rather than leaving the number to read as a response cap.
 - `objectIDs` is de-duplicated before fetching, first occurrence keeping its position (see Decision #13), so a repeated ID is fetched once, charged to the budget once, and appears in exactly one of `objects[]`/`failed[]`/`deferred[]`.
+- Every fetch in a call shares one `MET_CALL_DEADLINE_MS` budget (Decision #18). An ID whose fetch runs out of it, or starts after it is spent, lands in `failed[]`; when that is every ID, the call throws `retry_deadline_exceeded`. A caller cancellation ends the call as cancelled rather than as a partial success.
+- A `failed[]` entry is the failure's message and its recovery, with one period between them. An `upstream_blocked` entry carries that reason's recovery instead of "Retry after a brief delay", and once one ID is blocked the IDs not yet started fail with it and send no request (Decision #19).
 - `GalleryNumber` is `""` (not null) when off display — preserve as-is; an empty string is meaningful ("not on display").
 
 ---
 
 ### `met_list_departments`
 
-**Purpose:** Return the 19 curatorial departments with their numeric IDs and display names. Use to discover valid `departmentId` values before calling `met_search_collections`.
+**Purpose:** Return the 19 curatorial departments with their numeric IDs and display names. Use to discover valid `departmentId` values before calling `met_search_collections` or `met_list_objects`.
 
 **Upstream endpoint:** `GET /v1/departments`
 
@@ -382,14 +518,34 @@ errors: [
 z.object({
   departments: z.array(z.object({
     departmentId: z.number().int()
-      .describe('Numeric department ID for use in met_search_collections departmentId parameter.'),
+      .describe('Numeric department ID for the departmentId parameter of met_search_collections and met_list_objects.'),
     displayName: z.string()
       .describe('Human-readable department name (e.g., "European Paintings", "Egyptian Art", "Arms and Armor").'),
   })).describe('All 19 curatorial departments at The Metropolitan Museum of Art.'),
 })
 ```
 
-**Error contract:** No domain failures — the endpoint is static data; infrastructure errors bubble as `ServiceUnavailable`.
+**Error contract:** No domain failures — the endpoint is static data. Two infrastructure failures are declared, so each carries its recovery; the rest bubble as `ServiceUnavailable`.
+
+```ts
+errors: [
+  {
+    reason: 'upstream_blocked',
+    code: JsonRpcErrorCode.ServiceUnavailable,
+    retryable: false,
+    thrownBy: 'service', // Decision #19
+    when: "The Met API's firewall refused the request with HTTP 403 — it blocks this server's address, not one endpoint.",
+    recovery: 'Wait several minutes before retrying, and send fewer requests.',
+  },
+  {
+    reason: 'retry_deadline_exceeded',
+    code: JsonRpcErrorCode.Timeout,
+    thrownBy: 'service', // Decision #18
+    when: "The call's time budget ran out, retries and backoff included, before the Met API returned a successful response.",
+    recovery: "The call's time budget ran out before the Met API returned a successful response, retries included. Retry after a short wait; if it keeps happening, the Met API is likely down or overloaded.",
+  },
+]
+```
 
 **Annotations:** `{ readOnlyHint: true, idempotentHint: true }`
 
@@ -428,9 +584,9 @@ Note: ID 20 does not exist — the sequence is not contiguous.
 | Noun | Operations | API Endpoint | Tool |
 |:-----|:-----------|:-------------|:-----|
 | Object | search by keyword + filters | `GET /v1.1/search` | `met_search_collections` |
+| Object | list IDs by department and/or update date | `GET /v1/objects` with `departmentIds` and `metadataDate` (inclusive: a record updated on that day is listed, verified live) | `met_list_objects` |
 | Object | fetch by ID (single or batch) | `GET /v1/objects/{id}` | `met_get_object` |
 | Department | list all | `GET /v1/departments` | `met_list_departments` |
-| Object corpus | enumerate all IDs | `GET /v1/objects` | — (excluded; see Decisions Log) |
 
 ---
 
@@ -438,13 +594,15 @@ Note: ID 20 does not exist — the sequence is not contiguous.
 
 **Common chain:** `met_list_departments` (once, to get ID) → `met_search_collections` (get IDs) → `met_get_object` (get records)
 
+**Browse chain:** `met_list_departments` → `met_list_objects` (IDs by department and/or update date) → `met_get_object`
+
 The object fetch is the only multi-upstream-call tool. For a batch of N IDs:
 
 | # | Call | Purpose | Concurrency |
 |:--|:-----|:--------|:------------|
 | 1…N | `GET /v1/objects/{id}` | Fetch full record per ID | Up to `MET_BATCH_CONCURRENCY` in parallel |
 
-`Promise.allSettled` collects all results. Successes → `objects[]`. 404s and network errors → `failed[]`. If `failed` is non-empty but `objects` has results, return partial success. If all fail, throw `all_failed`.
+A fixed pool of workers drains the IDs, each result written at its input position. Successes → `objects[]`. 404s, network errors, a spent call budget, and a firewall block → `failed[]`. If `failed` is non-empty but `objects` has results, return partial success. If nothing was fetched, throw, first match winning: `all_not_found` when every ID was a 404, `upstream_blocked` when any fetch met the firewall block, `retry_deadline_exceeded` when every ID ran out of the call's budget, and `all_failed` otherwise.
 
 ---
 
@@ -490,13 +648,15 @@ The Met API documents `title=true` as a flag that restricts keyword matching to 
 
 ### 5. Batch input on `met_get_object` (max 20)
 
-The API has no batch endpoint — each object ID requires its own HTTP GET. The search-returns-IDs-only design of the Met API makes serial fetching impractical (a 20-result search would take 20 serial round trips). Batch input with `Promise.allSettled` and a concurrency gate solves this cleanly. Max 20 per call is a practical cap: 20 × ~150ms = ~3s worst case at concurrency 1, or ~600ms at concurrency 5. Larger batches should be multiple tool calls.
+The API has no batch endpoint — each object ID requires its own HTTP GET. The search-returns-IDs-only design of the Met API makes serial fetching impractical (a 20-result search would take 20 serial round trips). Batch input drained by a fixed pool of workers, each recording its ID's outcome, solves this cleanly. Max 20 per call is a practical cap: 20 × ~150ms = ~3s worst case at concurrency 1, or ~600ms at concurrency 5. Larger batches should be multiple tool calls.
 
 The cap bounds *latency*, not response size — a record's cost is driven by its `constituents`/`tags`/`additionalImages`/`measurements` counts, so three composite objects can cost more than twenty sparse ones. Response size is bounded separately (Decision #12); the input cap stays at 20.
 
 ### 6. Exclude `/objects` (full corpus enumeration) from the tool surface
 
 The endpoint returns every object ID (502,828 on 2026-09-24). There is no practical agent workflow that needs to enumerate the full collection — it's too large to consume and produces no useful output on its own. Search + department filtering covers all real use cases. The `/objects?departmentIds=&metadataDate=` variant (filtering by department and update date) is marginally useful but also excluded — an agent wanting "all Egyptian Art objects" should use `met_search_collections` with `departmentId=10`.
+
+**Reversed (2026-09-30).** Search moved to `/v1.1` (Decision #15), which pages only the first 10,000 matches of a search, needs a keyword, and cannot filter by update date. `/objects` answers the questions search can't: every object in a department, and every record created or revised since a date. `met_list_objects` exposes it with one `departmentIds` value and `metadataDate`; with neither filter it lists the whole collection, paged with no depth limit.
 
 ### 7. Geography fields are department-stratified, not universally empty — expose them as a nested block
 
@@ -589,9 +749,23 @@ The Met deprecated `GET /v1/search` on 2026-09-04 and retires it on 2026-10-01. 
 
 A zero result has two causes a caller fixes differently: the keyword matches nothing, or the filters removed every match. A hint keyed on which inputs were set misfires on the first cause — it tells the caller to fix a valid filter.
 
-**Decision.** When a filtered search returns `total: 0`, the handler issues one extra `/v1.1/search?q=…&limit=1` request and reads the keyword-only `total`. Zero → a keyword hint naming no filter. Positive → a hint naming every filter the call set, in one sentence, so one retry clears it; `medium` adds its correction (case-sensitive classification as the Met spells it, not a material; Decision #2). If the extra request fails, the hint names the filters used — the caller did set them — and the call still returns `no_results`; a caller abort during it is not such a failure and ends the call as cancelled. An unfiltered zero needs no extra request. The extra request is one attempt, not a retry ladder: it only words a hint for an answer that is already a miss. `data.reason` stays `no_results`; `ctx.recoveryFor` cannot branch on input, so the hint is built at the throw site and the declared `recovery` is its static summary.
+**Decision.** When a filtered search returns `total: 0`, the handler issues one extra `/v1.1/search?q=…&limit=1` request and reads the keyword-only `total`. Zero → a keyword hint naming no filter. Positive → a hint naming every filter the call set, in one sentence, so one retry clears it; `medium` adds its correction (case-sensitive classification as the Met spells it, not a material; Decision #2). If the extra request fails, the hint names the filters used — the caller did set them — and the call still returns `no_results`; a caller abort during it is not such a failure and ends the call as cancelled. An unfiltered zero needs no extra request. The extra request is one attempt, not a retry ladder: it only words a hint for an answer that is already a miss. `data.reason` stays `no_results`; the declared recovery cannot branch on input, so the hint is built at the throw site and the declared `recovery` is its static summary.
 
 **Reverses** the `isPublicDomain` recovery branch (issue #20): the filter is gone (Decision #3), and a branch keyed on the input alone fired even when the keyword itself matched nothing. Validating `medium` against a classification list up front was rejected: the Met exposes no classification endpoint, and a hardcoded list would go stale and reject values that work.
+
+### 18. One wall-clock budget per tool call
+
+Each `MetService` retry ladder makes 4 attempts at `MET_REQUEST_TIMEOUT_MS` plus 5.25–8.75 s of backoff, so an upstream that stops answering costs about 47 s per ladder, and `met_get_object` runs one ladder per ID in waves of `MET_BATCH_CONCURRENCY`. MCP TypeScript SDK clients time a request out at 60 s by default, so a hung upstream reached the caller as an opaque transport timeout instead of the server's classified error.
+
+**Decision.** A tool call fixes one deadline, `MET_CALL_DEADLINE_MS` (default 30,000 ms) from its start, and every service method takes it as a required argument. Each ladder hands `withRetry` the time left as its `deadlineMs`, and each attempt's request timeout is capped by it. Expiry is `Timeout` (`-32004`) with `data.reason: 'retry_deadline_exceeded'`. A ladder that starts with the budget spent fails the same way without a request. `met_search_collections`, `met_list_objects`, and `met_list_departments` declare the reason (`thrownBy: 'service'`), so the expiry reaches their callers with a recovery hint. In `met_get_object` it lands the ID in `failed[]`. When nothing was fetched and every failure is the expiry — an ID whose fetch never started included — the handler throws one batch-level `retry_deadline_exceeded` with the same recovery, after the `all_not_found` and `upstream_blocked` checks: N copies of one spent budget are one timeout, not N upstream faults, so the caller gets the `Timeout` code and the budget's recovery rather than `all_failed`'s advice to verify the IDs. A 404 or an upstream error beside the expiries keeps the batch `all_failed`. The recovery says the budget ran out before a successful response, not that the API did not answer: a ladder of fast 5xx answers spends a short budget too. The keyword-only count stays one attempt, capped the same way and skipped when nothing is left. The default is half the SDK's 60 s and above the ~9 s a fast-failing ladder (an upstream 503) needs, so a fast failure still surfaces as the upstream error. The argument is required rather than defaulted: a default would quietly bring back per-ladder budgets.
+
+Rejected: a budget per ladder, which stacks per wave (a 20-ID batch waits `ceil(20 / MET_BATCH_CONCURRENCY) ×` the budget); and a lower `maxRetries`, which bounds attempts, not time, and drops retries that succeed after a transient blip. A caller cancellation stays a cancellation: `met_get_object`'s per-ID catch rethrows once the call's signal has aborted, so a cancelled batch never returns as a partial success.
+
+### 19. A 403 from the Met API is a firewall block, not a failed request
+
+The Collection API takes no credentials, so a 403 is its firewall refusing this server's address. A burst of about 22 requests in 3 minutes drew a 403 HTML block page on every endpoint for about 20 minutes, far below the documented 80 requests per second. The trigger is undetermined. Passing the 403 through told `met_get_object` callers to "retry after a brief delay", which cannot succeed.
+
+**Decision.** `MetService` classifies an HTTP 403 as `upstream_blocked` (`ServiceUnavailable`, `retryable: false`, so `withRetry` never retries it), with a message naming the firewall and no block page in `data`. Every tool declares it with one recovery: wait several minutes, and send fewer requests. It makes no claim that retrying extends the block, which is unmeasured. In `met_get_object`, a blocked ID's `failed[]` entry carries that recovery. Once any ID is blocked, the IDs not yet started fail with the same reason and send no request, since the block covers the server's address and the remaining requests could only add traffic. A batch that fetched nothing throws `upstream_blocked` when any failure was the block, after the `all_not_found` check.
 
 ---
 
@@ -605,6 +779,7 @@ A zero result has two causes a caller fixes differently: the keyword matches not
 - **No public-domain search filter** — `/v1.1/search` ignores `isPublicDomain`. CC0 status is read per object from `isPublicDomain`/`hasCC0Image` on `met_get_object`; `hasImages=true` is the nearest search narrowing and includes copyrighted works.
 - **Non-public-domain objects have no image URLs** — the Met restricts images for works still under copyright. `primaryImage` and `primaryImageSmall` are empty strings; agents cannot display images for these works.
 - **An unknown or blank filter value widens the search upstream** — `/v1.1/search` ignores it and answers unfiltered, which is why `departmentId` is validated and blank values are rejected before any request (Decisions Log #3a).
+- **Object-ID lists are cached for an hour** — `met_list_objects` serves each filter set's list from a cache for up to an hour, so a record created or revised very recently may not appear yet.
 
 ---
 
@@ -617,13 +792,20 @@ A zero result has two causes a caller fixes differently: the keyword matches not
 | Endpoint | Method | Purpose |
 |:---------|:-------|:--------|
 | `/v1.1/search` | GET | Search — one `offset`/`limit` page, returns `{ total, objectIDs }` |
+| `/v1/objects` | GET | Every object ID matching `departmentIds` / `metadataDate` (every public object with neither), returns `{ total, objectIDs }` |
 | `/v1/objects/{id}` | GET | Single object record |
 | `/v1/departments` | GET | Static list of departments |
 
+**`/v1/objects`:**
+- Returns the whole matching ID set in one response, with no paging — 3.4 MB of JSON for the whole collection.
+- Answers an empty result as `objectIDs: []`, not `null`, and `total` equals the array's length.
+- The order differs on every call, so the server sorts the list before paging it.
+
 **Error responses:**
 - 404: `{ "message": "ObjectID not found" }` — object does not exist
+- 403 with an HTML block page — the Met's firewall refusing this server's address, on every endpoint, for minutes at a time (Decision #19)
 - 200 with `{ total, objectIDs: null }` — an empty search page: zero matches, or an `offset` at or past the reachable window (not an HTTP error)
 
-**No rate limit published.** The API is run by the Met as a public service. Treat it with reasonable care: no more than 5 parallel requests (handled by `MET_BATCH_CONCURRENCY`).
+**Rate limit.** The documented limit is 80 requests per second, but the firewall has blocked a burst far below it (Decision #19). Treat the API with care: no more than 5 parallel requests (handled by `MET_BATCH_CONCURRENCY`).
 
 **No auth.** No API key. No OAuth. Plain HTTPS GET.
