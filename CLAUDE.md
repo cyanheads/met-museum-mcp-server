@@ -2,9 +2,9 @@
 
 **Server:** met-museum-mcp-server
 **Version:** 0.6.0
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.6`
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.10`
 **Engines:** Bun ≥1.4.0, Node ≥24.0.0
-**MCP SDK:** `@modelcontextprotocol/server` ^2.0.0
+**MCP SDK:** `@modelcontextprotocol/server` ^2.1.0
 **Zod:** ^4.6.5
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
@@ -72,6 +72,7 @@ import { parseEnvConfig } from '@cyanheads/mcp-ts-core/config';
 const ServerConfigSchema = z.object({
   baseUrl: z.string().url().default('https://collectionapi.metmuseum.org/public/collection'),
   requestTimeoutMs: z.coerce.number().int().positive().default(10_000),
+  callDeadlineMs: z.coerce.number().int().positive().default(30_000),
   batchConcurrency: z.coerce.number().int().min(1).max(20).default(5),
 });
 
@@ -80,6 +81,7 @@ export function getServerConfig() {
   _config ??= parseEnvConfig(ServerConfigSchema, {
     baseUrl: 'MET_BASE_URL',
     requestTimeoutMs: 'MET_REQUEST_TIMEOUT_MS',
+    callDeadlineMs: 'MET_CALL_DEADLINE_MS',
     batchConcurrency: 'MET_BATCH_CONCURRENCY',
   });
   return _config;
@@ -90,9 +92,11 @@ export function getServerConfig() {
 
 For env booleans use `z.stringbool()`, never `z.coerce.boolean()` — `Boolean("false")` is `true`, so a coerced flag can't be disabled through the environment. `z.stringbool()` parses `true/false/1/0/yes/no/on/off` and rejects anything else, so `=false` actually disables.
 
-### Server instructions
+### Server identity and instructions
 
-`createApp({ instructions })` — optional server-level orientation, sent to clients on every `initialize` as session-level context. Use it for deployment guidance (connection aliases, regional notes, scope hints) instead of repeating the same context across tool descriptions. Client adoption is uneven, but there's no downside when set.
+`createApp()` accepts optional identity fields — `title`, `websiteUrl`, `description`, `icons` — forwarded to the SDK's `initialize` response and the server manifest (`/.well-known/mcp.json`). This server sets `name` and `title` to the repo name.
+
+`instructions` is optional server-level orientation, sent to clients on every `initialize` as session-level context. Use it for deployment guidance (connection aliases, regional notes, scope hints) instead of repeating the same context across tool descriptions. Client adoption is uneven, but there's no downside when set.
 
 ### Session posture and shutdown
 
@@ -120,7 +124,7 @@ Handlers receive a unified `ctx` object. Key properties:
 |:---------|:------------|
 | `ctx.log` | Request-scoped logger for Met API operations. Auto-correlates request, trace, and tenant metadata; its notifications can be client-visible. |
 | `ctx.signal` | `AbortSignal` passed to every Met API request so caller cancellation stops upstream work. |
-| `ctx.recoveryFor` | Recovery metadata from a tool's declared error contract, used when search and batch-object errors are returned to the caller. |
+| `ctx.fail` | Throws a failure from the tool's declared `errors[]` contract; the framework fills that entry's `recovery` hint onto search and batch-object errors returned to the caller. |
 
 ---
 
@@ -128,7 +132,7 @@ Handlers receive a unified `ctx` object. Key properties:
 
 Handlers throw — the framework catches, classifies, and formats.
 
-**Recommended: typed error contract.** Declare `errors: [{ reason, code, when, recovery, retryable?, severity?, thrownBy? }]` on `tool()` / `resource()` to receive `ctx.fail(reason, …)` typed against the reason union. TypeScript catches typos at compile time, `data.reason` is auto-populated for observability, linter enforces conformance against the handler body. `recovery` is required (≥ 5 words, lint-validated) — the single source of truth for the agent's next move. Pass `ctx.recoveryFor('reason')` as the throw's data to put it on the wire (`data.recovery.hint`, mirrored into `content[]` text unless the message already contains it verbatim); override with an explicit `{ recovery: { hint: '...' } }` when dynamic runtime context matters. Forwarding it is lint-enforced per throw site (`error-contract-recovery-unforwarded`). Mark an entry the service layer throws with `thrownBy: 'service'` so `error-contract-unthrown` skips it — lint-only metadata, nothing at runtime reads it. Baseline codes (`InternalError`, `ServiceUnavailable`, `Timeout`, `ValidationError`, `SerializationError`, `RequestCancelled`) bubble freely and don't need declaring.
+**Recommended: typed error contract.** Declare `errors: [{ reason, code, when, recovery, retryable?, severity?, thrownBy? }]` on `tool()` / `resource()` to receive `ctx.fail(reason, …)` typed against the reason union. TypeScript catches typos at compile time, `data.reason` is auto-populated for observability, linter enforces conformance against the handler body. `recovery` is required (≥ 5 words, lint-validated) — the single source of truth for the agent's next move. The framework puts it on the wire whenever a failure carrying that `reason` arrives without a hint — a bare `ctx.fail('reason')` or a service throw with `data: { reason }` — as `data.recovery.hint`, mirrored into `content[]` text unless the message already contains it verbatim; override with an explicit `{ recovery: { hint: '...' } }` when dynamic runtime context matters. Every error envelope also carries `data.requestId`, the id the server's log records for that call carry, and `content[]` closes with `(reason … · request <id>)`. Mark an entry the service layer throws with `thrownBy: 'service'` so `error-contract-unthrown` skips it — lint-only metadata, nothing at runtime reads it. Baseline codes (`InternalError`, `ServiceUnavailable`, `Timeout`, `ValidationError`, `SerializationError`, `RequestCancelled`) bubble freely and don't need declaring.
 
 ```ts
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
@@ -140,7 +144,7 @@ errors: [
 ],
 async handler(input, ctx) {
   const item = await db.find(input.id);
-  if (!item) throw ctx.fail('no_match', `No item ${input.id}`, ctx.recoveryFor('no_match'));
+  if (!item) throw ctx.fail('no_match', `No item ${input.id}`);
   return item;
 }
 ```
@@ -183,6 +187,7 @@ src/
     tools/definitions/
       met-list-departments.tool.ts      # met_list_departments
       met-search-collections.tool.ts    # met_search_collections
+      met-list-objects.tool.ts          # met_list_objects
       met-get-object.tool.ts            # met_get_object
 ```
 
@@ -221,16 +226,15 @@ Available skills:
 | `tool-defs-analysis` | Read-only audit of MCP definition language across the surface — voice, leaks, defaults, recovery hints, output descriptions |
 | `security-pass` | Audit server for MCP-flavored security gaps: output injection, scope blast radius, input sinks, tenant isolation |
 | `code-simplifier` | Post-session cleanup against `git diff` — modernize syntax, consolidate duplication, align with the codebase |
-| `devcheck` | Lint, format, typecheck, audit |
 | `polish-docs-meta` | Finalize docs, README, metadata, and agent protocol for shipping |
 | `git-wrapup` | Land working-tree changes as a commit stack — version bump, changelog, verify, commit by concern, release commit on top. No tag, no push to main; opens the release PR when the project declares release PR mode |
 | `release-pr-review` | Review pass on an open release PR — simplifier + correctness review, fixes as ordinary commits on top of the stack, PR body kept in sync. Release PR mode only |
 | `release-and-publish` | Fast-forward merge (release PR mode) + tag + push + npm + MCP Registry + GH Release + Docker. Picks up from `git-wrapup` |
 | `maintenance` | Investigate changelogs, adopt upstream changes, sync skills to agent dirs |
 | `orchestrations` | Chain task skills into a gated multi-phase pipeline — build-out, QA-fix, update-ship — when you can spawn sub-agents |
-| `techniques` | Catalog of reusable response/data-shaping patterns (outline-on-overflow, etc.) |
 | `report-issue-framework` | File a bug or feature request against `@cyanheads/mcp-ts-core` via `gh` CLI |
 | `report-issue-local` | File a bug or feature request against this server's own repo via `gh` CLI |
+| `techniques` | Catalog of response/data-shaping techniques — overflow handling, payload shaping, retrieval patterns |
 | `api-auth` | Auth modes, scopes, JWT/OAuth |
 | `api-canvas` | DataCanvas: register tabular data, run SQL, export, plus the `spillover()` helper for big result sets — Tier 3 opt-in |
 | `api-config` | AppConfig, parseConfig, env vars |
@@ -243,6 +247,8 @@ Available skills:
 | `api-utils` | Formatting, parsing, security, pagination, scheduling, telemetry helpers |
 | `api-telemetry` | OTel catalog: spans, metrics, completion logs, env config, cardinality rules |
 | `api-workers` | Cloudflare Workers runtime |
+
+**Chaining skills into pipelines.** When the user wants a multi-phase effort — build this server out, QA-and-fix the surface, update-and-ship — *and you can spawn sub-agents*, `framework-skills/orchestrations/SKILL.md` sequences the task skills above into a gated pipeline with verification at each step. Read it to drive the run. Optional: skip it if you can't orchestrate sub-agents, and ignore it entirely if you were *spawned* as one — you've already been scoped to a single phase.
 
 When you complete a skill's checklist, check the boxes and add a completion timestamp at the end (e.g., `Completed: 2026-03-11`).
 
