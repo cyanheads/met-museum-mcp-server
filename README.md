@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.7.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/met-museum-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.1.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/met-museum-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/met-museum-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.2%2B-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.7.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/met-museum-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.2.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/met-museum-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/met-museum-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.2%2B-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -36,9 +36,9 @@ The Metropolitan Museum of Art's public Collection API. Search the collection by
 | Tool | Description |
 |:---|:---|
 | `met_list_departments` | Return all 19 curatorial departments with their numeric IDs and display names |
-| `met_search_collections` | Search the collection by keyword with filters for department, date range, medium, geography, image availability, on-view status, and highlight designation |
+| `met_search_collections` | Search the collection by keyword, optionally matched in titles or tags only, with filters for department, date range, medium, geography, image availability, on-view status, and highlight designation |
 | `met_list_objects` | List every object ID in a department, every object created or revised since a date, or both, without a keyword |
-| `met_get_object` | Fetch full records for one or more object IDs — metadata, provenance, artist info, CC0 image URLs, tags, and Wikidata links |
+| `met_get_object` | Fetch full records for one or more object IDs — metadata, provenance, artist info, CC0 image URLs, tags, and Wikidata links — optionally with up to 3 CC0 images as image content |
 
 ## Capability reference
 
@@ -46,22 +46,24 @@ The Metropolitan Museum of Art's public Collection API. Search the collection by
 
 - No input; returns all 19 curatorial departments, each a numeric `departmentId` with its `displayName` (e.g., "Egyptian Art")
 - `departmentId` values are the valid input for the `departmentId` filter on `met_search_collections` and `met_list_objects`
-- Typed errors: `upstream_blocked` and `retry_deadline_exceeded` (the call's time budget ran out)
+- Typed errors: `upstream_blocked`, `upstream_unavailable` (the Met answered 500/502/503/504 through every retry), and `retry_deadline_exceeded` (the call's time budget ran out)
 
 ---
 
 ### `met_search_collections` <sub>tool</sub>
 
-- Keyword `q` (required) plus filters: `departmentId`, `medium` (a case-sensitive classification as the Met spells it — `"Paintings"`, not `"Oil on canvas"`), `dateBegin`/`dateEnd` (integer years, negative = BCE, set together), one `geoLocation`, `hasImages`, `isOnView`, and `isHighlight` (`true` only)
+- Keyword `q` (required), matched across all text fields unless `matchField` narrows it to `"title"` or `"tags"`. `"*"` matches every object, for a search by filters alone; an accession number from a label ranks its object first. Plus filters: `departmentId`, `medium` (a case-sensitive classification as the Met spells it — `"Paintings"`, not `"Oil on canvas"`), `dateBegin`/`dateEnd` (integer years, negative = BCE, set together), one `geoLocation`, `hasImages`, `isOnView`, and `isHighlight` (`true` only)
+- `departmentId` 7 (The Cloisters) and 17 (Medieval Art) share one search result set at the Met: each page keeps only the requested department's IDs, while `total` and paging count both, so a page can hold fewer than `limit` IDs; a `notice` says so, and `met_list_objects` gives exact department membership
 - Up to 500 IDs per page (default 20), paged by `offset` / `nextOffset` through the first 10,000 matches only; `total` still reports the full count, with a `notice` when it exceeds 10,000
-- Typed errors: `no_results` (its recovery names the filters that removed every match), `invalid_date_range`, `invalid_filter` (a blank `q`, `medium`, or `geoLocation`), `invalid_department`, `upstream_blocked`, `retry_deadline_exceeded`
+- Zero matches is a result, not an error: `total: 0` with a `notice` saying whether the keyword matches nothing or the filters removed every match, and which filters to correct or drop. Every result echoes the applied query as `effectiveQuery`
+- Typed errors: `invalid_date_range`, `invalid_filter` (a blank `q`, `medium`, or `geoLocation`), `invalid_department`, `upstream_blocked`, `upstream_unavailable`, `retry_deadline_exceeded`
 
 ---
 
 ### `met_list_objects` <sub>tool</sub>
 
 - Filters `departmentId` (from `met_list_departments`) and `updatedSince` (`YYYY-MM-DD` — records created or revised on or after that day), alone or together; with neither, the whole collection (over 500,000 IDs). Up to 500 IDs per page (default 20), in ascending order, paged by `offset` / `nextOffset` with no depth limit
-- Typed errors: `invalid_department`, `invalid_date` (an impossible date such as `2026-02-30`), `upstream_blocked`, `retry_deadline_exceeded`; an empty list is a result, not an error, with a `notice` naming the filters
+- Typed errors: `invalid_department`, `invalid_date` (an impossible date such as `2026-02-30`), `upstream_blocked`, `upstream_unavailable`, `retry_deadline_exceeded`; an empty list is a result, not an error, with a `notice` naming the filters, and every result echoes the applied filters as `effectiveQuery`
 - Each list is cached for up to an hour, so a record revised within the last hour may not appear yet
 
 ---
@@ -69,8 +71,12 @@ The Metropolitan Museum of Art's public Collection API. Search the collection by
 ### `met_get_object` <sub>tool</sub>
 
 - 1–20 IDs per call, from `met_search_collections` or `met_list_objects`; a repeated ID is fetched and returned once
-- Partial success: per-ID errors land in `failed[]`, and the call fails only when every ID does — `all_not_found` when every ID was a 404, `upstream_blocked` when the Met's firewall refused a request, `retry_deadline_exceeded` when every fetch ran out of the call's time budget, and `all_failed` otherwise; records past a 60,000-byte `structuredContent` budget are listed in `deferred[]` with their sizes, to re-request
+- Partial success: per-ID errors land in `failed[]`, and the call fails only when every ID does — `all_not_found` when every ID was a 404, `upstream_blocked` when the Met's firewall refused a request, `retry_deadline_exceeded` when every fetch ran out of the call's time budget, `upstream_unavailable` when a fetch met a Met API outage, and `all_failed` otherwise; records past a 60,000-byte `structuredContent` budget are listed in `deferred[]` with their sizes, to re-request
 - `isPublicDomain` / `hasCC0Image` gate image URLs — non-public-domain objects return empty `primaryImage`, `primaryImageSmall`, and `additionalImages`; sparse fields are empty or null, never fabricated
+- `includeImages: true` attaches the CC0 web-display image (about 600 px on the long edge) of the first 3 returned records that have one, as image content after a caption naming the object, and `images[]` gives each returned record's outcome (`attached`, `no_cc0_image`, `over_cap`, `unavailable`). The bytes ride `content[]` only, so a client that passes the model only `structuredContent` won't show them
+- The Artist line carries the full attribution and role — `artistPrefix` ("Style of"), the name, `artistSuffix`, and `artistRole` ("Patron") — so a follower's work or a patron never reads as the named artist's own; `rightsAndReproduction` names the rights holder on the copyrighted works that carry one, beside `accessionYear`
+- `metadataDate` is the record's last revision, the timestamp `met_list_objects` `updatedSince` compares; `departmentId` resolves the record's department name (five differ from `met_list_departments`) to the ID `met_list_objects` and `met_search_collections` take, or `null` when the name is not recognized
+- The search index can list IDs the object endpoint no longer serves, so a 404's guidance is to drop the ID rather than search for it again
 
 ## Features
 
@@ -83,6 +89,8 @@ Met Museum-specific:
 - Parallel batch fetching with configurable concurrency for `met_get_object`
 - Linked data on every object — Getty ULAN and AAT URLs, Wikidata entity URLs for artists, tags, and works
 - A 403 from the Met's firewall surfaces on every tool as `upstream_blocked`, non-retryable: the block covers the server's address for minutes, so the recovery is to wait and send fewer requests
+- A 500, 502, 503, or 504 that outlasts the retries surfaces on every tool as `upstream_unavailable`; once every fetch in flight has failed without the Met answering any ID, `met_get_object` stops requesting the rest of the batch, so a 5xx outage costs at most `MET_BATCH_CONCURRENCY` × 4 requests (20 at the default) however many IDs were asked for
+- No error carries the Met's HTML or JSON error page — an HTTP failure reaches the caller as its code, message, and status, or, inside a `met_get_object` batch, as that ID's `failed[]` message
 
 Agent-friendly output:
 
