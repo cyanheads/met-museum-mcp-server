@@ -4,7 +4,7 @@
  */
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { z } from 'zod';
 import { metSearchCollections } from '@/mcp-server/tools/definitions/met-search-collections.tool.js';
@@ -12,11 +12,13 @@ import { metSearchCollections } from '@/mcp-server/tools/definitions/met-search-
 const mockSearch = vi.fn();
 const mockGetValidDepartmentIds = vi.fn();
 const mockCountKeywordMatches = vi.fn();
+const mockKeepDepartmentMembers = vi.fn();
 
 /**
  * The service is stubbed at its accessor; the module's constants (the search
- * window `format()` reads) stay real. The URL building, window arithmetic, and
- * no_results hint over a real service are covered in the service suite.
+ * window `format()` reads) stay real. The URL building, window arithmetic,
+ * zero-match notice, and the 7/17 department filter over a real service are
+ * covered in the service suites.
  */
 vi.mock('@/services/met/met-service.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/services/met/met-service.js')>()),
@@ -24,6 +26,7 @@ vi.mock('@/services/met/met-service.js', async (importOriginal) => ({
     search: mockSearch,
     getValidDepartmentIds: mockGetValidDepartmentIds,
     countKeywordMatches: mockCountKeywordMatches,
+    keepDepartmentMembers: mockKeepDepartmentMembers,
   }),
 }));
 
@@ -35,6 +38,24 @@ const aDeadline = () =>
 const VALID_DEPARTMENT_IDS = new Set([
   1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 21,
 ]);
+
+type ToolResult = Awaited<ReturnType<typeof runToolContract>>;
+
+/** Every text block of a tool result's `content[]`, joined — the enrichment trailer included. */
+const contentText = (result: ToolResult) =>
+  (result.content ?? [])
+    .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+    .map((block) => block.text)
+    .join('\n');
+
+/** The success-path fields of a tool result's `structuredContent`. */
+const structuredOf = (result: ToolResult) => {
+  expect(result.isError).toBeFalsy();
+  return result.structuredContent as Record<string, unknown> & {
+    effectiveQuery?: string;
+    notice?: string;
+  };
+};
 
 describe('metSearchCollections', () => {
   beforeEach(() => {
@@ -73,7 +94,7 @@ describe('metSearchCollections', () => {
     expect(result.nextOffset).toBe(3);
   });
 
-  it('throws no_results when total is 0', async () => {
+  it('returns a total of 0 as an empty success carrying the keyword notice (#44)', async () => {
     mockSearch.mockResolvedValue({
       total: 0,
       objectIDs: [],
@@ -84,12 +105,56 @@ describe('metSearchCollections', () => {
       offset: 0,
     });
 
-    const ctx = createMockContext({ errors: metSearchCollections.errors });
-    const input = metSearchCollections.input.parse({ q: 'zzznomatch', limit: 20 });
-    await expect(metSearchCollections.handler(input, ctx)).rejects.toMatchObject({
-      code: JsonRpcErrorCode.NotFound,
-      data: { reason: 'no_results' },
+    const result = await runToolContract(metSearchCollections, { q: 'zzznomatch', limit: 20 });
+
+    const notice =
+      'The keyword "zzznomatch" matches no object in the collection. Try a different, broader, or differently spelled keyword.';
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toEqual({
+      total: 0,
+      objectIDs: [],
+      returned: 0,
+      truncated: false,
+      remaining: 0,
+      nextOffset: null,
+      offset: 0,
+      notice,
+      effectiveQuery: 'q="zzznomatch"',
     });
+    const text = contentText(result);
+    expect(text).toContain('**Total matches:** 0');
+    expect(text).toContain('**Returned IDs:** 0 (complete)');
+    expect(text).toContain(`> ${notice}`);
+    expect(text).toContain('Query: q="zzznomatch"');
+    expect(text).not.toContain('no_results');
+    expect(mockCountKeywordMatches).not.toHaveBeenCalled();
+  });
+
+  it('keeps a multi-line q on one line inside the zero-match notice, the echo its own block', async () => {
+    mockSearch.mockResolvedValue({
+      total: 0,
+      objectIDs: [],
+      returned: 0,
+      truncated: false,
+      remaining: 0,
+      nextOffset: null,
+      offset: 0,
+    });
+    const q = 'a "b"\n\n# heading';
+
+    const result = await runToolContract(metSearchCollections, { q });
+
+    const notice =
+      'The keyword "a \\"b\\"\\n\\n# heading" matches no object in the collection. Try a different, broader, or differently spelled keyword.';
+    expect(structuredOf(result).notice).toBe(notice);
+    expect(result.content?.[1]).toEqual({
+      type: 'text',
+      text: `\n\n> ${notice}\n\nQuery: q=${JSON.stringify(q)}`,
+    });
+  });
+
+  it('no longer declares no_results in its error contract (#44)', () => {
+    expect(metSearchCollections.errors?.map((entry) => entry.reason)).not.toContain('no_results');
   });
 
   /**
@@ -189,7 +254,7 @@ describe('metSearchCollections', () => {
     expect(mockSearch).not.toHaveBeenCalled();
   });
 
-  it('a valid department with zero matches still returns no_results, not invalid_department', async () => {
+  it('a valid department with zero matches is an empty success, not invalid_department', async () => {
     mockSearch.mockResolvedValue({
       total: 0,
       objectIDs: [],
@@ -200,14 +265,127 @@ describe('metSearchCollections', () => {
       offset: 0,
     });
     mockCountKeywordMatches.mockResolvedValue(0);
-    const ctx = createMockContext({ errors: metSearchCollections.errors });
-    const input = metSearchCollections.input.parse({
-      q: 'zzznomatch',
-      departmentId: 11,
-      limit: 20,
+
+    const structured = structuredOf(
+      await runToolContract(metSearchCollections, { q: 'zzznomatch', departmentId: 11, limit: 20 }),
+    );
+
+    expect(structured.total).toBe(0);
+    expect(structured.notice).toBe(
+      'The keyword "zzznomatch" matches no object in the collection, even with no filter applied. Try a different, broader, or differently spelled keyword.',
+    );
+    expect(structured.effectiveQuery).toBe('q="zzznomatch", departmentId=11');
+  });
+
+  // --- #39: departments 7 and 17 share one search result set ---
+
+  describe('departments 7 and 17 (#39)', () => {
+    const combinedPage = {
+      total: 165,
+      objectIDs: [464100, 467638, 464101],
+      returned: 3,
+      truncated: true,
+      remaining: 162,
+      nextOffset: 3,
+      offset: 0,
+    };
+
+    it('narrows the page through keepDepartmentMembers under the same call deadline as the search', async () => {
+      mockSearch.mockResolvedValue(combinedPage);
+      mockKeepDepartmentMembers.mockResolvedValue([467638]);
+      const ctx = createMockContext({ errors: metSearchCollections.errors });
+      const input = metSearchCollections.input.parse({ q: 'tapestry', departmentId: 7, limit: 3 });
+
+      const result = await metSearchCollections.handler(input, ctx);
+
+      expect(mockKeepDepartmentMembers).toHaveBeenCalledExactlyOnceWith(
+        [464100, 467638, 464101],
+        7,
+        ctx,
+        aDeadline(),
+      );
+      expect(mockKeepDepartmentMembers.mock.calls[0]?.[3]).toBe(mockSearch.mock.calls[0]?.[2]);
+      expect(result).toEqual({ ...combinedPage, objectIDs: [467638], returned: 1 });
+      expect(getEnrichment(ctx).notice).toContain(
+        'departments 7 (The Cloisters) and 17 (Medieval Art)',
+      );
     });
-    await expect(Promise.resolve(metSearchCollections.handler(input, ctx))).rejects.toMatchObject({
-      data: { reason: 'no_results' },
+
+    it('returns the combined page unchanged, with the not-applied notice, when the list is unavailable', async () => {
+      mockSearch.mockResolvedValue(combinedPage);
+      mockKeepDepartmentMembers.mockResolvedValue(null);
+      const ctx = createMockContext({ errors: metSearchCollections.errors });
+      const input = metSearchCollections.input.parse({ q: 'tapestry', departmentId: 17, limit: 3 });
+
+      const result = await metSearchCollections.handler(input, ctx);
+
+      expect(result).toEqual(combinedPage);
+      expect(getEnrichment(ctx).notice).toContain(
+        "Department 17's object list could not be loaded, so the department filter was not applied",
+      );
+    });
+
+    it('carries the not-applied notice and the query echo on both surfaces when the list is unavailable', async () => {
+      mockSearch.mockResolvedValue(combinedPage);
+      mockKeepDepartmentMembers.mockResolvedValue(null);
+
+      const result = await runToolContract(metSearchCollections, {
+        q: 'tapestry',
+        departmentId: 17,
+        limit: 3,
+      });
+
+      const structured = structuredOf(result);
+      expect(structured.objectIDs).toEqual(combinedPage.objectIDs);
+      expect(structured.notice).toContain("Department 17's object list could not be loaded");
+      expect(structured.effectiveQuery).toBe('q="tapestry", departmentId=17');
+      const text = contentText(result);
+      expect(text).toContain("> The Met's search returns departments 7 (The Cloisters) and 17");
+      expect(text).toContain('Query: q="tapestry", departmentId=17');
+    });
+
+    it('never narrows another department', async () => {
+      mockSearch.mockResolvedValue(combinedPage);
+      const ctx = createMockContext({ errors: metSearchCollections.errors });
+
+      for (const departmentId of [1, 6, 8, 11, 16, 18, 21]) {
+        const input = metSearchCollections.input.parse({ q: 'tapestry', departmentId, limit: 3 });
+        expect(await metSearchCollections.handler(input, ctx)).toEqual(combinedPage);
+      }
+      expect(mockKeepDepartmentMembers).not.toHaveBeenCalled();
+    });
+
+    it('states the combined set in the departmentId description', () => {
+      const { description } = metSearchCollections.input.shape.departmentId;
+      expect(description).toContain('7 (The Cloisters) and 17 (Medieval Art)');
+      expect(description).toContain('one combined result set');
+      expect(description).toContain('total and paging count both');
+      expect(description).toContain('fewer than limit IDs while more remain');
+    });
+
+    it('defines truncated, remaining, and nextOffset by the positions read, equal to returned elsewhere', () => {
+      const { objectIDs, truncated, remaining, nextOffset } = metSearchCollections.output.shape;
+      expect(objectIDs.description).toContain('For departmentId 7 or 17');
+      expect(truncated.description).toContain(
+        'offset + the positions this page read < the smaller of total and 10,000',
+      );
+      expect(truncated.description).toContain(
+        'The positions read equal returned, except for departmentId 7 or 17',
+      );
+      expect(remaining.description).toContain('minus (offset + the positions this page read)');
+      expect(nextOffset.description).toContain('for departmentId 7 or 17 can exceed returned');
+    });
+
+    it('says in the truncated and remaining descriptions that an empty page ends paging (#46)', () => {
+      const { truncated, remaining } = metSearchCollections.output.shape;
+      expect(truncated.description).toContain('An empty page reports false');
+      expect(remaining.description).toContain('An empty page reports 0');
+    });
+
+    it('names the 7/17 case in the notice description', () => {
+      const { description } = metSearchCollections.enrichment?.notice ?? {};
+      expect(description).toContain('when departmentId is 7 or 17');
+      expect(description).toContain('several apply as one string');
     });
   });
 
@@ -281,6 +459,77 @@ describe('metSearchCollections', () => {
     expect(result.total).toBe(12);
   });
 
+  // --- #35: matchField restricts the keyword match to titles or tags ---
+
+  it.each(['title', 'tags'] as const)(
+    'passes matchField %s through to the service',
+    async (matchField) => {
+      mockSearch.mockResolvedValue({
+        total: 36,
+        objectIDs: [1, 2],
+        returned: 2,
+        truncated: true,
+        remaining: 34,
+        nextOffset: 2,
+        offset: 0,
+      });
+      const ctx = createMockContext({ errors: metSearchCollections.errors });
+      const input = metSearchCollections.input.parse({ q: 'sunflower', matchField, limit: 2 });
+      await metSearchCollections.handler(input, ctx);
+
+      expect(mockSearch).toHaveBeenCalledWith(
+        expect.objectContaining({ q: 'sunflower', matchField }),
+        ctx,
+        aDeadline(),
+      );
+    },
+  );
+
+  it('accepts only title and tags for matchField at the input schema', () => {
+    for (const value of ['artistOrCulture', true, false, 'TITLE', '']) {
+      expect(() =>
+        metSearchCollections.input.parse({ q: 'sunflower', matchField: value }),
+      ).toThrow();
+    }
+    expect(metSearchCollections.input.parse({ q: 'sunflower' }).matchField).toBeUndefined();
+  });
+
+  it('says in the matchField description that it has no effect when q is "*"', () => {
+    const { description } = metSearchCollections.input.shape.matchField;
+    expect(description).not.toContain('upstream');
+    expect(description).toContain('"title" matches object titles only');
+    expect(description).toContain('"tags" matches subject tags only');
+    expect(description).toContain('no effect when q is "*"');
+  });
+
+  it('names matchField in the q description as the way to narrow the match', () => {
+    const { description } = metSearchCollections.input.shape.q;
+    expect(description).toContain('matched across title, artist name');
+    expect(description).toContain('matchField');
+  });
+
+  // --- #43: the q description carries the "*" match-all and accession-number notes ---
+
+  it('documents "*" as match-all for a filter-only search, still within the 10,000 window', () => {
+    const { description } = metSearchCollections.input.shape.q;
+    expect(description).toContain('"*" matches every object');
+    expect(description).toContain('narrowed by filters alone');
+    expect(description).toContain('first 10,000 matches');
+  });
+
+  it('documents an accession number as ranking its object first, to confirm on met_get_object', () => {
+    const { description } = metSearchCollections.input.shape.q;
+    expect(description).toContain('accession number');
+    expect(description).toContain('near-numbered objects after it');
+    expect(description).toContain('accessionNumber on met_get_object');
+  });
+
+  it('keeps q required and non-empty — the notes change no schema', () => {
+    expect(() => metSearchCollections.input.parse({})).toThrow();
+    expect(() => metSearchCollections.input.parse({ q: '' })).toThrow();
+    expect(metSearchCollections.input.parse({ q: '*' }).q).toBe('*');
+  });
+
   it('rejects a second geoLocation value at the input schema, naming the remedy', () => {
     // The Met search applies only the first repeated value, so a second one would
     // be silently ignored — the schema refuses it instead.
@@ -328,6 +577,38 @@ describe('metSearchCollections', () => {
     expect(text).toContain('truncated');
     expect(text).toContain('Remaining:** 498');
     expect(text).toContain('Next offset:** 2');
+  });
+
+  // --- #44: a zero result is (complete) at offset 0, past the end only at a nonzero offset ---
+
+  it('format marks a zero result read from offset 0 (complete), not beyond the result set', () => {
+    const blocks = metSearchCollections.format!({
+      total: 0,
+      objectIDs: [],
+      returned: 0,
+      truncated: false,
+      remaining: 0,
+      nextOffset: null,
+      offset: 0,
+    });
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).toContain('**Returned IDs:** 0 (complete)');
+    expect(text).not.toContain('offset beyond result set');
+  });
+
+  it('format marks a zero result read from a nonzero offset (offset beyond result set)', () => {
+    const blocks = metSearchCollections.format!({
+      total: 0,
+      objectIDs: [],
+      returned: 0,
+      truncated: false,
+      remaining: 0,
+      nextOffset: null,
+      offset: 40,
+    });
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).toContain('**Returned IDs:** 0 (offset beyond result set)');
+    expect(text).not.toContain('(complete)');
   });
 
   it('format shows completion markers on the final page (not truncated, nextOffset none)', () => {
@@ -615,10 +896,10 @@ describe('metSearchCollections', () => {
     mockSearch.mockResolvedValue(emptyPage);
     const ctx = createMockContext({ errors: metSearchCollections.errors });
     const input = metSearchCollections.input.parse({ q: 'zzznomatch', limit: 20 });
-    const err = await Promise.resolve(metSearchCollections.handler(input, ctx)).catch((e) => e);
+    const result = await metSearchCollections.handler(input, ctx);
 
-    expect(err.data.reason).toBe('no_results');
-    expect(err.data.recovery.hint).toContain('"zzznomatch" matches no object');
+    expect(result.total).toBe(0);
+    expect(getEnrichment(ctx).notice).toContain('"zzznomatch" matches no object');
     expect(mockCountKeywordMatches).not.toHaveBeenCalled();
   });
 
@@ -627,14 +908,141 @@ describe('metSearchCollections', () => {
     mockCountKeywordMatches.mockResolvedValue(1);
     const ctx = createMockContext({ errors: metSearchCollections.errors });
     const input = metSearchCollections.input.parse({ q: 'sunflower', hasImages: false });
-    const err = await Promise.resolve(metSearchCollections.handler(input, ctx)).catch((e) => e);
+    await metSearchCollections.handler(input, ctx);
+    const notice = String(getEnrichment(ctx).notice);
 
     expect(mockCountKeywordMatches).toHaveBeenCalledExactlyOnceWith('sunflower', ctx, aDeadline());
     expect(mockCountKeywordMatches.mock.calls[0]?.[2]).toBe(mockSearch.mock.calls[0]?.[2]);
-    expect(err.data.recovery.hint).toContain('matches 1 object on its own');
-    expect(err.data.recovery.hint).toContain('removed every match: hasImages.');
+    expect(notice).toContain('matches 1 object on its own');
+    expect(notice).toContain('removed every match: hasImages.');
     // No medium correction when medium was not set.
-    expect(err.data.recovery.hint).not.toContain('classification');
+    expect(notice).not.toContain('classification');
+  });
+
+  it('keys the zero-match notice on total 0 alone: an empty page of a nonzero total gets none', async () => {
+    mockSearch.mockResolvedValue({ ...emptyPage, total: 178, offset: 178 });
+    const result = await runToolContract(metSearchCollections, {
+      q: 'sunflower',
+      medium: 'Paintings',
+      offset: 178,
+    });
+
+    const structured = structuredOf(result);
+    expect(structured.notice).toBeUndefined();
+    expect(contentText(result)).toContain('**Returned IDs:** 0 (offset beyond result set)');
+    expect(mockCountKeywordMatches).not.toHaveBeenCalled();
+  });
+
+  it('keeps the zero-match notice on a zero result read from a nonzero offset', async () => {
+    mockSearch.mockResolvedValue({ ...emptyPage, offset: 40 });
+    const result = await runToolContract(metSearchCollections, { q: 'zzznomatch', offset: 40 });
+
+    expect(structuredOf(result).notice).toContain('"zzznomatch" matches no object');
+    const text = contentText(result);
+    expect(text).toContain('**Returned IDs:** 0 (offset beyond result set)');
+    expect(text).toContain('> The keyword "zzznomatch" matches no object');
+  });
+
+  it('delivers one notice string per response — the window disclosure alone, with no separator', async () => {
+    mockSearch.mockResolvedValue({
+      total: 14_398,
+      objectIDs: [1, 2],
+      returned: 2,
+      truncated: true,
+      remaining: 9998,
+      nextOffset: 2,
+      offset: 0,
+    });
+    const structured = structuredOf(
+      await runToolContract(metSearchCollections, { q: 'horse', limit: 2 }),
+    );
+
+    expect(structured.notice).toBe(
+      'Only the first 10,000 of 14,398 matches are reachable by paging. Narrow the search with filters or a more specific keyword to reach the rest.',
+    );
+  });
+
+  // --- #44: every success echoes the applied query as effectiveQuery ---
+
+  describe('effectiveQuery', () => {
+    const page = {
+      total: 3,
+      objectIDs: [1, 2, 3],
+      returned: 3,
+      truncated: false,
+      remaining: 0,
+      nextOffset: null,
+      offset: 0,
+    };
+
+    it('echoes q and the filters set, in schema order, on both surfaces', async () => {
+      mockSearch.mockResolvedValue(page);
+      const result = await runToolContract(metSearchCollections, {
+        departmentId: 11,
+        q: 'sunflower',
+        medium: 'Paintings',
+      });
+
+      const echo = 'q="sunflower", medium="Paintings", departmentId=11';
+      expect(structuredOf(result).effectiveQuery).toBe(echo);
+      expect(contentText(result)).toContain(`Query: ${echo}`);
+    });
+
+    it('echoes every filter, JSON-encoded, and never limit or offset', async () => {
+      mockSearch.mockResolvedValue({ ...page, offset: 40, truncated: false });
+      const result = await runToolContract(metSearchCollections, {
+        dateEnd: 1800,
+        q: 'vase',
+        hasImages: true,
+        isHighlight: true,
+        isOnView: false,
+        medium: 'Ceramics',
+        departmentId: 11,
+        geoLocation: ['France'],
+        dateBegin: -500,
+        matchField: 'title',
+        limit: 7,
+        offset: 40,
+      });
+
+      const echo =
+        'q="vase", matchField="title", hasImages=true, isHighlight=true, isOnView=false, medium="Ceramics", departmentId=11, geoLocation=["France"], dateBegin=-500, dateEnd=1800';
+      expect(structuredOf(result).effectiveQuery).toBe(echo);
+      expect(contentText(result)).toContain(`Query: ${echo}`);
+      expect(contentText(result)).not.toContain('limit=');
+      expect(contentText(result)).not.toContain('offset=');
+    });
+
+    it('echoes q as sent: surrounding whitespace kept, quotes escaped, one line', async () => {
+      mockSearch.mockResolvedValue(page);
+      const result = await runToolContract(metSearchCollections, { q: ' Van "Gogh"\nletters ' });
+
+      const echo = 'q=" Van \\"Gogh\\"\\nletters "';
+      expect(structuredOf(result).effectiveQuery).toBe(echo);
+      expect(contentText(result)).toContain(`Query: ${echo}`);
+    });
+
+    it('echoes on the zero, window, and offset-beyond paths alike', async () => {
+      mockSearch.mockResolvedValueOnce(emptyPage);
+      mockSearch.mockResolvedValueOnce({
+        ...page,
+        total: 14_398,
+        truncated: true,
+        remaining: 9997,
+      });
+      mockSearch.mockResolvedValueOnce({ ...emptyPage, total: 97, offset: 97 });
+
+      for (const args of [{ q: 'zzznomatch' }, { q: 'horse' }, { q: 'sunflower', offset: 97 }]) {
+        const result = await runToolContract(metSearchCollections, args);
+        expect(structuredOf(result).effectiveQuery).toBe(`q="${args.q}"`);
+        expect(contentText(result)).toContain(`Query: q="${args.q}"`);
+      }
+    });
+
+    it('is declared optional in the enrichment block', () => {
+      const field = metSearchCollections.enrichment?.effectiveQuery;
+      expect(field?.safeParse(undefined).success).toBe(true);
+    });
   });
 
   it('a non-empty filtered page never asks for the keyword-only count', async () => {
@@ -672,11 +1080,7 @@ describe('metSearchCollections', () => {
         args as unknown as z.input<typeof metSearchCollections.input>,
       );
 
-    const textOf = (result: Awaited<ReturnType<typeof runToolContract>>) =>
-      (result.content ?? [])
-        .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
-        .map((block) => block.text)
-        .join('\n');
+    const textOf = contentText;
 
     it.each(['query', 'keyword'])('rewrites %s to q before validation', async (alias) => {
       mockSearch.mockResolvedValue(page);
@@ -722,7 +1126,7 @@ describe('metSearchCollections', () => {
       expect(mockSearch).not.toHaveBeenCalled();
     });
 
-    it('delivers no_results on both surfaces — the log severity moves, the envelope does not', async () => {
+    it('delivers a zero result through an alias as a success on both surfaces (#44)', async () => {
       mockSearch.mockResolvedValue({
         total: 0,
         objectIDs: [],
@@ -732,19 +1136,14 @@ describe('metSearchCollections', () => {
         nextOffset: null,
         offset: 0,
       });
-      const result = await call({ q: 'zzznomatch', limit: 3 });
+      const result = await call({ keyword: 'zzznomatch', limit: 3 });
 
-      expect(result.isError).toBe(true);
-      const error = (
-        result.structuredContent as {
-          error: { code: number; data: { reason: string; recovery: { hint: string } } };
-        }
-      ).error;
-      expect(error.code).toBe(JsonRpcErrorCode.NotFound);
-      expect(error.data.reason).toBe('no_results');
-      expect(error.data.recovery.hint).not.toContain('met_list_departments');
-      expect(textOf(result)).toContain('Recovery: The keyword "zzznomatch" matches no object');
-      expect(textOf(result)).toContain('no_results');
+      const structured = structuredOf(result);
+      expect(structured.total).toBe(0);
+      expect(structured.notice).not.toContain('met_list_departments');
+      expect(structured.effectiveQuery).toBe('q="zzznomatch"');
+      expect(textOf(result)).toContain('> The keyword "zzznomatch" matches no object');
+      expect(textOf(result)).not.toContain('no_results');
     });
   });
 });

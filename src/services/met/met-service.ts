@@ -13,6 +13,7 @@ import {
 } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import {
+  arrayBufferToBase64,
   type FetchWithTimeoutOptions,
   fetchWithTimeout,
   type RetryAttempt,
@@ -35,6 +36,28 @@ import type {
 export const SEARCH_RESULT_WINDOW = 10_000;
 
 /**
+ * The server-error statuses a retry ladder that ends on them reports as
+ * `upstream_unavailable`: an outage on the Met's side. 501 (permanent, never
+ * retried) and 505 (a protocol mismatch) are not outages and keep their own
+ * code and message.
+ */
+const OUTAGE_STATUSES = new Set([500, 502, 503, 504]);
+
+/**
+ * `error` without the upstream page `fetchWithTimeout` attaches to an HTTP
+ * failure — `data.body` and its alias `data.responseBody` — and otherwise as it
+ * was: same code, message, and every other `data` key. The original, page
+ * included, rides as the `cause`, which reaches the log and never the caller.
+ * Any error carrying no page is returned untouched.
+ */
+function withoutErrorPage(error: unknown): unknown {
+  if (!(error instanceof McpError) || error.data == null) return error;
+  if (!('body' in error.data) && !('responseBody' in error.data)) return error;
+  const { body: _body, responseBody: _responseBody, ...data } = error.data;
+  return new McpError(error.code, error.message, data, { cause: error });
+}
+
+/**
  * One tool call's wall-clock budget (`MET_CALL_DEADLINE_MS`), shared by every
  * Met API request the call makes. Fixed once per call rather than per ladder: a
  * per-ladder budget stacks, and `met_get_object` runs its ladders in waves.
@@ -51,6 +74,18 @@ export function startCallDeadline(signal: AbortSignal): CallDeadline {
   return { deadlineAt: Date.now() + getServerConfig().callDeadlineMs, signal };
 }
 
+/**
+ * The only origin `fetchImage` requests. A record's image URLs are free catalog
+ * text, so fetching whatever the field holds would let a record point this
+ * server's requests anywhere; pinning scheme and host closes that.
+ */
+const IMAGE_ORIGIN = 'https://images.metmuseum.org';
+
+/** One image from `fetchImage`: base64 and MIME type for a content block, or why there is none. */
+export type ImageFetchResult =
+  | { ok: true; data: string; mimeType: string }
+  | { ok: false; detail: string };
+
 /** Input for the search method. */
 export interface SearchInput {
   dateBegin?: number | undefined;
@@ -63,6 +98,12 @@ export interface SearchInput {
   isHighlight?: true | undefined;
   isOnView?: boolean | undefined;
   limit: number;
+  /**
+   * Restricts the keyword match to titles or to tags, sent as `title=true` or
+   * `tags=true`. One field because upstream honors only one flag: with both it
+   * answers the title set and drops `tags`; it ignores a `false` value.
+   */
+  matchField?: 'title' | 'tags' | undefined;
   medium?: string | undefined;
   offset?: number | undefined;
   q: string;
@@ -84,7 +125,7 @@ export interface SearchResult {
   offset: number;
   /**
    * Reachable IDs after this page: `min(total, SEARCH_RESULT_WINDOW) - (offset +
-   * returned)`, floored at 0.
+   * returned)`, floored at 0, and 0 for an empty page, which ends paging.
    */
   remaining: number;
   returned: number;
@@ -93,6 +134,14 @@ export interface SearchResult {
   truncated: boolean;
 }
 
+/**
+ * The earliest `metadataDate` `/v1/objects` filters by. Any earlier date answers
+ * `total: 0`, while this one answers the whole collection — exactly the
+ * unfiltered ID set (both verified live, 2026-10-04). An earlier date asks for
+ * every record, so `met_list_objects` sends it as this one.
+ */
+export const METADATA_DATE_FLOOR = '1753-01-01';
+
 /** Input for the listObjects method. */
 export interface ListObjectsInput {
   departmentId?: number | undefined;
@@ -100,7 +149,8 @@ export interface ListObjectsInput {
   offset?: number | undefined;
   /**
    * `YYYY-MM-DD`, sent as `metadataDate`: records created or revised on or after
-   * that day, the day itself included.
+   * that day, the day itself included. Sent as given — a date before
+   * `METADATA_DATE_FLOOR` matches nothing upstream.
    */
   updatedSince?: string | undefined;
 }
@@ -139,12 +189,20 @@ function toCollectionRoot(baseUrl: string): string {
 /** Normalized object record — subset of the full API record. */
 export interface ObjectRecord {
   accessionNumber: string;
+  /** As sent: a year on nearly every record, a full date (`2005-02-15`) on a few. */
+  accessionYear: string;
   additionalImages: string[];
   artistBeginDate: string;
   artistDisplayBio: string;
   artistDisplayName: string;
   artistEndDate: string;
   artistNationality: string;
+  /** The qualifier before `artistDisplayName` (`Style of`, `Published by`), as sent. */
+  artistPrefix: string;
+  /** The named person's role for this object (`Artist`, `Patron`, `Publisher`). */
+  artistRole: string;
+  /** The text after `artistDisplayName` (`(r. 1876–1909)`, `, Paris`), as sent. */
+  artistSuffix: string;
   classification: string;
   constituents:
     | {
@@ -160,6 +218,8 @@ export interface ObjectRecord {
   creditLine: string;
   culture: string;
   department: string;
+  /** `department` resolved through `DEPARTMENT_ID_BY_NAME`; null for a name it does not hold. */
+  departmentId: number | null;
   dimensions: string;
   dynasty: string;
   GalleryNumber: string;
@@ -196,6 +256,11 @@ export interface ObjectRecord {
       }[]
     | null;
   medium: string;
+  /**
+   * When the Met last created or revised the record: an ISO 8601 UTC timestamp,
+   * as sent. Its UTC date is what `/v1/objects` `metadataDate` filters on.
+   */
+  metadataDate: string;
   /** Null when the Met has no machine-readable date for the work. */
   objectBeginDate: number | null;
   objectDate: string;
@@ -209,6 +274,8 @@ export interface ObjectRecord {
   primaryImage: string;
   primaryImageSmall: string;
   region: string;
+  /** Rights holder and reproduction notice; most copyrighted records carry none. */
+  rightsAndReproduction: string;
   tags:
     | {
         term: string;
@@ -248,6 +315,19 @@ const OBJECT_IDS_CACHE_TTL_MS = 60 * 60 * 1000;
 export const OBJECT_IDS_CACHE_MAX_BYTES = 16 * 1024 * 1024;
 
 /**
+ * How long after a department list fails to load `keepDepartmentMembers` leaves
+ * 7/17 pages unfiltered without asking for it again. A list-only outage would
+ * otherwise cost every 7/17 search a full retry ladder — up to four requests and
+ * seconds of backoff — and a paging walk would send those requests in a burst.
+ */
+const DEPARTMENT_LIST_RETRY_MS = 60 * 1000;
+
+/** The cache, in-flight, and failure key for one filter set; an unset filter serializes as `null`. */
+function objectListKey({ departmentId, updatedSince }: ObjectListFilters): string {
+  return JSON.stringify([departmentId, updatedSince]);
+}
+
+/**
  * One caller's wait on a load other callers may share. Settles with the load, or
  * rejects when this caller's signal aborts (with its reason, as `fetch` does) or
  * its call deadline passes (as the same `retry_deadline_exceeded` expiry a retry
@@ -283,6 +363,56 @@ function waitForShared<T>(load: Promise<T>, deadline: CallDeadline): Promise<T> 
   });
 }
 
+/** Whether ascending `sorted` holds `id` — a binary search, so a page of IDs costs microseconds. */
+function sortedHas(sorted: Int32Array, id: number): boolean {
+  let low = 0;
+  let high = sorted.length - 1;
+  while (low <= high) {
+    const mid = (low + high) >>> 1;
+    const value = sorted[mid] as number;
+    if (value === id) return true;
+    if (value < id) low = mid + 1;
+    else high = mid - 1;
+  }
+  return false;
+}
+
+/**
+ * A record's `department` name to its `departmentId`, matched exactly: the 19
+ * `met_list_departments` names, plus the five names records carry instead for
+ * their department (each verified live on a record from that department's
+ * `/v1/objects` list, 2026-10-04). Static because the roster is stable and the
+ * only exact live alternative — reading all 19 department lists — costs a
+ * request burst near the one that has drawn the Met's firewall block.
+ */
+export const DEPARTMENT_ID_BY_NAME: ReadonlyMap<string, number> = new Map([
+  ['American Decorative Arts', 1],
+  ['Ancient West Asian Art', 3],
+  ['Arms and Armor', 4],
+  ['Arts of Africa, Oceania, and the Americas', 5],
+  ['Asian Art', 6],
+  ['The Cloisters', 7],
+  ['The Costume Institute', 8],
+  ['Drawings and Prints', 9],
+  ['Egyptian Art', 10],
+  ['European Paintings', 11],
+  ['European Sculpture and Decorative Arts', 12],
+  ['Greek and Roman Art', 13],
+  ['Islamic Art', 14],
+  ['The Robert Lehman Collection', 15],
+  ['The Libraries', 16],
+  ['Medieval Art', 17],
+  ['Musical Instruments', 18],
+  ['Photographs', 19],
+  ['Modern Art', 21],
+  // Record names that differ from the department list's.
+  ['The American Wing', 1],
+  ['The Michael C. Rockefeller Wing', 5],
+  ['Costume Institute', 8],
+  ['Robert Lehman Collection', 15],
+  ['Modern and Contemporary Art', 21],
+]);
+
 /**
  * Resolve the machine-readable date range, mapping "unknown" to null.
  *
@@ -292,8 +422,9 @@ function waitForShared<T>(load: Promise<T>, deadline: CallDeadline): Promise<T> 
  * never a real year and is free to carry the sentinel. Only the `0`/`0` pair is
  * the unknown marker; a single zero bound is left as sent.
  *
- * This is the one numeric field pair that departs from the server's `''`/`0`
- * absence convention, because an unbounded signed year has no safe sentinel.
+ * This pair departs from the server's `''`/`0` absence convention because an
+ * unbounded signed year has no safe sentinel; `departmentId` is the record's
+ * other nullable number, for its own reason (a `0` reads as a passable ID).
  */
 function resolveDateRange(raw: RawObjectRecord): {
   objectBeginDate: number | null;
@@ -353,6 +484,8 @@ export class MetService {
   private objectIdCacheBytes = 0;
   /** The load in flight per filter set, shared by every caller that asks for it meanwhile. */
   private readonly objectIdLoads = new Map<string, Promise<Int32Array>>();
+  /** When each filter set's latest load failed, cleared by its next successful load. */
+  private readonly objectIdLoadFailedAt = new Map<string, number>();
 
   constructor(_config: AppConfig, _storage: StorageService) {
     const serverConfig = getServerConfig();
@@ -365,7 +498,10 @@ export class MetService {
    * caller's `offset` and `limit` passed straight through. `total` is the full
    * upstream match count; the continuation fields (`remaining`, `truncated`,
    * `nextOffset`) are computed against the reachable window,
-   * `min(total, SEARCH_RESULT_WINDOW)`, because no page reaches past it.
+   * `min(total, SEARCH_RESULT_WINDOW)`, because no page reaches past it. An
+   * empty page ends paging even inside that window: continuing from it would
+   * hand back the offset just read, and a caller following `nextOffset` would
+   * request the same page forever.
    *
    * Every failure, a Timeout-coded one included (an upstream 504/408/425 or the
    * request timer), takes the ordinary `withRetry` ladder: a page is at most 500
@@ -380,7 +516,7 @@ export class MetService {
       const objectIDs = raw.objectIDs ?? [];
       const reachable = Math.min(raw.total, SEARCH_RESULT_WINDOW);
       const consumed = offset + objectIDs.length;
-      const remaining = Math.max(0, reachable - consumed);
+      const remaining = objectIDs.length > 0 ? Math.max(0, reachable - consumed) : 0;
       const truncated = remaining > 0;
       return {
         total: raw.total,
@@ -423,6 +559,48 @@ export class MetService {
   }
 
   /**
+   * The IDs in `objectIDs` that the department's `/v1/objects` list holds, in
+   * their given order, or `null` when that list could not be loaded — an
+   * upstream failure, this call waiting longer than one request timeout, or a
+   * load that failed within the last `DEPARTMENT_LIST_RETRY_MS`, which sends no
+   * request. The list is the sorted, cached one `listObjects` pages, so it costs
+   * one load per department per cache lifetime, and after a failure none until
+   * that window passes or another load succeeds. Best-effort, like
+   * `countKeywordMatches`: the caller still answers without it. A caller abort
+   * is not such a failure — it propagates, so the call ends as cancelled.
+   */
+  async keepDepartmentMembers(
+    objectIDs: number[],
+    departmentId: number,
+    ctx: Context,
+    deadline: CallDeadline,
+  ): Promise<number[] | null> {
+    const failedAt = this.objectIdLoadFailedAt.get(objectListKey({ departmentId }));
+    if (failedAt !== undefined && Date.now() - failedAt < DEPARTMENT_LIST_RETRY_MS) {
+      ctx.log.warning('Met department object list failed recently; the page is left unfiltered', {
+        departmentId,
+      });
+      return null;
+    }
+    let members: Int32Array;
+    try {
+      // Waits at most one request timeout: the load is shared and keeps going for the next call.
+      members = await this.getSortedObjectIds({ departmentId }, ctx, {
+        signal: deadline.signal,
+        deadlineAt: Math.min(deadline.deadlineAt, Date.now() + this.timeoutMs),
+      });
+    } catch (error) {
+      if (deadline.signal.aborted) throw error;
+      ctx.log.warning('Met department object list unavailable; the page is left unfiltered', {
+        departmentId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
+    return objectIDs.filter((id) => sortedHas(members, id));
+  }
+
+  /**
    * The sorted ID list for one filter set: the cached copy while it is fresh,
    * else the load already in flight for it, else a new load. This caller waits
    * on a load only as long as its own signal and deadline allow; the load itself
@@ -437,8 +615,7 @@ export class MetService {
     ctx: Context,
     deadline: CallDeadline,
   ): Promise<Int32Array> {
-    // The cache and in-flight key; an unset filter serializes as `null`.
-    const key = JSON.stringify([filters.departmentId, filters.updatedSince]);
+    const key = objectListKey(filters);
     const cached = this.objectIdCache.get(key);
     if (cached) {
       this.objectIdCache.delete(key);
@@ -452,10 +629,17 @@ export class MetService {
     if (!load) {
       deadline.signal.throwIfAborted();
       load = this.loadSortedObjectIds(filters, ctx)
-        .then((ids) => {
-          this.cacheObjectIds(key, ids);
-          return ids;
-        })
+        .then(
+          (ids) => {
+            this.objectIdLoadFailedAt.delete(key);
+            this.cacheObjectIds(key, ids);
+            return ids;
+          },
+          (error: unknown) => {
+            this.objectIdLoadFailedAt.set(key, Date.now());
+            throw error;
+          },
+        )
         .finally(() => this.objectIdLoads.delete(key));
       this.objectIdLoads.set(key, load);
     }
@@ -500,9 +684,9 @@ export class MetService {
    * How many objects the keyword matches with no filter applied, or `null` when
    * the request failed or the call's budget is already spent. One `limit=1`
    * request, one attempt, its timeout capped by the budget left: the caller uses
-   * it to word a recovery hint, so a failure degrades the hint rather than the
-   * call, and a retry ladder would only delay an answer that is already a miss. A
-   * caller abort is not such a failure — it propagates, so the call ends as
+   * it to word the zero-match notice, so a failure degrades the notice rather
+   * than the call, and a retry ladder would only delay an answer that is already
+   * a miss. A caller abort is not such a failure — it propagates, so the call ends as
    * cancelled.
    */
   async countKeywordMatches(
@@ -519,7 +703,8 @@ export class MetService {
     try {
       return (await this.fetchSearch(url, ctx, { signal: deadline.signal, remainingMs })).total;
     } catch (error) {
-      if (deadline.signal.aborted) throw error;
+      // An HTTP failure can land just as the caller aborts; it leaves without its page too.
+      if (deadline.signal.aborted) throw withoutErrorPage(error);
       ctx.log.warning('Met keyword-only count failed', {
         q,
         error: error instanceof Error ? error.message : String(error),
@@ -558,6 +743,45 @@ export class MetService {
     });
   }
 
+  /**
+   * One image from the Met's image host, base64-encoded for an image content
+   * block. A single attempt, never retried: its timeout is the per-request
+   * timeout capped by what is left of the call's budget, and a redirect is
+   * refused rather than followed off the pinned host.
+   *
+   * A URL outside `IMAGE_ORIGIN`, a spent budget, any failed exchange, or a body
+   * that is not `image/*` comes back as `ok: false` — nothing is requested in
+   * the first two cases — so one image never fails a call. A 403 here is the
+   * image host's answer about one file, not the API firewall's
+   * `upstream_blocked`. A caller abort throws, so the call ends as cancelled.
+   */
+  async fetchImage(url: string, ctx: Context, deadline: CallDeadline): Promise<ImageFetchResult> {
+    const target = URL.parse(url);
+    if (target?.origin !== IMAGE_ORIGIN) {
+      return { ok: false, detail: 'Not a URL on the Met image host, so it was not requested.' };
+    }
+    const remainingMs = deadline.deadlineAt - Date.now();
+    if (remainingMs <= 0) {
+      return { ok: false, detail: "The call's time budget had run out, so it was not requested." };
+    }
+    try {
+      const response = await fetchWithTimeout(target, Math.min(this.timeoutMs, remainingMs), ctx, {
+        redirect: 'error',
+        signal: deadline.signal,
+      });
+      const mimeType =
+        response.headers.get('content-type')?.split(';')[0]?.trim().toLowerCase() ?? '';
+      if (!mimeType.startsWith('image/')) {
+        await response.body?.cancel();
+        return { ok: false, detail: `The image host answered ${mimeType || 'no content type'}.` };
+      }
+      return { ok: true, data: arrayBufferToBase64(await response.arrayBuffer()), mimeType };
+    } catch (error) {
+      if (deadline.signal.aborted) throw withoutErrorPage(error);
+      return { ok: false, detail: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
   /** Fetch all departments. */
   getDepartments(ctx: Context, deadline: CallDeadline): Promise<Department[]> {
     return this.retry('MetService.getDepartments', ctx, deadline, async (attempt) => {
@@ -593,6 +817,20 @@ export class MetService {
    * `withRetry` bounded by what is left of the call's budget. A ladder that
    * starts with none left fails as the same `retry_deadline_exceeded` expiry
    * `withRetry` raises, without sending a request.
+   *
+   * A ladder that ends on an HTTP 500, 502, 503, or 504 — every attempt spent,
+   * or an upstream `Retry-After` too long to wait — is the Met failing on its
+   * side, and is rethrown as `upstream_unavailable` (`ServiceUnavailable`, so a
+   * persistent 504 leaves `Timeout` behind). Its `data` is the reason, the
+   * status, and the upstream's `Retry-After` value when it sent one; the
+   * exhausted error, error page included, rides only as the `cause`, which
+   * reaches the log and never the caller. The ladder itself is unchanged: a 504
+   * is still retried, and a deadline that cuts a ladder short still ends it as
+   * `retry_deadline_exceeded`.
+   *
+   * Any other HTTP failure — a 501, a 505, a 4xx other than the 403 that
+   * `request()` classifies — keeps its code, message, and `data`, minus the
+   * upstream page (`withoutErrorPage`), so no error leaving the service carries it.
    */
   private async retry<T>(
     operation: string,
@@ -607,13 +845,27 @@ export class MetService {
         { reason: 'retry_deadline_exceeded', retryAttempts: 0 },
       );
     }
-    return await withRetry(fn, {
-      operation,
-      context: ctx,
-      baseDelayMs: 1000,
-      deadlineMs,
-      signal: deadline.signal,
-    });
+    try {
+      return await withRetry(fn, {
+        operation,
+        context: ctx,
+        baseDelayMs: 1000,
+        deadlineMs,
+        signal: deadline.signal,
+      });
+    } catch (error) {
+      const data = error instanceof McpError ? error.data : undefined;
+      const status = data?.status;
+      if (typeof status === 'number' && OUTAGE_STATUSES.has(status)) {
+        const retryAfter = data?.retryAfter;
+        throw serviceUnavailable(
+          `The Met API answered with a server error (HTTP ${status}).`,
+          { reason: 'upstream_unavailable', status, ...(retryAfter != null && { retryAfter }) },
+          { cause: error },
+        );
+      }
+      throw withoutErrorPage(error);
+    }
   }
 
   /**
@@ -659,6 +911,7 @@ export class MetService {
     url.searchParams.set('q', input.q);
     url.searchParams.set('offset', String(input.offset));
     url.searchParams.set('limit', String(input.limit));
+    if (input.matchField != null) url.searchParams.set(input.matchField, 'true');
     if (input.hasImages != null) url.searchParams.set('hasImages', String(input.hasImages));
     if (input.isHighlight != null) url.searchParams.set('isHighlight', String(input.isHighlight));
     if (input.isOnView != null) url.searchParams.set('isOnView', String(input.isOnView));
@@ -689,11 +942,14 @@ export class MetService {
 
   /**
    * Every free-text field passes through `stripItalicTags`; URL-shaped fields,
-   * identifiers, and the artist date bounds do not.
+   * identifiers, the artist date bounds, `accessionYear`, and `metadataDate` do
+   * not. `departmentId` is looked up from the cleaned `department`, and is null
+   * for a name the map does not hold — an empty one included — never a guess.
    */
   private normalizeObject(raw: RawObjectRecord): ObjectRecord {
     /** A free-text field that may be absent: `''` when it is, cleaned when it is not. */
     const text = (value: string | null | undefined) => stripItalicTags(value ?? '');
+    const department = text(raw.department);
     return {
       objectID: raw.objectID,
       title: text(raw.title),
@@ -702,13 +958,17 @@ export class MetService {
       primaryImageSmall: raw.primaryImageSmall ?? '',
       additionalImages: raw.additionalImages ?? [],
       objectURL: raw.objectURL ?? '',
-      department: text(raw.department),
+      department,
+      departmentId: DEPARTMENT_ID_BY_NAME.get(department) ?? null,
       objectName: text(raw.objectName),
       classification: text(raw.classification),
       hasCC0Image: Boolean(raw.primaryImage),
       isHighlight: raw.isHighlight ?? false,
       isTimelineWork: raw.isTimelineWork ?? false,
+      artistPrefix: text(raw.artistPrefix),
       artistDisplayName: text(raw.artistDisplayName),
+      artistSuffix: text(raw.artistSuffix),
+      artistRole: text(raw.artistRole),
       artistDisplayBio: text(raw.artistDisplayBio),
       artistNationality: text(raw.artistNationality),
       artistBeginDate: raw.artistBeginDate ?? '',
@@ -731,7 +991,9 @@ export class MetService {
       period: text(raw.period),
       dynasty: text(raw.dynasty),
       accessionNumber: raw.accessionNumber ?? '',
+      accessionYear: raw.accessionYear ?? '',
       creditLine: text(raw.creditLine),
+      rightsAndReproduction: text(raw.rightsAndReproduction),
       country: text(raw.country),
       region: text(raw.region),
       geography: {
@@ -764,6 +1026,7 @@ export class MetService {
         })) ?? null,
       objectWikidata_URL: raw.objectWikidata_URL ?? '',
       GalleryNumber: raw.GalleryNumber ?? '',
+      metadataDate: raw.metadataDate ?? '',
     };
   }
 }

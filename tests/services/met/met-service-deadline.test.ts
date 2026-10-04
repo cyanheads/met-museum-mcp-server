@@ -323,8 +323,8 @@ describe('call deadline (#22)', () => {
     });
   });
 
-  describe('a fast-failing upstream still surfaces as the upstream error', () => {
-    it('met_list_departments reports the 503 after four attempts, not a deadline', async () => {
+  describe('a fast-failing upstream surfaces as the outage, not a deadline', () => {
+    it('met_list_departments reports upstream_unavailable after four attempts', async () => {
       fetchMock.mockImplementation(unavailable);
 
       const { value: result, elapsedMs } = await timed(() =>
@@ -333,15 +333,15 @@ describe('call deadline (#22)', () => {
 
       const error = errorOf(result);
       expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
-      expect(error.message).toContain('Status: 503');
-      expect(error.message).toContain('(failed after 4 attempts)');
-      expect(error.data.reason).toBeUndefined();
+      expect(error.message).toBe('The Met API answered with a server error (HTTP 503).');
+      expect(error.data.reason).toBe('upstream_unavailable');
+      expect(error.data.status).toBe(503);
       expect(fetchMock).toHaveBeenCalledTimes(4);
       // 1 + 2 + 4 s of backoff, each ±25%: at most 8.75 s.
       expect(elapsedMs).toBeLessThanOrEqual(8750);
     });
 
-    it('a single-ID met_get_object reports all_failed after four attempts, not a deadline', async () => {
+    it('a single-ID met_get_object reports upstream_unavailable after four attempts', async () => {
       fetchMock.mockImplementation(unavailable);
 
       const { value: result } = await timed(() =>
@@ -350,7 +350,7 @@ describe('call deadline (#22)', () => {
 
       const error = errorOf(result);
       expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
-      expect(error.data.reason).toBe('all_failed');
+      expect(error.data.reason).toBe('upstream_unavailable');
       expect(fetchMock).toHaveBeenCalledTimes(4);
     });
   });
@@ -383,7 +383,7 @@ describe('call deadline (#22)', () => {
       ]);
     });
 
-    it('caps the keyword-only count at what the lookup and search left, and still answers no_results', async () => {
+    it('caps the keyword-only count at what the lookup and search left, and still answers the zero result', async () => {
       // Lookup 9.5 s, a 503 after 9 s, a backoff, "no match" after 9 s: the
       // count starts with 1.25–1.75 s left and never answers.
       let searches = 0;
@@ -406,9 +406,11 @@ describe('call deadline (#22)', () => {
         runToolContract(metSearchCollections, { q: 'horse', departmentId: 11 }),
       );
 
-      const error = errorOf(result);
-      expect(error.data.reason).toBe('no_results');
-      expect((error.data.recovery as { hint: string }).hint).toContain('could not be checked');
+      expect(result.isError).toBeFalsy();
+      const structured = result.structuredContent as { total: number; notice: string };
+      expect(structured.total).toBe(0);
+      expect(structured.notice).toContain('could not be checked');
+      expect(textOf(result)).toContain('could not be checked');
       expect(elapsedMs).toBeLessThanOrEqual(CALL_DEADLINE_MS);
       const count = fetchMock.mock.calls.map((call) => new URL(String(call[0]))).at(-1);
       expect(count?.searchParams.get('limit')).toBe('1');

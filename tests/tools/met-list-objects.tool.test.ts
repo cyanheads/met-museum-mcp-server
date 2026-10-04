@@ -61,10 +61,13 @@ function jsonResponse(body: unknown): Response {
  * `/v1/objects` as the Met answers it: `departmentIds` selects one department,
  * `metadataDate` keeps records updated on or after that day (the day itself
  * included — verified live), and the IDs come back unsorted with `[]` for none.
+ * A `metadataDate` before 1753-01-01 matches nothing, whatever the department —
+ * also verified live (`1752-12-31`, `1000-01-01`, `0001-01-01` → `total: 0`).
  */
 function objectsPage(url: URL): Response {
   const department = url.searchParams.get('departmentIds');
   const since = url.searchParams.get('metadataDate');
+  if (since != null && since < '1753-01-01') return jsonResponse({ total: 0, objectIDs: [] });
   const ids = RECORDS.filter(
     (r) =>
       (department == null || r.departmentId === Number(department)) &&
@@ -94,6 +97,7 @@ function upstream(request: unknown): Promise<Response> {
 type ToolResult = Awaited<ReturnType<typeof runToolContract>>;
 
 interface ListPage {
+  effectiveQuery: string;
   nextOffset: number | null;
   notice?: string;
   objectIDs: number[];
@@ -168,6 +172,7 @@ describe('met_list_objects (#26)', () => {
         remaining: RECORDS.length - 20,
         truncated: true,
         nextOffset: 20,
+        effectiveQuery: 'no filter (whole collection)',
       });
       expect(objectsRequests().map((url) => url.search)).toEqual(['']);
 
@@ -215,6 +220,7 @@ describe('met_list_objects (#26)', () => {
         remaining: 0,
         truncated: false,
         nextOffset: null,
+        effectiveQuery: 'no filter (whole collection)',
       });
       expect(textOf(result)).toContain('**Returned IDs:** 5 (complete)');
       expect(textOf(result)).toContain('**Next offset:** none');
@@ -233,6 +239,7 @@ describe('met_list_objects (#26)', () => {
           remaining: 0,
           truncated: false,
           nextOffset: null,
+          effectiveQuery: 'no filter (whole collection)',
         });
         expect(textOf(result)).toContain('**Returned IDs:** 0 (offset beyond result set)');
       },
@@ -294,6 +301,12 @@ describe('met_list_objects (#26)', () => {
   });
 
   describe('updatedSince', () => {
+    it('names the met_get_object field it compares in its description', () => {
+      expect(metListObjects.input.shape.updatedSince.description).toContain(
+        "the UTC date of each record's metadataDate, which met_get_object returns",
+      );
+    });
+
     it('sends the date unchanged as metadataDate and keeps records updated that same day', async () => {
       const result = await list({ departmentId: 10, updatedSince: '2026-09-26' });
 
@@ -368,6 +381,7 @@ describe('met_list_objects (#26)', () => {
         nextOffset: null,
         notice:
           'No objects match departmentId 10 and updatedSince 2026-09-27. Pass an earlier updatedSince or drop a filter to widen the list.',
+        effectiveQuery: 'departmentId=10, updatedSince="2026-09-27"',
       });
       const text = textOf(result);
       expect(text).toContain('**Returned IDs:** 0 (complete)');
@@ -407,6 +421,7 @@ describe('met_list_objects (#26)', () => {
         nextOffset: null,
         notice:
           'No objects match updatedSince 2026-09-27. Pass an earlier updatedSince to widen the list.',
+        effectiveQuery: 'updatedSince="2026-09-27"',
       });
       const text = textOf(result);
       expect(text).toContain('**Total objects:** 0');
@@ -424,6 +439,146 @@ describe('met_list_objects (#26)', () => {
         "No objects match updatedSince 2999-01-01. 2999-01-01 is after today's date (UTC), so no record has been created or revised since then; pass an earlier updatedSince.",
       );
       expect(textOf(result)).toContain("2999-01-01 is after today's date (UTC)");
+    });
+  });
+
+  describe('updatedSince before 1753-01-01 (#40)', () => {
+    it.each(['1752-12-31', '0001-01-01', '0000-01-01'])(
+      '%s is sent as 1753-01-01 and lists every record, with no notice',
+      async (updatedSince) => {
+        const result = await list({ updatedSince });
+
+        const page = pageOf(result);
+        expect(objectsRequests().map((url) => url.search)).toEqual(['?metadataDate=1753-01-01']);
+        expect(page.total).toBe(RECORDS.length);
+        expect(page.objectIDs).toEqual(ALL_IDS_ASCENDING.slice(0, 20));
+        expect(page.notice).toBeUndefined();
+        expect(textOf(result)).toContain(`**Total objects:** ${RECORDS.length}`);
+
+        // The same answer the floor itself gets.
+        const atFloor = pageOf(await list({ updatedSince: '1753-01-01' }));
+        expect(atFloor.total).toBe(page.total);
+        expect(atFloor.objectIDs).toEqual(page.objectIDs);
+      },
+    );
+
+    it("lists the department's whole list for a pre-1753 date with departmentId", async () => {
+      const page = pageOf(await list({ departmentId: 10, updatedSince: '1700-06-15' }));
+
+      expect(objectsRequests().map((url) => url.search)).toEqual([
+        '?departmentIds=10&metadataDate=1753-01-01',
+      ]);
+      expect(page.objectIDs).toEqual([544100, 545138, 555799]);
+      expect(page.notice).toBeUndefined();
+    });
+
+    it('shares one cache entry across every pre-1753 date and the floor itself', async () => {
+      await list({ updatedSince: '1752-12-31' });
+      await list({ updatedSince: '0001-01-01' });
+      await list({ updatedSince: '1753-01-01' });
+      await list({ updatedSince: '1000-01-01', offset: 20 });
+
+      expect(objectsRequests().map((url) => url.search)).toEqual(['?metadataDate=1753-01-01']);
+    });
+
+    it.each(['1753-01-01', '1753-01-02', '1900-01-01'])(
+      'sends %s, on or after the floor, unchanged',
+      async (updatedSince) => {
+        await list({ updatedSince });
+
+        expect(objectsRequests()[0]?.searchParams.get('metadataDate')).toBe(updatedSince);
+      },
+    );
+
+    describe('when the Met returns nothing for a date at or before the floor', () => {
+      beforeEach(() => {
+        fetchMock.mockImplementation((request: unknown) =>
+          new URL(String(request)).pathname === OBJECTS_PATH
+            ? Promise.resolve(jsonResponse({ total: 0, objectIDs: [] }))
+            : upstream(request),
+        );
+      });
+
+      it('says the date already covers every record and that the collection came back empty', async () => {
+        const result = await list({ updatedSince: '1700-01-01' });
+
+        const notice =
+          'No objects match updatedSince 1700-01-01. 1700-01-01 already covers every record, and the Met returned no object IDs for the collection.';
+        expect(pageOf(result)).toMatchObject({ total: 0, objectIDs: [], notice });
+        expect(textOf(result)).toContain(notice);
+        expect(textOf(result)).not.toContain('Pass an earlier');
+      });
+
+      it('points to departmentId, never to an earlier date, at the floor itself', async () => {
+        const result = await list({ departmentId: 10, updatedSince: '1753-01-01' });
+
+        const notice =
+          'No objects match departmentId 10 and updatedSince 1753-01-01. 1753-01-01 already covers every record, so the empty list comes from departmentId 10; pass another departmentId.';
+        expect(pageOf(result).notice).toBe(notice);
+        expect(textOf(result)).toContain(notice);
+        expect(textOf(result)).not.toContain('earlier updatedSince');
+      });
+
+      it('keeps the widen-with-an-earlier-date notice for a date after the floor', async () => {
+        const result = await list({ updatedSince: '1753-01-02' });
+
+        expect(pageOf(result).notice).toBe(
+          'No objects match updatedSince 1753-01-02. Pass an earlier updatedSince to widen the list.',
+        );
+      });
+    });
+  });
+
+  describe('effectiveQuery (#44)', () => {
+    /** The echo on both surfaces: `structuredContent` and the `content[]` trailer. */
+    async function expectEcho(args: Record<string, unknown>, echo: string) {
+      const result = await list(args);
+      expect(pageOf(result).effectiveQuery).toBe(echo);
+      expect(textOf(result)).toContain(`Query: ${echo}`);
+      return result;
+    }
+
+    it('echoes no filter (whole collection) for an unfiltered call', async () => {
+      await expectEcho({}, 'no filter (whole collection)');
+    });
+
+    it('echoes a blank updatedSince as no filter — the unfiltered list it reads as', async () => {
+      await expectEcho({ updatedSince: '' }, 'no filter (whole collection)');
+      expect(objectsRequests().map((url) => url.search)).toEqual(['']);
+    });
+
+    it('echoes both filters in schema order, JSON-encoded', async () => {
+      await expectEcho(
+        { updatedSince: '2026-09-01', departmentId: 10 },
+        'departmentId=10, updatedSince="2026-09-01"',
+      );
+    });
+
+    it('echoes departmentId alone', async () => {
+      await expectEcho({ departmentId: 10 }, 'departmentId=10');
+    });
+
+    it('echoes a pre-1753 updatedSince as the floor it was sent as', async () => {
+      await expectEcho({ updatedSince: '1752-12-31' }, 'updatedSince="1753-01-01"');
+      expect(objectsRequests()[0]?.searchParams.get('metadataDate')).toBe('1753-01-01');
+    });
+
+    it('echoes the metadataDate alias under the declared name', async () => {
+      await expectEcho({ metadataDate: '2026-09-26' }, 'updatedSince="2026-09-26"');
+    });
+
+    it('echoes on the empty-list path beside its notice, and never limit or offset', async () => {
+      const result = await expectEcho(
+        { departmentId: 10, updatedSince: '2999-01-01', limit: 5, offset: 50 },
+        'departmentId=10, updatedSince="2999-01-01"',
+      );
+      expect(pageOf(result).notice).toContain('2999-01-01 is after today');
+      expect(textOf(result)).toContain('**Returned IDs:** 0 (offset beyond result set)');
+      expect(textOf(result)).not.toContain('limit=');
+    });
+
+    it('is declared optional in the enrichment block', () => {
+      expect(metListObjects.enrichment?.effectiveQuery?.safeParse(undefined).success).toBe(true);
     });
   });
 

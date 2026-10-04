@@ -3,10 +3,16 @@
  * @module mcp-server/tools/definitions/met-get-object
  */
 
-import { tool, z } from '@cyanheads/mcp-ts-core';
+import { type Context, tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { getServerConfig } from '@/config/server-config.js';
-import { getMetService, startCallDeadline } from '@/services/met/met-service.js';
+import {
+  type CallDeadline,
+  getMetService,
+  type MetService,
+  type ObjectRecord,
+  startCallDeadline,
+} from '@/services/met/met-service.js';
 import { escapeMarkdown, isHttpUrl } from '@/utils/markdown.js';
 
 const ConstituentSchema = z
@@ -129,7 +135,7 @@ const ObjectSchema = z
     primaryImageSmall: z
       .string()
       .describe(
-        'Web-display image URL (~800px; CC0 objects only; empty string for non-public-domain works).',
+        'Web-display image URL (about 600 px on the long edge; CC0 objects only; empty string for non-public-domain works).',
       ),
     additionalImages: z
       .array(z.string().describe('An additional image URL (detail shot or alternate view).'))
@@ -137,7 +143,16 @@ const ObjectSchema = z
     objectURL: z.string().describe('Canonical metmuseum.org page URL for human follow-up.'),
     department: z
       .string()
-      .describe('Curatorial department (e.g., "European Paintings", "Egyptian Art").'),
+      .describe(
+        'Curatorial department as the record names it (e.g., "European Paintings", "Egyptian Art"). Five departments carry a different name on their records than in met_list_departments — "The American Wing", "The Michael C. Rockefeller Wing", "Costume Institute", "Robert Lehman Collection", "Modern and Contemporary Art" — so match departments by departmentId, not by name.',
+      ),
+    departmentId: z
+      .number()
+      .int()
+      .nullable()
+      .describe(
+        "The department's numeric ID, resolved from department, for the departmentId filter of met_list_objects and met_search_collections. Null when the record's department name was not recognized — never a guess.",
+      ),
     objectName: z
       .string()
       .describe('Object type or classification name (e.g., "Painting", "Statuette").'),
@@ -146,10 +161,25 @@ const ObjectSchema = z
       .describe('Broad classification category (e.g., "Paintings", "Ceramics").'),
     isHighlight: z.boolean().describe('True when the Met designates this a collection highlight.'),
     isTimelineWork: z.boolean().describe("True when the work appears in the Met's art timeline."),
+    artistPrefix: z
+      .string()
+      .describe(
+        'Qualifier the Met places before artistDisplayName (e.g., "Style of", "Workshop of", "Attributed to", "Published by"). Read the two together: "Style of" with "Rembrandt" is a work in Rembrandt\'s style, not one by him. Empty when the attribution is unqualified.',
+      ),
     artistDisplayName: z
       .string()
       .describe(
-        'Primary artist name as displayed (e.g., "Vincent van Gogh"). Empty for anonymous or unknown works.',
+        'Name of the person or firm the attribution names (e.g., "Vincent van Gogh"), without the qualifier in artistPrefix or the text in artistSuffix — read those and artistRole with it. Empty for anonymous or unknown works.',
+      ),
+    artistSuffix: z
+      .string()
+      .describe(
+        'Text the Met places after artistDisplayName (e.g., "(r. 1876–1909)", ", Paris", "(?)"). Empty when the Met records none.',
+      ),
+    artistRole: z
+      .string()
+      .describe(
+        'The named person\'s role for this object (e.g., "Artist", "Maker", "Publisher", "Patron") — a patron or publisher is not the maker. Empty when the record names no one.',
       ),
     artistDisplayBio: z
       .string()
@@ -162,12 +192,12 @@ const ObjectSchema = z
     artistBeginDate: z
       .string()
       .describe(
-        'Artist birth year, or a firm\'s founding year, as a string (e.g., "1853"). Occasionally a full date (e.g., "1928-01-10"). Empty for anonymous works.',
+        'Birth year of the person artistDisplayName names, or a firm\'s founding year, as a string (e.g., "1853") — that person\'s even when artistPrefix qualifies the attribution. Occasionally a full date (e.g., "1928-01-10"). Empty for anonymous works.',
       ),
     artistEndDate: z
       .string()
       .describe(
-        'Artist death year, or a firm\'s closing year, as a string (e.g., "1890"). Occasionally a full date (e.g., "1928-01-10"). Empty for a living artist, a firm still active, or an anonymous work.',
+        'Death year of the person artistDisplayName names, or a firm\'s closing year, as a string (e.g., "1890") — that person\'s even when artistPrefix qualifies the attribution. Occasionally a full date (e.g., "1928-01-10"). Empty for a living artist, a firm still active, or an anonymous work.',
       ),
     constituents: z
       .array(ConstituentSchema)
@@ -210,7 +240,17 @@ const ObjectSchema = z
       .string()
       .describe('Dynasty for applicable cultures (e.g., "Dynasty 19"). Often empty.'),
     accessionNumber: z.string().describe("The Met's accession number for the object."),
+    accessionYear: z
+      .string()
+      .describe(
+        'Year the Met acquired the object, as sent (e.g., "1960") — occasionally a full date (e.g., "2005-02-15"). Can differ from the year in creditLine. Empty when the Met records none.',
+      ),
     creditLine: z.string().describe('Provenance and gift/bequest attribution.'),
+    rightsAndReproduction: z
+      .string()
+      .describe(
+        'Rights holder and reproduction notice (e.g., "© 2026 Pollock-Krasner Foundation / Artists Rights Society (ARS), New York"). Most copyrighted records carry none, so an empty value does not make a work free to reuse — isPublicDomain decides that.',
+      ),
     country: z.string().describe('Country of origin. Often empty.'),
     region: z.string().describe('Geographic region of origin. Often empty.'),
     geography: GeographySchema,
@@ -234,6 +274,11 @@ const ObjectSchema = z
       .describe(
         'Gallery room number at the museum. Empty string for objects not currently on display.',
       ),
+    metadataDate: z
+      .string()
+      .describe(
+        'When the Met last created or revised this record: an ISO 8601 UTC timestamp, as sent (e.g., "2026-10-01T04:59:29.693Z"; fractional seconds run from none to three digits). Its UTC date is what met_list_objects updatedSince compares, that day included. Empty when the Met sends none.',
+      ),
   })
   .describe('A fully fetched Met Museum object record.');
 
@@ -246,7 +291,7 @@ const ObjectSchema = z
  * a caller read the budget as a response-size cap.
  *
  * The axis is the sum, not the record: no single Met record approaches an
- * overflow (the heaviest measured normalizes to under 4 KB), while twenty of
+ * overflow (the heaviest measured normalizes to about 5 KB), while twenty of
  * them together are what produces a six-figure response. So this is not the
  * framework's per-document `outlineOnOverflow` budget applied per object —
  * that would never fire here — but the same idea moved to the batch.
@@ -273,18 +318,82 @@ function serializedBytes(value: unknown): number {
   return utf8.encode(JSON.stringify(value)).length;
 }
 
+/**
+ * How many images one call attaches, to the first CC0 records in request order.
+ *
+ * The cap counts images, not bytes: the web-large rendition is bounded in
+ * pixels (long edge about 600 px), so what one costs a vision model is roughly
+ * fixed while its file size varies several-fold. Three is enough to compare
+ * works side by side. A constant for the same reason as `BATCH_BUDGET_BYTES`.
+ */
+const IMAGE_CAP = 3;
+
+const ImageStatusSchema = z
+  .enum(['attached', 'no_cc0_image', 'over_cap', 'unavailable'])
+  .describe(
+    'attached: the image rides content[], after a caption naming the objectID. no_cc0_image: the record has no CC0 image, so nothing was fetched. over_cap: 3 earlier CC0 records took the image slots — request this ID among the first 3 CC0 records of another call to see its image. unavailable: the image host returned no image in time, or the URL was not on the Met image host.',
+  );
+
+type ImageEntry = { objectID: number; status: z.infer<typeof ImageStatusSchema> };
+
+/**
+ * Attach the `primaryImageSmall` of the first `IMAGE_CAP` CC0 records among the
+ * returned ones as caption + image blocks in `content[]`, and report every
+ * returned record's outcome in request order. A record that fails still spent
+ * its slot, so which records get one never depends on the network.
+ */
+async function attachImages(
+  objects: readonly ObjectRecord[],
+  service: MetService,
+  ctx: Context,
+  deadline: CallDeadline,
+): Promise<{ images: ImageEntry[]; attached: number; base64Bytes: number }> {
+  // All at once: the cap bounds it at 3 requests, to the image host rather than
+  // the firewalled API, and one after another would stack their latencies
+  // inside the call's shared budget.
+  let slots = IMAGE_CAP;
+  const fetched = await Promise.all(
+    objects.map((obj) => {
+      if (!obj.hasCC0Image || slots === 0) return null;
+      slots--;
+      return service.fetchImage(obj.primaryImageSmall, ctx, deadline);
+    }),
+  );
+
+  // Blocks are emitted only after every fetch settles, so content[] follows
+  // request order whatever order the fetches finish in.
+  const images: ImageEntry[] = [];
+  let attached = 0;
+  let base64Bytes = 0;
+  for (const [index, { objectID, hasCC0Image, primaryImageSmall: url }] of objects.entries()) {
+    const result = fetched[index];
+    if (result == null) {
+      images.push({ objectID, status: hasCC0Image ? 'over_cap' : 'no_cc0_image' });
+      continue;
+    }
+    if (!result.ok) {
+      ctx.log.warning('Met image unavailable', { objectID, url, detail: result.detail });
+      images.push({ objectID, status: 'unavailable' });
+      continue;
+    }
+    ctx.content({ type: 'text', text: `Image of object ${objectID} (primaryImageSmall)` });
+    ctx.content.image(result.data, result.mimeType);
+    images.push({ objectID, status: 'attached' });
+    attached++;
+    base64Bytes += result.data.length;
+  }
+  return { images, attached, base64Bytes };
+}
+
 export const metGetObject = tool('met_get_object', {
   title: 'Get Met Objects',
   description:
-    'Fetch full records for one or more Met Museum object IDs. Accepts up to 20 IDs per call and returns partial success — a single 404 does not fail the whole batch; per-ID failures are reported separately. ' +
-    'Object IDs come from met_search_collections (keyword search) or met_list_objects (browse by department or update date). Non-public-domain objects return empty image URLs. ' +
-    'The constituents array is null for anonymous or unattributed works; tags and measurements are null when the Met records none. ' +
-    'Records are returned whole and never truncated, so a batch of unusually large records may return fewer than requested — any that did not fit are listed in deferred[] with their sizes, to be re-requested in a follow-up call.',
+    'Fetch full records for one or more Met Museum object IDs. Accepts up to 20 IDs per call and returns partial success — a single 404 does not fail the whole batch; per-ID failures are reported separately. Object IDs come from met_search_collections (keyword search) or met_list_objects (browse by department or update date). Non-public-domain objects return empty image URLs. The constituents array is null for anonymous or unattributed works; tags and measurements are null when the Met records none. Records are returned whole and never truncated, so a batch of unusually large records may return fewer than requested — any that did not fit are listed in deferred[] with their sizes, to be re-requested in a follow-up call. Set includeImages to also receive the CC0 images of up to 3 returned records as image content a vision-capable model can look at.',
   annotations: { readOnlyHint: true, idempotentHint: true },
   /**
-   * The tool takes one input, so the shorthand a caller reaches for can only
-   * mean that one. Case-style variants (`object_ids`, `objectIds`) already
-   * resolve without a declaration.
+   * `ids` can only mean the ID list: the tool's other input is the
+   * includeImages flag, which no shorthand reaches for. Case-style variants
+   * (`object_ids`, `objectIds`) already resolve without a declaration.
    */
   inputAliases: { ids: 'objectIDs' },
   input: z.object({
@@ -299,9 +408,13 @@ export const metGetObject = tool('met_get_object', {
       .min(1)
       .max(20)
       .describe(
-        'One or more Met object IDs to fetch. Maximum 20 per call. IDs come from met_search_collections or met_list_objects. ' +
-          'A repeated ID is fetched and returned once, at its first position. ' +
-          'Partial failures are reported per ID rather than failing the whole batch.',
+        'One or more Met object IDs to fetch. Maximum 20 per call. IDs come from met_search_collections or met_list_objects. A repeated ID is fetched and returned once, at its first position. Partial failures are reported per ID rather than failing the whole batch.',
+      ),
+    includeImages: z
+      .boolean()
+      .default(false)
+      .describe(
+        'Also attach the web-display image (primaryImageSmall, about 600 px on the long edge) of the first 3 returned records that have hasCC0Image true, in request order, as image blocks in content[], each after a caption naming its objectID. images[] reports what happened for every returned record. The image bytes ride content[] only, so a client that hands the model only structuredContent will not show the images. Default false: no image is fetched.',
       ),
   }),
   output: z.object({
@@ -338,6 +451,19 @@ export const metGetObject = tool('met_get_object', {
       .describe(
         'Records that were fetched but did not fit the call’s cumulative budget on serialized structuredContent bytes, in request order. Re-call met_get_object with these IDs to retrieve them. Absent when every fetched record fit.',
       ),
+    images: z
+      .array(
+        z
+          .object({
+            objectID: z.number().int().describe('Object ID of a returned record.'),
+            status: ImageStatusSchema,
+          })
+          .describe("A returned record's image outcome."),
+      )
+      .optional()
+      .describe(
+        'Image outcome for each record in objects[], in request order; deferred and failed IDs get no entry. Present only when includeImages is true.',
+      ),
   }),
   enrichment: {
     notice: z
@@ -353,7 +479,7 @@ export const metGetObject = tool('met_get_object', {
       code: JsonRpcErrorCode.NotFound,
       when: 'Every requested objectID returned a 404 — all IDs are stale or invalid.',
       recovery:
-        'Verify the IDs with met_search_collections — they may be stale search-index entries.',
+        'The search index can carry IDs the object endpoint no longer serves, so searching again returns the same IDs. Drop these IDs rather than re-checking them with met_search_collections.',
       // A modeled answer about the IDs the caller sent, not a fault of this
       // server or the upstream — unlike all_failed, which keeps `error`.
       severity: 'notice',
@@ -361,9 +487,9 @@ export const metGetObject = tool('met_get_object', {
     {
       reason: 'all_failed',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'Every requested objectID failed due to network errors or API downtime.',
+      when: 'No object was fetched, no failure was a firewall block or a 500/502/503/504 outage, and the failures were neither all 404s nor all time-budget expiries — network errors, other HTTP errors, or 404s beside expiries.',
       recovery:
-        'Retry after a brief delay. If one ID fails repeatedly, verify it with met_search_collections.',
+        'Retry after a brief delay. If one ID keeps failing across retries, drop it from the batch.',
     },
     {
       reason: 'upstream_blocked',
@@ -371,6 +497,13 @@ export const metGetObject = tool('met_get_object', {
       retryable: false,
       when: "No object was fetched and the Met API's firewall refused requests with HTTP 403 — it blocks this server's address, not one object.",
       recovery: 'Wait several minutes before retrying, and send fewer requests.',
+    },
+    {
+      reason: 'upstream_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: "No object was fetched and a fetch exhausted its retries on HTTP 500, 502, 503, or 504 — an outage on the Met API's side, not a problem with the IDs.",
+      recovery:
+        'The Met API is failing on its side, so changing the request will not help. Wait a few minutes before retrying.',
     },
     {
       reason: 'retry_deadline_exceeded',
@@ -422,6 +555,19 @@ export const metGetObject = tool('met_get_object', {
      */
     let blockMessage: string | undefined;
     const blockedHint = ctx.recoveryFor('upstream_blocked').recovery.hint;
+    /**
+     * The first `upstream_unavailable` failure: a ladder that ended on a 5xx.
+     * Once every fetch started so far has settled and the Met has answered no ID
+     * in this call — no record, no 404 — the outage reads as the API's rather
+     * than one record's, so the IDs not yet started fail with it instead of each
+     * running a full ladder into it. A fetch still in flight may yet answer, so
+     * the skip waits for it rather than deciding first; any answer turns it off.
+     */
+    let outage: McpError | undefined;
+    let metAnswered = false;
+    const outageHint = ctx.recoveryFor('upstream_unavailable').recovery.hint;
+    /** Each fetch in flight, as a promise that settles with it and never rejects. */
+    const inFlight = new Set<Promise<unknown>>();
     /** A failure's detail, which may already end in a period, then its recovery. */
     const withHint = (detail: string, hint: string) => `${detail.replace(/\.+$/, '')}. ${hint}`;
 
@@ -430,6 +576,9 @@ export const metGetObject = tool('met_get_object', {
         const index = nextIndex++;
         const objectID = objectIDs[index];
         if (objectID == null) break;
+        while (outage !== undefined && !metAnswered && inFlight.size > 0) {
+          await Promise.race(inFlight);
+        }
         if (blockMessage !== undefined) {
           results[index] = {
             ok: false,
@@ -439,14 +588,27 @@ export const metGetObject = tool('met_get_object', {
           };
           continue;
         }
+        if (outage !== undefined && !metAnswered) {
+          results[index] = {
+            ok: false,
+            objectID,
+            kind: 'error',
+            error: withHint(`Object ${objectID} was not requested. ${outage.message}`, outageHint),
+          };
+          continue;
+        }
+        const fetching = service.getObject(objectID, ctx, deadline);
+        const settled = Promise.allSettled([fetching]);
+        inFlight.add(settled);
         try {
-          const record = await service.getObject(objectID, ctx, deadline);
+          const record = await fetching;
+          metAnswered = true;
           if (record == null) {
             results[index] = {
               ok: false,
               objectID,
               kind: 'not_found',
-              error: `Object ${objectID} not found in the Met collection. Verify the ID with met_search_collections.`,
+              error: `Object ${objectID} not found in the Met collection — the object endpoint does not serve it, though the search index can still list it. Drop this ID rather than searching for it again.`,
             };
           } else {
             results[index] = { ok: true, objectID, record };
@@ -456,18 +618,23 @@ export const metGetObject = tool('met_get_object', {
           // failed[] lists the IDs the cancellation cut off.
           if (ctx.signal.aborted) throw err;
           const message = err instanceof Error ? err.message : String(err);
-          const reason = err instanceof McpError ? err.data?.reason : undefined;
+          const failure = err instanceof McpError ? err : undefined;
+          const reason = failure?.data?.reason;
           const blocked = reason === 'upstream_blocked';
+          const unavailable = reason === 'upstream_unavailable';
           if (blocked) blockMessage ??= message;
+          if (unavailable) outage ??= failure;
           results[index] = {
             ok: false,
             objectID,
             kind: reason === 'retry_deadline_exceeded' ? 'deadline' : 'error',
             error: withHint(
               `Failed to fetch object ${objectID}: ${message}`,
-              blocked ? blockedHint : 'Retry after a brief delay.',
+              blocked ? blockedHint : unavailable ? outageHint : 'Retry after a brief delay.',
             ),
           };
+        } finally {
+          inFlight.delete(settled);
         }
       }
     };
@@ -514,7 +681,8 @@ export const metGetObject = tool('met_get_object', {
         throw ctx.fail('upstream_blocked', `No object could be fetched. ${blockMessage}`);
       }
       // A batch the budget ran out on is one expiry, not N upstream faults — but
-      // only when nothing else failed: a 404 or an upstream error beside it stays all_failed.
+      // only when nothing else failed: a 404 or an upstream error beside it falls
+      // through to the outage, else all_failed.
       if (failItems.every((f) => f.kind === 'deadline')) {
         throw ctx.fail(
           'retry_deadline_exceeded',
@@ -522,6 +690,15 @@ export const metGetObject = tool('met_get_object', {
             ? `Object ${objectIDs[0]} could not be fetched before the call's time budget ran out.`
             : `All ${objectIDs.length} object fetches ran out of the call's time budget.`,
         );
+      }
+      // A 5xx outage anywhere in a batch that fetched nothing is the answer, not
+      // the network errors or 404s beside it.
+      if (outage !== undefined) {
+        const { status, retryAfter } = outage.data ?? {};
+        throw ctx.fail('upstream_unavailable', `No object could be fetched. ${outage.message}`, {
+          status,
+          ...(retryAfter != null && { retryAfter }),
+        });
       }
       throw ctx.fail(
         'all_failed',
@@ -537,13 +714,29 @@ export const metGetObject = tool('met_get_object', {
       failed: failed.length,
       deferred: deferred.length,
     });
-    if (deferred.length === 0) return { objects, failed };
 
-    ctx.enrich.notice(
-      `Returned ${objects.length} of ${succeeded.length} fetched records — ${usedBytes} bytes of serialized structuredContent against a ${BATCH_BUDGET_BYTES}-byte budget measured on that surface alone; content[] renders the same records again, so the delivered response is roughly twice that. ` +
-        `The remaining ${deferred.length} would exceed the budget. Re-call met_get_object with the deferred objectIDs to retrieve them; each record's listed size is on the same structuredContent scale, so sum them against the budget before requesting several.`,
-    );
-    return { objects, failed, deferred };
+    // After admission, so only returned records get an image or an entry.
+    const attachment = input.includeImages
+      ? await attachImages(objects, service, ctx, deadline)
+      : undefined;
+
+    if (deferred.length > 0) {
+      // The image blocks are outside the budget but inside the response, so
+      // the delivered size stated here has to count them.
+      const imageClause = attachment?.attached
+        ? `, plus ${attachment.attached} attached image block${attachment.attached === 1 ? '' : 's'} (${attachment.base64Bytes} bytes of base64)`
+        : '';
+      ctx.enrich.notice(
+        `Returned ${objects.length} of ${succeeded.length} fetched records — ${usedBytes} bytes of serialized structuredContent against a ${BATCH_BUDGET_BYTES}-byte budget measured on that surface alone; content[] renders the same records again, so the delivered response is roughly twice that${imageClause}. ` +
+          `The remaining ${deferred.length} would exceed the budget. Re-call met_get_object with the deferred objectIDs to retrieve them; each record's listed size is on the same structuredContent scale, so sum them against the budget before requesting several.`,
+      );
+    }
+    return {
+      objects,
+      failed,
+      ...(deferred.length > 0 && { deferred }),
+      ...(attachment && { images: attachment.images }),
+    };
   },
 
   format: (result) => {
@@ -570,13 +763,27 @@ export const metGetObject = tool('met_get_object', {
     const labeledLink = (label: string, v: string) =>
       isHttpUrl(v) ? `[${label}](${v})` : `${label}: ${escapeMarkdown(v)}`;
 
+    /**
+     * The attribution as the Met writes it: qualifier and name joined by a
+     * space, then the suffix — directly after a leading comma (`, Paris`), after
+     * a space otherwise (`(r. 1876–1909)`). The record keeps each part raw.
+     */
+    const attribution = (obj: (typeof result.objects)[number]) => {
+      const named = [obj.artistPrefix.trim(), obj.artistDisplayName.trim()]
+        .filter(Boolean)
+        .join(' ');
+      const suffix = obj.artistSuffix.trim();
+      if (!named || !suffix) return named || suffix;
+      return suffix.startsWith(',') ? `${named}${suffix}` : `${named} ${suffix}`;
+    };
+
     for (const obj of result.objects) {
       lines.push(`## ${escapeMarkdown(obj.title) || '(Untitled)'} — Object ${obj.objectID}`);
       lines.push(
         `**isPublicDomain:** ${obj.isPublicDomain ? 'Yes (CC0)' : 'No'} | **hasCC0Image:** ${obj.hasCC0Image ? 'Yes' : 'No'} | **isHighlight:** ${obj.isHighlight ? 'Yes' : 'No'} | **isTimelineWork:** ${obj.isTimelineWork ? 'Yes' : 'No'}`,
       );
       lines.push(
-        `**Artist:** ${prose(obj.artistDisplayName)}${obj.artistDisplayBio ? ` (${escapeMarkdown(obj.artistDisplayBio)})` : ''}`,
+        `**Artist:** ${prose(attribution(obj))}${obj.artistDisplayBio ? ` (${escapeMarkdown(obj.artistDisplayBio)})` : ''} | **Artist role:** ${prose(obj.artistRole)}`,
       );
       lines.push(`**Nationality:** ${prose(obj.artistNationality)}`);
       // One empty bound beside a set one renders as nothing, so the range reads
@@ -585,7 +792,7 @@ export const metGetObject = tool('met_get_object', {
         `**Artist dates:** ${obj.artistBeginDate || obj.artistEndDate ? `${escapeMarkdown(obj.artistBeginDate)}–${escapeMarkdown(obj.artistEndDate)}` : '—'}`,
       );
       lines.push(
-        `**Department:** ${prose(obj.department)} | **Object name:** ${prose(obj.objectName)} | **Classification:** ${prose(obj.classification)}`,
+        `**Department:** ${prose(obj.department)} | **departmentId:** ${obj.departmentId ?? '—'} | **Object name:** ${prose(obj.objectName)} | **Classification:** ${prose(obj.classification)}`,
       );
       // A null range means the Met has no machine-readable date — render the
       // human-readable field alone rather than a fabricated or empty span.
@@ -632,8 +839,12 @@ export const metGetObject = tool('met_get_object', {
             .join('; ')
         : '—';
       lines.push(`**Measurements:** ${measurements}`);
-      lines.push(`**Accession:** ${prose(obj.accessionNumber)}`);
+      lines.push(
+        `**Accession:** ${prose(obj.accessionNumber)} | **Accession year:** ${prose(obj.accessionYear)}`,
+      );
       lines.push(`**Credit:** ${prose(obj.creditLine)}`);
+      lines.push(`**Rights:** ${prose(obj.rightsAndReproduction)}`);
+      lines.push(`**Metadata date:** ${prose(obj.metadataDate)}`);
       lines.push(`**Gallery:** ${prose(obj.GalleryNumber)}`);
       lines.push(`**URL:** ${orDash(destination(obj.objectURL))}`);
       lines.push(`**Image (full):** ${orDash(destination(obj.primaryImage))}`);
@@ -674,6 +885,14 @@ export const metGetObject = tool('met_get_object', {
       lines.push('', '## Deferred — batch byte budget');
       for (const d of result.deferred) {
         lines.push(`- **${d.objectID}:** ${d.bytes} bytes`);
+      }
+    }
+
+    // On field presence too: absent unless the caller set includeImages.
+    if (result.images?.length) {
+      lines.push('', '## Images');
+      for (const image of result.images) {
+        lines.push(`- **${image.objectID}:** ${image.status}`);
       }
     }
 

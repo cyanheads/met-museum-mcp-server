@@ -45,6 +45,14 @@ export const metListDepartments = tool('met_list_departments', {
       recovery: 'Wait several minutes before retrying, and send fewer requests.',
     },
     {
+      reason: 'upstream_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      thrownBy: 'service',
+      when: 'The Met API answered HTTP 500, 502, 503, or 504 until the retry ladder ran out — an outage on its side.',
+      recovery:
+        'The Met API is failing on its side, so changing the request will not help. Wait a few minutes before retrying.',
+    },
+    {
       reason: 'retry_deadline_exceeded',
       code: JsonRpcErrorCode.Timeout,
       thrownBy: 'service',

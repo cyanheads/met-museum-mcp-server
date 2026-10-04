@@ -236,6 +236,21 @@ describe('content[] escaping — every tool, every rendered upstream text field'
   }
 });
 
+describe('met_get_object probe coverage', () => {
+  it('probes the attribution, rights, and acquisition fields as upstream text', () => {
+    expect(synthesize(metGetObject.output, 'valid').probes).toEqual(
+      expect.arrayContaining([
+        'objects[].artistPrefix',
+        'objects[].artistSuffix',
+        'objects[].artistRole',
+        'objects[].rightsAndReproduction',
+        'objects[].metadataDate',
+        'objects[].accessionYear',
+      ]),
+    );
+  });
+});
+
 describe('structuredContent is untouched by the render-boundary escaping', () => {
   let fetchMock: ReturnType<typeof vi.fn>;
 

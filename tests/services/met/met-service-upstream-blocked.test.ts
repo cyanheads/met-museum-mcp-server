@@ -135,7 +135,7 @@ describe('a 403 from the Met API (#31)', () => {
       expect(fetchMock).toHaveBeenCalledTimes(1);
     });
 
-    it('leaves the keyword-only count best-effort: a 403 there degrades the hint to null', async () => {
+    it('leaves the keyword-only count best-effort: a 403 there degrades the zero-match count to null', async () => {
       fetchMock.mockImplementation(blocked);
       expect(await getMetService().countKeywordMatches('horse', ...call())).toBeNull();
       expect(fetchMock).toHaveBeenCalledTimes(1);

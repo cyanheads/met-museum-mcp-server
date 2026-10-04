@@ -5,7 +5,11 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { getMetService, startCallDeadline } from '@/services/met/met-service.js';
+import {
+  getMetService,
+  METADATA_DATE_FLOOR,
+  startCallDeadline,
+} from '@/services/met/met-service.js';
 
 /** A blank from a form client is "unset", never a value to validate. */
 const blankAsUnset = <T extends z.ZodType>(schema: T) =>
@@ -24,7 +28,12 @@ function isCalendarDate(value: string): boolean {
   );
 }
 
-/** The notice for an empty list: which filters matched nothing, and how to widen it. */
+/**
+ * The notice for an empty list: which filters matched nothing, and how to widen
+ * it. `updatedSince` is the caller's date, before any clamp to the floor — a date
+ * at or before the floor already covers every record, so it is never the filter
+ * to widen.
+ */
 function emptyListNotice(departmentId: number | undefined, updatedSince: string | undefined) {
   const filters = [
     ...(departmentId != null ? [`departmentId ${departmentId}`] : []),
@@ -32,12 +41,29 @@ function emptyListNotice(departmentId: number | undefined, updatedSince: string 
   ];
   if (filters.length === 0) return 'The Met returned no object IDs for the unfiltered collection.';
   const lead = `No objects match ${filters.join(' and ')}.`;
+  if (updatedSince != null && updatedSince <= METADATA_DATE_FLOOR) {
+    return departmentId != null
+      ? `${lead} ${updatedSince} already covers every record, so the empty list comes from departmentId ${departmentId}; pass another departmentId.`
+      : `${lead} ${updatedSince} already covers every record, and the Met returned no object IDs for the collection.`;
+  }
   const today = new Date().toISOString().slice(0, 10);
   if (updatedSince != null && updatedSince > today) {
     return `${lead} ${updatedSince} is after today's date (UTC), so no record has been created or revised since then; pass an earlier updatedSince.`;
   }
   const widen = updatedSince != null ? 'Pass an earlier updatedSince' : 'Pass another departmentId';
   return `${lead} ${widen}${filters.length > 1 ? ' or drop a filter' : ''} to widen the list.`;
+}
+
+/**
+ * The `effectiveQuery` echo: the filters as sent, `updatedSince` after its clamp
+ * to the floor, each as `name=` and its JSON-encoded value in schema order.
+ */
+function describeFilters(departmentId: number | undefined, updatedSince: string | undefined) {
+  const applied = [
+    ...(departmentId != null ? [`departmentId=${JSON.stringify(departmentId)}`] : []),
+    ...(updatedSince != null ? [`updatedSince=${JSON.stringify(updatedSince)}`] : []),
+  ];
+  return applied.length > 0 ? applied.join(', ') : 'no filter (whole collection)';
 }
 
 export const metListObjects = tool('met_list_objects', {
@@ -64,7 +90,7 @@ export const metListObjects = tool('met_list_objects', {
         })
         .optional(),
     ).describe(
-      'List only objects whose record was created or revised on or after this date, the day itself included, as YYYY-MM-DD (e.g., "2026-09-01") — no time part and no other date format. A date later than the newest update returns an empty list, not an error.',
+      'List only objects whose record was created or revised on or after this date, the day itself included, as YYYY-MM-DD (e.g., "2026-09-01") — no time part and no other date format. It compares the UTC date of each record\'s metadataDate, which met_get_object returns. A date later than the newest update returns an empty list, not an error.',
     ),
     limit: z
       .number()
@@ -125,6 +151,12 @@ export const metListObjects = tool('met_list_objects', {
       .describe(
         'Present only when total is 0: names the filters that matched nothing and how to widen the list.',
       ),
+    effectiveQuery: z
+      .string()
+      .optional()
+      .describe(
+        'The filters as applied, as name=value pairs with JSON-encoded values — an updatedSince before 1753-01-01 shows as 1753-01-01, the date sent — or "no filter (whole collection)". limit and offset are left out.',
+      ),
   },
   /**
    * Severity separates the modeled outcomes from the incidents: a filter value
@@ -155,6 +187,14 @@ export const metListObjects = tool('met_list_objects', {
       recovery: 'Wait several minutes before retrying, and send fewer requests.',
     },
     {
+      reason: 'upstream_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      thrownBy: 'service',
+      when: 'The Met API answered HTTP 500, 502, 503, or 504 to the department lookup or the ID list until the retry ladder ran out — an outage on its side.',
+      recovery:
+        'The Met API is failing on its side, so changing the request will not help. Wait a few minutes before retrying.',
+    },
+    {
       reason: 'retry_deadline_exceeded',
       code: JsonRpcErrorCode.Timeout,
       thrownBy: 'service',
@@ -169,6 +209,16 @@ export const metListObjects = tool('met_list_objects', {
     if (updatedSince != null && !isCalendarDate(updatedSince)) {
       throw ctx.fail('invalid_date', `updatedSince ${updatedSince} is not a calendar date.`);
     }
+
+    /**
+     * The date sent as `metadataDate`, and so the list's cache key. Upstream
+     * answers any date before the floor with nothing, though such a date asks
+     * for every record — which the floor itself lists — so it is sent as the floor.
+     */
+    const appliedUpdatedSince =
+      updatedSince != null && updatedSince < METADATA_DATE_FLOOR
+        ? METADATA_DATE_FLOOR
+        : updatedSince;
 
     // One budget for every request below: the department lookup and the ID list.
     const deadline = startCallDeadline(ctx.signal);
@@ -191,13 +241,19 @@ export const metListObjects = tool('met_list_objects', {
     ctx.log.info('Met object list', {
       departmentId,
       updatedSince,
+      appliedUpdatedSince,
       limit: input.limit,
       offset: input.offset,
     });
 
-    const result = await getMetService().listObjects(input, ctx, deadline);
+    const result = await getMetService().listObjects(
+      { ...input, updatedSince: appliedUpdatedSince },
+      ctx,
+      deadline,
+    );
 
     if (result.total === 0) ctx.enrich.notice(emptyListNotice(departmentId, updatedSince));
+    ctx.enrich.echo(describeFilters(departmentId, appliedUpdatedSince));
     return result;
   },
 

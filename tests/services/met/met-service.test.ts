@@ -1,7 +1,7 @@
 /**
  * @fileoverview Tests for MetService — `/v1.1/search` paging and its 10,000
  * window, retry of Timeout-coded failures, the keyword-only count behind the
- * `no_results` hint, cached department-ID validation, and object normalization.
+ * zero-match notice, cached department-ID validation, and object normalization.
  * Exercises the real service with a mocked global fetch; the search-tool cases
  * here run the tool over that real service through `runToolContract`, the seam
  * that includes the URL building and window arithmetic under test.
@@ -20,6 +20,7 @@ import type { z } from 'zod';
 import { metGetObject } from '@/mcp-server/tools/definitions/met-get-object.tool.js';
 import { metSearchCollections } from '@/mcp-server/tools/definitions/met-search-collections.tool.js';
 import {
+  DEPARTMENT_ID_BY_NAME,
   getMetService,
   initMetService,
   OBJECT_IDS_CACHE_MAX_BYTES,
@@ -569,7 +570,170 @@ const rawObjects = {
     objectDate: 'blade, 18th century; mounting, 19th century',
     objectURL: 'https://www.metmuseum.org/art/collection/search/21830',
   },
+
+  /**
+   * 437403 — a "Style of" attribution: `artistPrefix` set, the dates Rembrandt's
+   * own, the prefix repeated in the constituent name, and a credit-line year
+   * (1959) that is not `accessionYear` (1960). Trimmed to the attribution,
+   * department, and acquisition fields.
+   */
+  styleOfAttribution: {
+    objectID: 437403,
+    title: 'Christ and the Woman of Samaria',
+    department: 'European Paintings',
+    artistRole: 'Artist',
+    artistPrefix: 'Style of',
+    artistDisplayName: 'Rembrandt',
+    artistDisplayBio: 'Dutch, ca. 1655',
+    artistSuffix: '',
+    artistNationality: 'Dutch',
+    artistBeginDate: '1606',
+    artistEndDate: '1669',
+    constituents: [
+      {
+        constituentID: 162297,
+        role: 'Artist',
+        name: 'Style of Rembrandt',
+        constituentULAN_URL: 'http://vocab.getty.edu/page/ulan/500011051',
+        constituentWikidata_URL: 'https://www.wikidata.org/wiki/Q5598',
+        gender: '',
+      },
+    ],
+    accessionNumber: '60.71.14',
+    accessionYear: '1960',
+    creditLine: 'Bequest of Lillian S. Timken, 1959',
+    rightsAndReproduction: '',
+    metadataDate: '2025-09-17T04:49:46.407Z',
+  },
+
+  /**
+   * 456947 — a patron: `artistSuffix` carries the reign, `artistRole` is
+   * `Patron`, and the second constituent's prefix rides in its name. Trimmed to
+   * the attribution, department, and acquisition fields.
+   */
+  patronAttribution: {
+    objectID: 456947,
+    title: "Sitara, Interior Door Curtain of the Ka'ba",
+    department: 'Islamic Art',
+    artistRole: 'Patron',
+    artistPrefix: '',
+    artistDisplayName: 'Sultan Abdülhamid II',
+    artistDisplayBio: '',
+    artistSuffix: '(r. 1876–1909)',
+    artistNationality: 'Ottoman Turkish',
+    artistBeginDate: '1842',
+    artistEndDate: '1918',
+    constituents: [
+      {
+        constituentID: 196881,
+        role: 'Patron',
+        name: 'Sultan Abdülhamid II',
+        constituentULAN_URL: '',
+        constituentWikidata_URL: '',
+        gender: '',
+      },
+      {
+        constituentID: 203933,
+        role: 'Workshop director',
+        name: 'Workshop of Warshat al-Khurunfish',
+        constituentULAN_URL: '',
+        constituentWikidata_URL: '',
+        gender: '',
+      },
+    ],
+    accessionNumber: '2009.59.1',
+    accessionYear: '2009',
+    creditLine:
+      'Gift of Professor Maan Z. Madina, in memory of his mother, Najiyya Khanum al-Kurdi, 2009',
+    rightsAndReproduction: '',
+    metadataDate: '2026-04-18T04:56:48.367Z',
+  },
+
+  /**
+   * 488978 — a copyrighted work carrying its rights holder, in the department
+   * whose record name is not its `met_list_departments` name. Trimmed to the
+   * rights, department, and acquisition fields.
+   */
+  copyrightedWork: {
+    objectID: 488978,
+    title: 'Autumn Rhythm: Number 30, 1950',
+    isPublicDomain: false,
+    department: 'Modern and Contemporary Art',
+    artistRole: 'Artist',
+    artistDisplayName: 'Jackson Pollock',
+    accessionNumber: '57.92',
+    accessionYear: '1957',
+    creditLine: 'George A. Hearn Fund, 1957',
+    rightsAndReproduction:
+      '© 2026 Pollock-Krasner Foundation / Artists Rights Society (ARS), New York',
+    metadataDate: '2026-10-01T04:59:29.693Z',
+  },
+
+  /**
+   * 286850 — a full date in `accessionYear` and a `metadataDate` with no
+   * fractional seconds. Trimmed to the department and acquisition fields.
+   */
+  fullDateAccession: {
+    objectID: 286850,
+    title: '[Countess de Castiglione]',
+    department: 'Photographs',
+    accessionNumber: '2005.100.429',
+    accessionYear: '2005-02-15',
+    creditLine: 'Gilman Collection, Gift of The Howard Gilman Foundation, 2005',
+    rightsAndReproduction: '',
+    metadataDate: '2025-03-06T04:54:30Z',
+  },
+
+  /**
+   * 512 — an empty `accessionYear`, a two-digit fraction in `metadataDate`, and
+   * department 1 under its record name. Trimmed to the department and
+   * acquisition fields.
+   */
+  americanWing: {
+    objectID: 512,
+    title: 'Bible',
+    department: 'The American Wing',
+    artistRole: 'Maker',
+    artistDisplayName: 'George Edward Eyre',
+    accessionNumber: 'Inst.1986.1',
+    accessionYear: '',
+    creditLine: 'Gift of Daniel M. C. Hopping, 1986',
+    rightsAndReproduction: '',
+    metadataDate: '2023-02-07T04:46:51.34Z',
+  },
 } as const;
+
+/**
+ * Every name the department map holds: the 19 `met_list_departments` names
+ * (live, 2026-10-04), then the five record `department` names that differ from
+ * them, each observed on a live record of that department's `/v1/objects` list.
+ */
+const departmentNames: [string, number][] = [
+  ['American Decorative Arts', 1],
+  ['Ancient West Asian Art', 3],
+  ['Arms and Armor', 4],
+  ['Arts of Africa, Oceania, and the Americas', 5],
+  ['Asian Art', 6],
+  ['The Cloisters', 7],
+  ['The Costume Institute', 8],
+  ['Drawings and Prints', 9],
+  ['Egyptian Art', 10],
+  ['European Paintings', 11],
+  ['European Sculpture and Decorative Arts', 12],
+  ['Greek and Roman Art', 13],
+  ['Islamic Art', 14],
+  ['The Robert Lehman Collection', 15],
+  ['The Libraries', 16],
+  ['Medieval Art', 17],
+  ['Musical Instruments', 18],
+  ['Photographs', 19],
+  ['Modern Art', 21],
+  ['The American Wing', 1],
+  ['The Michael C. Rockefeller Wing', 5],
+  ['Costume Institute', 8],
+  ['Robert Lehman Collection', 15],
+  ['Modern and Contemporary Art', 21],
+];
 
 /** `/v1/objects/{id}` serving each record at its own ID; any other ID is unrouted. */
 function objectsUpstream(...records: { objectID: number }[]) {
@@ -650,7 +814,7 @@ describe('MetService', () => {
         init?.signal?.addEventListener('abort', () => reject(init.signal?.reason));
       });
 
-    it('retries an upstream 504 on the ordinary ladder and surfaces it as the upstream error', async () => {
+    it('retries an upstream 504 on the ordinary ladder, then surfaces it as the outage (#33)', async () => {
       vi.useFakeTimers();
       fetchMock.mockImplementation(gatewayTimeout);
       const ctx = createMockContext({ errors: metSearchCollections.errors });
@@ -663,16 +827,16 @@ describe('MetService', () => {
         code: number;
         message: string;
         data: Record<string, unknown>;
+        cause: { data: Record<string, unknown> };
       };
 
       expect(fetchMock).toHaveBeenCalledTimes(4);
-      expect(err.code).toBe(JsonRpcErrorCode.Timeout);
-      expect(err.message).toContain('Status: 504');
-      expect(err.data.status).toBe(504);
-      expect(err.data.errorSource).toBe('FetchHttpError');
-      expect(err.data.retryAttempts).toBe(4);
-      expect(err.data.reason).toBeUndefined();
-      expect(err.data.retryable).toBeUndefined();
+      expect(err.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+      expect(err.message).toBe('The Met API answered with a server error (HTTP 504).');
+      expect(err.data).toEqual({ reason: 'upstream_unavailable', status: 504 });
+      // The exhausted ladder's own 504 is the cause: four attempts, never relabeled.
+      expect(err.cause.data.errorSource).toBe('FetchHttpError');
+      expect(err.cause.data.retryAttempts).toBe(4);
     });
 
     it('retries a request-timer abort (FetchTimeout) the same way', async () => {
@@ -712,7 +876,7 @@ describe('MetService', () => {
       expect(result.total).toBe(3);
     });
 
-    it('reaches the caller through the tool contract as the 504, with no search_timeout reason', async () => {
+    it('reaches the caller through the tool contract as upstream_unavailable, with no search_timeout reason', async () => {
       vi.useFakeTimers();
       fetchMock.mockImplementation(gatewayTimeout);
 
@@ -720,18 +884,20 @@ describe('MetService', () => {
       await vi.runAllTimersAsync();
       const result = await pending;
 
+      expect(fetchMock).toHaveBeenCalledTimes(4);
       expect(result.isError).toBe(true);
       const error = (
         result.structuredContent as { error: { code: number; data: Record<string, unknown> } }
       ).error;
-      expect(error.code).toBe(JsonRpcErrorCode.Timeout);
+      expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
       expect(error.data.status).toBe(504);
-      expect(error.data.reason).toBeUndefined();
+      expect(error.data.reason).toBe('upstream_unavailable');
       const text = (result.content ?? [])
         .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
         .map((block) => block.text)
         .join('\n');
-      expect(text).toContain('Status: 504');
+      expect(text).toContain('(HTTP 504)');
+      expect(text).toContain('reason upstream_unavailable');
       expect(text).not.toContain('search_timeout');
       expect(text).not.toContain('too large');
     });
@@ -915,6 +1081,24 @@ describe('MetService', () => {
       expect(result.nextOffset).toBeNull();
     });
 
+    it('ends the walk on an empty page inside the reachable window rather than repeating its offset (#46)', async () => {
+      fetchMock.mockResolvedValue(jsonResponse({ total: 5000, objectIDs: null }));
+      const result = await getMetService().search(
+        { q: 'horse', limit: 100, offset: 4000 },
+        ...call(),
+      );
+
+      expect(result).toEqual({
+        total: 5000,
+        objectIDs: [],
+        returned: 0,
+        truncated: false,
+        remaining: 0,
+        nextOffset: null,
+        offset: 4000,
+      });
+    });
+
     it('echoes the applied default of 0 when offset is omitted (#17)', async () => {
       fetchMock.mockImplementation(searchUpstream(5));
       const result = await getMetService().search({ q: 'rare', limit: 20 }, ...call());
@@ -939,7 +1123,86 @@ describe('MetService', () => {
     });
   });
 
-  describe('countKeywordMatches — the keyword-only count behind the no_results hint (#25)', () => {
+  /**
+   * `/v1.1/search` honors one keyword-scope flag: `title=true` or `tags=true`.
+   * With both it answers the title set and drops `tags`, and it ignores a
+   * `false` value, so the service sends exactly one flag, set to `true`.
+   */
+  describe('search — matchField restricts the keyword match (#35)', () => {
+    /** The query parameters of the one search request the test issued. */
+    const sentParams = () => [
+      ...new URL(String(fetchMock.mock.calls[0]?.[0])).searchParams.entries(),
+    ];
+
+    it.each([
+      ['title', 'title'],
+      ['tags', 'tags'],
+    ] as const)(
+      'matchField %s sends %s=true after the paging parameters',
+      async (matchField, flag) => {
+        fetchMock.mockImplementation(searchUpstream(36));
+        await getMetService().search({ q: 'sunflower', limit: 20, matchField }, ...call());
+
+        expect(sentParams()).toEqual([
+          ['q', 'sunflower'],
+          ['offset', '0'],
+          ['limit', '20'],
+          [flag, 'true'],
+        ]);
+      },
+    );
+
+    it('sends neither flag, and no false value, when matchField is unset', async () => {
+      fetchMock.mockImplementation(searchUpstream(178));
+      await getMetService().search({ q: 'sunflower', limit: 20 }, ...call());
+
+      const keys = sentParams().map(([key]) => key);
+      expect(keys).not.toContain('title');
+      expect(keys).not.toContain('tags');
+      expect(sentParams().some(([, value]) => value === 'false')).toBe(false);
+    });
+
+    it('composes with every other filter in the one request', async () => {
+      fetchMock.mockImplementation(searchUpstream(20));
+      await getMetService().search(
+        { q: 'sunflower', limit: 20, matchField: 'title', hasImages: true, departmentId: 11 },
+        ...call(),
+      );
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(sentParams()).toEqual([
+        ['q', 'sunflower'],
+        ['offset', '0'],
+        ['limit', '20'],
+        ['title', 'true'],
+        ['hasImages', 'true'],
+        ['departmentId', '11'],
+      ]);
+    });
+
+    it('leaves paging unchanged: one request per page, the flag on every page', async () => {
+      fetchMock.mockImplementation(searchUpstream(36));
+      const seen: number[] = [];
+      let offset: number | null = 0;
+      while (offset !== null) {
+        const page = await getMetService().search(
+          { q: 'sunflower', limit: 10, offset, matchField: 'tags' },
+          ...call(),
+        );
+        seen.push(...page.objectIDs);
+        offset = page.nextOffset;
+      }
+
+      expect(seen).toEqual(Array.from({ length: 36 }, (_, i) => i + 1));
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+      for (const url of searchRequests(fetchMock)) {
+        expect(url.searchParams.getAll('tags')).toEqual(['true']);
+        expect(url.searchParams.has('title')).toBe(false);
+      }
+    });
+  });
+
+  describe('countKeywordMatches — the keyword-only count behind the zero-match notice (#25)', () => {
     it('sends one limit=1 request carrying q alone and returns the upstream total', async () => {
       fetchMock.mockImplementation(searchUpstream(178));
       const total = await getMetService().countKeywordMatches('sunflower', ...call());
@@ -991,6 +1254,23 @@ describe('MetService', () => {
   describe('met_search_collections — the reachable window on both surfaces (#27)', () => {
     type Structured = Record<string, unknown> & { notice?: string };
 
+    it('carries exactly the output fields and the query echo on a page inside the window', async () => {
+      fetchMock.mockImplementation(searchUpstream(178));
+      const result = await runToolContract(metSearchCollections, { q: 'sunflower' });
+
+      expect(result.structuredContent).toEqual({
+        total: 178,
+        objectIDs: Array.from({ length: 20 }, (_, i) => i + 1),
+        returned: 20,
+        truncated: true,
+        remaining: 158,
+        nextOffset: 20,
+        offset: 0,
+        effectiveQuery: 'q="sunflower"',
+      });
+      expect(textOf(result)).toContain('Query: q="sunflower"');
+    });
+
     it('discloses the window when total exceeds 10,000, on a truncated page', async () => {
       fetchMock.mockImplementation(searchUpstream(14_398));
       const result = await runToolContract(metSearchCollections, { q: 'horse', limit: 20 });
@@ -1034,17 +1314,22 @@ describe('MetService', () => {
       expect(textOf(result)).toContain('**Returned IDs:** 0 (offset beyond result set)');
     });
 
-    it('marks an offset of exactly total as beyond the result set, with no window notice', async () => {
+    it('marks an offset of exactly total as beyond the result set, with no notice of either kind', async () => {
       fetchMock.mockImplementation(searchUpstream(178));
       const result = await runToolContract(metSearchCollections, { q: 'sunflower', offset: 178 });
 
       expect(result.isError).toBeFalsy();
       const structured = result.structuredContent as Structured;
       expect(structured.total).toBe(178);
+      expect(structured.objectIDs).toEqual([]);
       expect(structured.notice).toBeUndefined();
+      expect(structured.effectiveQuery).toBe('q="sunflower"');
       const text = textOf(result);
-      expect(text).toContain('(offset beyond result set)');
+      expect(text).toContain('**Returned IDs:** 0 (offset beyond result set)');
       expect(text).not.toContain('10,000');
+      expect(text).not.toContain('matches no object');
+      // The empty page asks for no keyword-only count: total is not 0.
+      expect(fetchMock).toHaveBeenCalledTimes(1);
     });
 
     it('renders the last page of a result set inside the window as (complete), with no notice', async () => {
@@ -1099,8 +1384,10 @@ describe('MetService', () => {
         const structured = result.structuredContent as Structured;
         expect(structured).toMatchObject({ total, offset, returned, remaining, nextOffset });
         expect(structured.truncated).toBe(nextOffset !== null);
+        expect(structured.effectiveQuery).toBe('q="horse"');
         const text = textOf(result);
         expect(text).toContain(`**Returned IDs:** ${returned} ${marker}`);
+        expect(text).toContain('Query: q="horse"');
         if (notice) {
           expect(structured.notice).toContain('first 10,000 of');
           expect(text).toContain('first 10,000 of');
@@ -1141,6 +1428,29 @@ describe('MetService', () => {
       expect(textOf(result)).toContain('**Returned IDs:** 499 (truncated)');
     });
 
+    it('ends paging on both surfaces when a mid-window page comes back empty (#46)', async () => {
+      fetchMock.mockImplementation(
+        routes({ [SEARCH_PATH]: () => jsonResponse({ total: 5000, objectIDs: null }) }),
+      );
+      const result = await runToolContract(metSearchCollections, {
+        q: 'horse',
+        offset: 4000,
+        limit: 100,
+      });
+
+      expect(result.structuredContent).toMatchObject({
+        total: 5000,
+        returned: 0,
+        remaining: 0,
+        truncated: false,
+        nextOffset: null,
+        offset: 4000,
+      });
+      const text = textOf(result);
+      expect(text).toContain('**Returned IDs:** 0 (complete)');
+      expect(text).toContain('**Next offset:** none');
+    });
+
     it('rejects isPublicDomain at the schema, naming the key, before any request', async () => {
       // An undeclared key by construction, so the typed argument cannot express it.
       const result = await runToolContract(metSearchCollections, {
@@ -1153,6 +1463,43 @@ describe('MetService', () => {
       expect(error.code).toBe(JsonRpcErrorCode.InvalidParams);
       expect(textOf(result)).toContain('isPublicDomain');
       expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['"artistOrCulture"', 'artistOrCulture'],
+      ['true', true],
+      ['"Title"', 'Title'],
+    ])('rejects matchField %s at the schema, before any request (#35)', async (_label, value) => {
+      const result = await runToolContract(metSearchCollections, {
+        q: 'sunflower',
+        matchField: value,
+      } as unknown as z.input<typeof metSearchCollections.input>);
+
+      expect(result.isError).toBe(true);
+      expect((result.structuredContent as { error: { code: number } }).error.code).toBe(
+        JsonRpcErrorCode.InvalidParams,
+      );
+      expect(textOf(result)).toContain('matchField');
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it('accepts matchField title and tags, each a one-request page on both surfaces (#35)', async () => {
+      fetchMock.mockImplementation(searchUpstream(36));
+      for (const matchField of ['title', 'tags'] as const) {
+        const result = await runToolContract(metSearchCollections, {
+          q: 'sunflower',
+          matchField,
+        });
+        expect(result.isError).toBeFalsy();
+        expect((result.structuredContent as { effectiveQuery: string }).effectiveQuery).toBe(
+          `q="sunflower", matchField="${matchField}"`,
+        );
+        expect(textOf(result)).toContain('**Total matches:** 36');
+      }
+      expect(searchRequests(fetchMock).map((url) => url.search)).toEqual([
+        '?q=sunflower&offset=0&limit=20&title=true',
+        '?q=sunflower&offset=0&limit=20&tags=true',
+      ]);
     });
 
     it('rejects a two-element geoLocation at the schema and accepts one location', async () => {
@@ -1178,12 +1525,13 @@ describe('MetService', () => {
   });
 
   /**
-   * The `no_results` recovery is composed from the levers the call used. Whether
-   * the keyword matches on its own separates "bad keyword" from "filters removed
+   * A zero result is an empty success whose notice is composed from the levers
+   * the call used (#25, moved from the `no_results` error by #44). Whether the
+   * keyword matches on its own separates "bad keyword" from "filters removed
    * every match", and it costs one extra `limit=1` request, only when a filtered
    * search comes back empty.
    */
-  describe('met_search_collections — no_results names the levers that zeroed the query (#25)', () => {
+  describe('met_search_collections — the zero-match notice names the levers that zeroed the query (#25, #44)', () => {
     /**
      * `/v1.1/search` whose filtered requests match `filteredTotal` and whose
      * keyword-only requests match `keywordTotal` — or answer 503 on `'fail'`.
@@ -1201,30 +1549,43 @@ describe('MetService', () => {
     const departmentsRoute = () =>
       jsonResponse({ departments: [{ departmentId: 11, displayName: 'European Paintings' }] });
 
-    type NoResults = {
-      code: number;
-      data: { reason: string; recovery: { hint: string } };
+    type ZeroMatch = Record<string, unknown> & { effectiveQuery: string; notice: string };
+    /** A successful zero result: `total` 0, an empty page, and its notice. */
+    const zeroOf = (result: Awaited<ReturnType<typeof runToolContract>>) => {
+      expect(result.isError).toBeFalsy();
+      const structured = result.structuredContent as ZeroMatch;
+      expect(structured).toMatchObject({ total: 0, objectIDs: [], returned: 0 });
+      return structured;
     };
-    const errorOf = (result: { structuredContent?: unknown }) =>
-      (result.structuredContent as { error: NoResults }).error;
 
     const OTHER_FILTERS = ['hasImages', 'isHighlight', 'isOnView', 'geoLocation', 'dateBegin'];
 
-    it('an unfiltered miss gets the keyword hint and issues no extra request', async () => {
+    it('an unfiltered miss gets the keyword notice and issues no extra request', async () => {
       fetchMock.mockImplementation(routes({ [SEARCH_PATH]: searchByShape(0, 0) }));
       const result = await runToolContract(metSearchCollections, { q: 'zzzqqqxyz' });
 
-      const error = errorOf(result);
-      expect(error.code).toBe(JsonRpcErrorCode.NotFound);
-      expect(error.data.reason).toBe('no_results');
-      expect(error.data.recovery.hint).toContain('"zzzqqqxyz" matches no object');
-      expect(error.data.recovery.hint).not.toContain('departmentId');
-      expect(error.data.recovery.hint).not.toContain('met_list_departments');
+      const zero = zeroOf(result);
+      expect(zero.notice).toContain('"zzzqqqxyz" matches no object');
+      expect(zero.notice).not.toContain('departmentId');
+      expect(zero.notice).not.toContain('met_list_departments');
+      expect(zero.effectiveQuery).toBe('q="zzzqqqxyz"');
       expect(fetchMock).toHaveBeenCalledTimes(1);
-      // The text surface carries the same hint and the reason a caller branches on.
+      // The text surface carries the same notice, an empty page marked complete, and the echo.
       const text = textOf(result);
-      expect(text).toContain('Recovery: The keyword "zzzqqqxyz" matches no object');
-      expect(text).toContain('no_results');
+      expect(text).toContain('> The keyword "zzzqqqxyz" matches no object');
+      expect(text).toContain('**Returned IDs:** 0 (complete)');
+      expect(text).toContain('Query: q="zzzqqqxyz"');
+      expect(text).not.toContain('no_results');
+    });
+
+    it('a zero result read from a nonzero offset is marked past the end, notice kept', async () => {
+      fetchMock.mockImplementation(routes({ [SEARCH_PATH]: searchByShape(0, 0) }));
+      const result = await runToolContract(metSearchCollections, { q: 'zzzqqqxyz', offset: 40 });
+
+      expect(zeroOf(result).notice).toContain('"zzzqqqxyz" matches no object');
+      const text = textOf(result);
+      expect(text).toContain('**Returned IDs:** 0 (offset beyond result set)');
+      expect(text).toContain('> The keyword "zzzqqqxyz" matches no object');
     });
 
     it('a keyword that matches nothing even unfiltered names no filter', async () => {
@@ -1234,8 +1595,7 @@ describe('MetService', () => {
         medium: 'Paintings',
       });
 
-      const { hint } = errorOf(result).data.recovery;
-      expect(errorOf(result).data.reason).toBe('no_results');
+      const { notice: hint } = zeroOf(result);
       expect(hint).toContain('even with no filter applied');
       expect(hint).not.toContain('medium');
       expect(hint).not.toContain('classification');
@@ -1257,18 +1617,25 @@ describe('MetService', () => {
         medium: 'Painting',
       });
 
-      const { hint } = errorOf(result).data.recovery;
-      expect(errorOf(result).data.reason).toBe('no_results');
+      const { notice: hint, effectiveQuery } = zeroOf(result);
       expect(hint).toContain('matches 178 objects on its own');
       expect(hint).toContain('so the filter removed every match: medium. Correct or drop it,');
       expect(hint).toContain('case-sensitive');
       expect(hint).toContain('classification');
       expect(hint).toContain('not a material');
       for (const other of [...OTHER_FILTERS, 'departmentId']) expect(hint).not.toContain(other);
-      expect(searchRequests(fetchMock)).toHaveLength(2);
+      expect(effectiveQuery).toBe('q="sunflower", medium="Painting"');
+      // Exactly one extra request: q alone, limit 1.
+      const requests = searchRequests(fetchMock);
+      expect(requests).toHaveLength(2);
+      expect([...(requests[1]?.searchParams.entries() ?? [])]).toEqual([
+        ['q', 'sunflower'],
+        ['offset', '0'],
+        ['limit', '1'],
+      ]);
       const text = textOf(result);
-      expect(text).toContain('No objects matched the query "sunflower" with the filter medium.');
       expect(text).toContain('removed every match: medium.');
+      expect(text).toContain(`> ${hint}`);
     });
 
     it('names every filter the call set in one hint', async () => {
@@ -1281,17 +1648,56 @@ describe('MetService', () => {
         departmentId: 11,
       });
 
-      const { hint } = errorOf(result).data.recovery;
-      expect(errorOf(result).data.reason).toBe('no_results');
+      const { notice: hint, effectiveQuery } = zeroOf(result);
       expect(hint).toContain(
         'the filters removed every match: medium, departmentId. Correct or drop them,',
       );
       expect(hint).toContain('case-sensitive');
       for (const other of OTHER_FILTERS) expect(hint).not.toContain(other);
-      expect(textOf(result)).toContain('with the filters medium, departmentId.');
+      expect(effectiveQuery).toBe('q="sunflower", medium="Painting", departmentId=11');
+      expect(textOf(result)).toContain('removed every match: medium, departmentId.');
     });
 
-    it('names the filters used when the keyword-only request fails, and still returns no_results', async () => {
+    it('counts matchField as a filter: named in the notice, left off the keyword-only count (#35)', async () => {
+      fetchMock.mockImplementation(routes({ [SEARCH_PATH]: searchByShape(0, 178) }));
+      const result = await runToolContract(metSearchCollections, {
+        q: 'sunflower',
+        matchField: 'title',
+      });
+
+      const { notice, effectiveQuery } = zeroOf(result);
+      expect(notice).toBe(
+        'The keyword "sunflower" matches 178 objects on its own, so the filter removed every match: matchField. Correct or drop it, then retry.',
+      );
+      expect(effectiveQuery).toBe('q="sunflower", matchField="title"');
+      const requests = searchRequests(fetchMock);
+      expect(requests).toHaveLength(2);
+      expect(requests[0]?.searchParams.get('title')).toBe('true');
+      expect([...(requests[1]?.searchParams.entries() ?? [])]).toEqual([
+        ['q', 'sunflower'],
+        ['offset', '0'],
+        ['limit', '1'],
+      ]);
+      expect(textOf(result)).toContain(`> ${notice}`);
+    });
+
+    it('names matchField beside the other filters, in schema order (#35)', async () => {
+      fetchMock.mockImplementation(routes({ [SEARCH_PATH]: searchByShape(0, 178) }));
+      const result = await runToolContract(metSearchCollections, {
+        q: 'sunflower',
+        medium: 'Painting',
+        matchField: 'tags',
+      });
+
+      const { notice, effectiveQuery } = zeroOf(result);
+      expect(notice).toContain(
+        'so the filters removed every match: matchField, medium. Correct or drop them, then retry.',
+      );
+      expect(notice).toContain('case-sensitive');
+      expect(effectiveQuery).toBe('q="sunflower", matchField="tags", medium="Painting"');
+    });
+
+    it('names the filters used when the keyword-only request fails, and still succeeds', async () => {
       fetchMock.mockImplementation(routes({ [SEARCH_PATH]: searchByShape(0, 'fail') }));
       const result = await runToolContract(metSearchCollections, {
         q: 'sunflower',
@@ -1299,16 +1705,15 @@ describe('MetService', () => {
         isOnView: true,
       });
 
-      const error = errorOf(result);
-      expect(error.code).toBe(JsonRpcErrorCode.NotFound);
-      expect(error.data.reason).toBe('no_results');
-      expect(error.data.recovery.hint).toContain('may have removed every match: isOnView, medium');
-      expect(error.data.recovery.hint).toContain('could not be checked');
-      // One filtered request, one keyword-only attempt — no retry ladder on the hint.
+      const { notice } = zeroOf(result);
+      expect(notice).toContain('may have removed every match: isOnView, medium');
+      expect(notice).toContain('could not be checked');
+      expect(textOf(result)).toContain('could not be checked');
+      // One filtered request, one keyword-only attempt — no retry ladder on the notice.
       expect(searchRequests(fetchMock)).toHaveLength(2);
     });
 
-    it('a caller abort during the keyword-only request surfaces as cancellation, not no_results', async () => {
+    it('a caller abort during the keyword-only request surfaces as cancellation, not a zero-match success', async () => {
       const controller = new AbortController();
       fetchMock.mockImplementation((request: unknown, init?: RequestInit) => {
         const url = new URL(String(request));
@@ -1331,6 +1736,33 @@ describe('MetService', () => {
       expect(err).toMatchObject({ code: JsonRpcErrorCode.RequestCancelled });
       expect(err.data?.reason).toBeUndefined();
       expect(searchRequests(fetchMock)).toHaveLength(2);
+    });
+
+    it('a caller abort during the keyword-only request reaches the caller as a cancelled call', async () => {
+      const controller = new AbortController();
+      fetchMock.mockImplementation((request: unknown, init?: RequestInit) => {
+        const url = new URL(String(request));
+        if ([...url.searchParams.keys()].some((key) => !PAGING_PARAMS.has(key))) {
+          return Promise.resolve(searchPage(url, 0));
+        }
+        queueMicrotask(() => controller.abort());
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(init.signal?.reason));
+        });
+      });
+
+      const result = await runToolContract(
+        metSearchCollections,
+        { q: 'sunflower', medium: 'Painting' },
+        { context: { signal: controller.signal } },
+      );
+
+      expect(result.isError).toBe(true);
+      expect((result.structuredContent as { error: { code: number } }).error.code).toBe(
+        JsonRpcErrorCode.RequestCancelled,
+      );
+      expect(textOf(result)).not.toContain('matches no object');
+      expect(textOf(result)).not.toContain('removed every match');
     });
 
     it('a filtered search with results issues no extra request', async () => {
@@ -1913,7 +2345,10 @@ describe('MetService', () => {
           'department',
           'objectName',
           'classification',
+          'artistPrefix',
           'artistDisplayName',
+          'artistSuffix',
+          'artistRole',
           'artistDisplayBio',
           'artistNationality',
           'objectDate',
@@ -1923,6 +2358,7 @@ describe('MetService', () => {
           'period',
           'dynasty',
           'creditLine',
+          'rightsAndReproduction',
           'country',
           'region',
         ];
@@ -2038,11 +2474,411 @@ describe('MetService', () => {
       });
     });
 
+    describe('artist attribution qualifier and role (#38)', () => {
+      it('carries 437403’s prefix, leaving the name and the constituent as sent', async () => {
+        fetchMock.mockResolvedValue(jsonResponse(rawObjects.styleOfAttribution));
+        const record = await getMetService().getObject(437403, ...call());
+
+        expect(record).toMatchObject({
+          artistPrefix: 'Style of',
+          artistDisplayName: 'Rembrandt',
+          artistSuffix: '',
+          artistRole: 'Artist',
+          // The dates stay the named artist's, whatever the prefix says.
+          artistBeginDate: '1606',
+          artistEndDate: '1669',
+        });
+        expect(record?.constituents?.map((c) => c.name)).toEqual(['Style of Rembrandt']);
+      });
+
+      it('carries 456947’s suffix and patron role from the top level, not the constituents', async () => {
+        fetchMock.mockResolvedValue(jsonResponse(rawObjects.patronAttribution));
+        const record = await getMetService().getObject(456947, ...call());
+
+        expect(record).toMatchObject({
+          artistPrefix: '',
+          artistDisplayName: 'Sultan Abdülhamid II',
+          artistSuffix: '(r. 1876–1909)',
+          artistRole: 'Patron',
+        });
+        expect(record?.constituents?.map((c) => [c.role, c.name])).toEqual([
+          ['Patron', 'Sultan Abdülhamid II'],
+          ['Workshop director', 'Workshop of Warshat al-Khurunfish'],
+        ]);
+      });
+
+      it('keeps the whitespace the Met sends around a prefix — trimming is the render’s', async () => {
+        fetchMock.mockResolvedValue(
+          jsonResponse({ ...rawObjects.styleOfAttribution, artistPrefix: 'Style of ' }),
+        );
+        const record = await getMetService().getObject(437403, ...call());
+
+        expect(record?.artistPrefix).toBe('Style of ');
+      });
+
+      it('defaults all three to empty strings when the Met omits them', async () => {
+        fetchMock.mockResolvedValue(jsonResponse({ objectID: 999 }));
+        const record = await getMetService().getObject(999, ...call());
+
+        expect([record?.artistPrefix, record?.artistSuffix, record?.artistRole]).toEqual([
+          '',
+          '',
+          '',
+        ]);
+      });
+    });
+
+    describe('rights, metadata date, and accession year (#41)', () => {
+      it('carries 437403’s accession year beside a credit line naming another year', async () => {
+        fetchMock.mockResolvedValue(jsonResponse(rawObjects.styleOfAttribution));
+        const record = await getMetService().getObject(437403, ...call());
+
+        expect(record).toMatchObject({
+          accessionYear: '1960',
+          creditLine: 'Bequest of Lillian S. Timken, 1959',
+          rightsAndReproduction: '',
+          metadataDate: '2025-09-17T04:49:46.407Z',
+        });
+      });
+
+      it('carries 488978’s rights holder', async () => {
+        fetchMock.mockResolvedValue(jsonResponse(rawObjects.copyrightedWork));
+        const record = await getMetService().getObject(488978, ...call());
+
+        expect(record?.rightsAndReproduction).toBe(
+          '© 2026 Pollock-Krasner Foundation / Artists Rights Society (ARS), New York',
+        );
+        expect(record?.isPublicDomain).toBe(false);
+      });
+
+      it('passes 286850’s full-date accessionYear and fraction-less metadataDate through', async () => {
+        fetchMock.mockResolvedValue(jsonResponse(rawObjects.fullDateAccession));
+        const record = await getMetService().getObject(286850, ...call());
+
+        expect(record?.accessionYear).toBe('2005-02-15');
+        expect(record?.metadataDate).toBe('2025-03-06T04:54:30Z');
+      });
+
+      it('passes 512’s two-digit fraction and empty accessionYear through', async () => {
+        fetchMock.mockResolvedValue(jsonResponse(rawObjects.americanWing));
+        const record = await getMetService().getObject(512, ...call());
+
+        expect(record?.metadataDate).toBe('2023-02-07T04:46:51.34Z');
+        expect(record?.accessionYear).toBe('');
+      });
+
+      it('defaults all three to empty strings when the Met omits them', async () => {
+        fetchMock.mockResolvedValue(jsonResponse({ objectID: 999 }));
+        const record = await getMetService().getObject(999, ...call());
+
+        expect([
+          record?.accessionYear,
+          record?.rightsAndReproduction,
+          record?.metadataDate,
+        ]).toEqual(['', '', '']);
+      });
+    });
+
+    describe('departmentId from the record’s department name (#42)', () => {
+      it.each(departmentNames)('resolves "%s" to %i', async (department, departmentId) => {
+        fetchMock.mockResolvedValue(jsonResponse({ objectID: 999, department }));
+        const record = await getMetService().getObject(999, ...call());
+
+        expect(record?.departmentId).toBe(departmentId);
+        expect(record?.department).toBe(department);
+      });
+
+      it('holds exactly those 24 names', () => {
+        expect(Object.fromEntries(DEPARTMENT_ID_BY_NAME)).toEqual(
+          Object.fromEntries(departmentNames),
+        );
+      });
+
+      it.each([
+        [512, 'The American Wing', 1],
+        [307454, 'The Michael C. Rockefeller Wing', 5],
+        [100153, 'Costume Institute', 8],
+        [458994, 'Robert Lehman Collection', 15],
+        [488978, 'Modern and Contemporary Art', 21],
+      ])('resolves live record %i’s "%s" to %i', async (objectID, department, departmentId) => {
+        fetchMock.mockResolvedValue(jsonResponse({ objectID, department }));
+        const record = await getMetService().getObject(objectID, ...call());
+
+        expect(record?.departmentId).toBe(departmentId);
+      });
+
+      it.each([
+        ['an unrecognized name', 'Department of Unknowns'],
+        ['another casing of a known name', 'european paintings'],
+        ['a known name with surrounding whitespace', ' European Paintings '],
+        ['an empty name', ''],
+      ])('resolves %s to null, leaving department as sent', async (_case, department) => {
+        fetchMock.mockResolvedValue(jsonResponse({ objectID: 999, department }));
+        const record = await getMetService().getObject(999, ...call());
+
+        expect(record?.departmentId).toBeNull();
+        expect(record?.department).toBe(department);
+      });
+
+      it('resolves an absent department to null', async () => {
+        fetchMock.mockResolvedValue(jsonResponse({ objectID: 999 }));
+        const record = await getMetService().getObject(999, ...call());
+
+        expect(record?.departmentId).toBeNull();
+      });
+    });
+
+    it('produces records with every new field that met_get_object’s output schema accepts', async () => {
+      fetchMock.mockImplementation(
+        objectsUpstream(
+          rawObjects.styleOfAttribution,
+          rawObjects.copyrightedWork,
+          rawObjects.fullDateAccession,
+          { objectID: 999 },
+        ),
+      );
+      const records = await Promise.all(
+        [437403, 488978, 286850, 999].map((id) => getMetService().getObject(id, ...call())),
+      );
+
+      const parsed = metGetObject.output.safeParse({ objects: records, failed: [] });
+      expect(parsed.error?.message).toBeUndefined();
+      expect(parsed.data?.objects.map((o) => o.departmentId)).toEqual([11, 21, 19, null]);
+    });
+
+    it('carries the attribution, rights, and departmentId fields onto both surfaces', async () => {
+      fetchMock.mockImplementation(
+        objectsUpstream(
+          rawObjects.styleOfAttribution,
+          rawObjects.patronAttribution,
+          rawObjects.copyrightedWork,
+          rawObjects.americanWing,
+        ),
+      );
+      const result = await runToolContract(metGetObject, {
+        objectIDs: [437403, 456947, 488978, 512],
+      });
+
+      const { objects } = result.structuredContent as GetObjectOutput;
+      expect(
+        objects.map((o) => [
+          o.objectID,
+          o.departmentId,
+          o.artistPrefix,
+          o.artistRole,
+          o.accessionYear,
+        ]),
+      ).toEqual([
+        [437403, 11, 'Style of', 'Artist', '1960'],
+        [456947, 14, '', 'Patron', '2009'],
+        [488978, 21, '', 'Artist', '1957'],
+        [512, 1, '', 'Maker', ''],
+      ]);
+
+      const text = textOf(result);
+      const rembrandt = sectionFor(text, 437403);
+      expect(rembrandt).toContain(
+        '**Artist:** Style of Rembrandt (Dutch, ca. 1655) | **Artist role:** Artist',
+      );
+      expect(rembrandt).toContain('**Artist dates:** 1606–1669');
+      expect(rembrandt).toContain('**Department:** European Paintings | **departmentId:** 11 |');
+      expect(rembrandt).toContain(
+        [
+          '**Accession:** 60.71.14 | **Accession year:** 1960',
+          '**Credit:** Bequest of Lillian S. Timken, 1959',
+          '**Rights:** —',
+          '**Metadata date:** 2025-09-17T04:49:46.407Z',
+        ].join('\n'),
+      );
+      expect(sectionFor(text, 456947)).toContain(
+        '**Artist:** Sultan Abdülhamid II (r. 1876–1909) | **Artist role:** Patron',
+      );
+      expect(sectionFor(text, 488978)).toContain(
+        '**Rights:** © 2026 Pollock-Krasner Foundation / Artists Rights Society (ARS), New York',
+      );
+      expect(sectionFor(text, 488978)).toContain(
+        '**Department:** Modern and Contemporary Art | **departmentId:** 21 |',
+      );
+      expect(sectionFor(text, 512)).toContain('**Accession:** Inst.1986.1 | **Accession year:** —');
+      expect(sectionFor(text, 512)).toContain('**Metadata date:** 2023-02-07T04:46:51.34Z');
+    });
+
     it('returns null for a 404 instead of throwing', async () => {
       fetchMock.mockResolvedValue(new Response('Not found', { status: 404 }));
       const record = await getMetService().getObject(999999999, ...call());
 
       expect(record).toBeNull();
+    });
+  });
+
+  /**
+   * The image fetch behind met_get_object's includeImages: one attempt at the
+   * pinned image host, every failure an `ok: false` value rather than a throw —
+   * except the caller's own abort, which must still end the call.
+   */
+  describe('fetchImage — one rendition from the pinned image host (#36)', () => {
+    const IMAGE_URL = 'https://images.metmuseum.org/CRDImages/ep/web-large/DP145935.jpg';
+    /** A JPEG's leading bytes — enough for a body whose encoding is checkable. */
+    const JPEG = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46]);
+
+    const imageResponse = (contentType = 'image/jpeg') =>
+      new Response(JPEG, { headers: { 'content-type': contentType } });
+
+    /** A request that never answers until its signal aborts. */
+    const neverAnswers = (_request: unknown, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(init.signal?.reason));
+      });
+
+    it('returns the body base64-encoded with its MIME type, from one request that refuses redirects', async () => {
+      fetchMock.mockResolvedValue(imageResponse());
+      const result = await getMetService().fetchImage(IMAGE_URL, ...call());
+
+      expect(result).toEqual({
+        ok: true,
+        data: Buffer.from(JPEG).toString('base64'),
+        mimeType: 'image/jpeg',
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [request, init] = fetchMock.mock.calls[0] ?? [];
+      expect(String(request)).toBe(IMAGE_URL);
+      expect((init as RequestInit).redirect).toBe('error');
+    });
+
+    it('takes the MIME type without its parameters', async () => {
+      fetchMock.mockResolvedValue(imageResponse('Image/PNG; charset=binary'));
+      const result = await getMetService().fetchImage(IMAGE_URL, ...call());
+
+      expect(result).toMatchObject({ ok: true, mimeType: 'image/png' });
+    });
+
+    it.each([
+      [
+        'a look-alike host',
+        'https://images.metmuseum.org.evil.example/CRDImages/ep/web-large/DP1.jpg',
+      ],
+      ['the http scheme', 'http://images.metmuseum.org/CRDImages/ep/web-large/DP1.jpg'],
+      ['another port', 'https://images.metmuseum.org:8443/CRDImages/ep/web-large/DP1.jpg'],
+      ['userinfo spelling the host', 'https://images.metmuseum.org@evil.example/DP1.jpg'],
+      ['the API host', 'https://collectionapi.metmuseum.org/public/collection/v1/objects/1'],
+      ['an empty field', ''],
+      ['catalog text', '(not assigned)'],
+    ])('never requests %s', async (_label, url) => {
+      const result = await getMetService().fetchImage(url, ...call());
+
+      expect(result).toMatchObject({ ok: false });
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it('refuses a redirect: fetch is told to error on one, and that error is unavailable', async () => {
+      // Real fetch semantics: under `redirect: 'error'` a 3xx rejects; under the
+      // default it would be followed to wherever the Location points.
+      fetchMock.mockImplementation((_request: unknown, init?: RequestInit) =>
+        init?.redirect === 'error'
+          ? Promise.reject(new TypeError('fetch failed'))
+          : Promise.resolve(imageResponse()),
+      );
+      const result = await getMetService().fetchImage(IMAGE_URL, ...call());
+
+      expect(result).toMatchObject({ ok: false });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([403, 404, 500, 503])(
+      'reports HTTP %i unavailable after one attempt — no retry, never upstream_blocked',
+      async (status) => {
+        fetchMock.mockImplementation(() =>
+          Promise.resolve(new Response('<html>error</html>', { status })),
+        );
+        const result = await getMetService().fetchImage(IMAGE_URL, ...call());
+
+        expect(result).toMatchObject({ ok: false });
+        expect(JSON.stringify(result)).not.toContain('firewall');
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+      },
+    );
+
+    it.each([
+      [
+        'text/html',
+        new Response('<html>Not an image</html>', { headers: { 'content-type': 'text/html' } }),
+      ],
+      ['application/json', new Response('{}', { headers: { 'content-type': 'application/json' } })],
+      ['no content type', new Response(JPEG)],
+    ])('reports a 200 with %s unavailable', async (_label, response) => {
+      fetchMock.mockResolvedValue(response);
+      const result = await getMetService().fetchImage(IMAGE_URL, ...call());
+
+      expect(result).toMatchObject({ ok: false });
+    });
+
+    it("sends nothing once the call's time budget is spent", async () => {
+      const ctx = createMockContext();
+      const result = await getMetService().fetchImage(IMAGE_URL, ctx, {
+        deadlineAt: Date.now() - 1,
+        signal: ctx.signal,
+      });
+
+      expect(result).toMatchObject({ ok: false });
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it('caps the request timeout at the time left in the call budget', async () => {
+      fetchMock.mockImplementation(neverAnswers);
+      const ctx = createMockContext();
+      const started = Date.now();
+      const result = await getMetService().fetchImage(IMAGE_URL, ctx, {
+        deadlineAt: Date.now() + 50,
+        signal: ctx.signal,
+      });
+
+      expect(result).toMatchObject({ ok: false });
+      // The 10 s request timeout would have held it; the 50 ms left ended it.
+      expect(Date.now() - started).toBeLessThan(5_000);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('throws when the caller aborts mid-fetch, so the call ends as cancelled', async () => {
+      const controller = new AbortController();
+      const ctx = createMockContext({ signal: controller.signal });
+      fetchMock.mockImplementation((request: unknown, init?: RequestInit) => {
+        const pending = neverAnswers(request, init);
+        controller.abort();
+        return pending;
+      });
+
+      await expect(getMetService().fetchImage(IMAGE_URL, ...call(ctx))).rejects.toMatchObject({
+        code: JsonRpcErrorCode.RequestCancelled,
+      });
+    });
+
+    it('met_get_object attaches a record’s rendition end to end over the real service', async () => {
+      const smallUrl = rawObjects.populated.primaryImageSmall;
+      fetchMock.mockImplementation((request: unknown) => {
+        const url = new URL(String(request));
+        if (url.href === `${COLLECTION_ORIGIN}/public/collection/v1/objects/436535`) {
+          return Promise.resolve(jsonResponse(rawObjects.populated));
+        }
+        if (url.href === smallUrl) return Promise.resolve(imageResponse());
+        return Promise.reject(new Error(`unrouted fetch ${url.href}`));
+      });
+      const called = await runToolContract(metGetObject, {
+        objectIDs: [436535],
+        includeImages: true,
+      });
+
+      expect(called.isError).toBeFalsy();
+      expect(called.content.slice(0, 2)).toEqual([
+        { type: 'text', text: 'Image of object 436535 (primaryImageSmall)' },
+        { type: 'image', data: Buffer.from(JPEG).toString('base64'), mimeType: 'image/jpeg' },
+      ]);
+      expect((called.structuredContent as { images: unknown[] }).images).toEqual([
+        { objectID: 436535, status: 'attached' },
+      ]);
+      expect(fetchMock.mock.calls.map(([request]) => String(request))).toEqual([
+        `${COLLECTION_ORIGIN}/public/collection/v1/objects/436535`,
+        smallUrl,
+      ]);
     });
   });
 

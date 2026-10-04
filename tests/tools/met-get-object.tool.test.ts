@@ -3,22 +3,39 @@
  * @module tests/tools/met-get-object.tool.test
  */
 
+import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
+import {
+  createMockContext,
+  getContentBlocks,
+  getEnrichment,
+  runToolContract,
+} from '@cyanheads/mcp-ts-core/testing';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { z } from 'zod';
 import { metGetObject } from '@/mcp-server/tools/definitions/met-get-object.tool.js';
 import { escapeMarkdown } from '@/utils/markdown.js';
 
 const mockGetObject = vi.fn();
 
-/** The service is stubbed at its accessor; `startCallDeadline` stays real. */
-vi.mock('@/services/met/met-service.js', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('@/services/met/met-service.js')>()),
-  getMetService: () => ({
-    getObject: mockGetObject,
-  }),
-}));
+/**
+ * The service is stubbed at its accessor; `startCallDeadline` stays real, and so
+ * does `fetchImage` — it runs on a real service over the stubbed global fetch,
+ * so the host pin, redirect refusal, and status mapping are part of every image
+ * case here.
+ */
+vi.mock('@/services/met/met-service.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/services/met/met-service.js')>();
+  const real = new actual.MetService({} as AppConfig, {} as StorageService);
+  return {
+    ...actual,
+    getMetService: () => ({
+      getObject: mockGetObject,
+      fetchImage: (...args: Parameters<typeof real.fetchImage>) => real.fetchImage(...args),
+    }),
+  };
+});
 
 vi.mock('@/config/server-config.js', () => ({
   getServerConfig: () => ({
@@ -43,11 +60,15 @@ const sampleRecord = {
   additionalImages: ['https://example.com/alt.jpg'],
   objectURL: 'https://metmuseum.org/art/collection/437980',
   department: 'European Paintings',
+  departmentId: 11 as number | null,
   objectName: 'Painting',
   classification: 'Paintings',
   isHighlight: true,
   isTimelineWork: false,
+  artistPrefix: '',
   artistDisplayName: 'Vincent van Gogh',
+  artistSuffix: '',
+  artistRole: 'Artist',
   artistDisplayBio: 'Dutch, Zundert 1853–1890 Auvers-sur-Oise',
   artistNationality: 'Dutch',
   artistBeginDate: '1853',
@@ -71,7 +92,9 @@ const sampleRecord = {
   period: '',
   dynasty: '',
   accessionNumber: '93.21',
+  accessionYear: '1993',
   creditLine: 'Purchase',
+  rightsAndReproduction: '',
   country: '',
   region: '',
   geography: {
@@ -95,6 +118,7 @@ const sampleRecord = {
   tags: [{ term: 'Landscapes', AAT_URL: '', Wikidata_URL: '' }],
   objectWikidata_URL: 'https://www.wikidata.org/wiki/Q45585',
   GalleryNumber: '825',
+  metadataDate: '2026-04-18T04:56:48.367Z',
 };
 
 /**
@@ -112,11 +136,15 @@ const sparseRecord = {
   additionalImages: [] as string[],
   objectURL: '',
   department: '',
+  departmentId: null as number | null,
   objectName: '',
   classification: '',
   isHighlight: false,
   isTimelineWork: false,
+  artistPrefix: '',
   artistDisplayName: '',
+  artistSuffix: '',
+  artistRole: '',
   artistDisplayBio: '',
   artistNationality: '',
   artistBeginDate: '',
@@ -131,7 +159,9 @@ const sparseRecord = {
   period: '',
   dynasty: '',
   accessionNumber: '',
+  accessionYear: '',
   creditLine: '',
+  rightsAndReproduction: '',
   country: '',
   region: '',
   geography: {
@@ -155,6 +185,7 @@ const sparseRecord = {
   tags: null,
   objectWikidata_URL: '',
   GalleryNumber: '',
+  metadataDate: '',
 };
 
 /**
@@ -213,6 +244,23 @@ async function run(
 
 /** Numeric, not lexicographic — real Met object IDs are multi-digit. */
 const byNumber = (a: number, b: number) => a - b;
+
+type RecordOutput = z.infer<typeof metGetObject.output>['objects'][number];
+
+/** `format()`'s text for a batch of the given records and no failures. */
+const renderText = (...objects: RecordOutput[]) =>
+  (metGetObject.format!({ objects, failed: [] })[0] as { text: string }).text;
+
+/** The rendered line that starts with `label`, or undefined when none does. */
+const lineOf = (text: string, label: string) =>
+  text.split('\n').find((line) => line.startsWith(label));
+
+/** Every text block of a tool result's `content[]`, joined. */
+const contentText = (result: { content?: { type: string }[] }) =>
+  (result.content ?? [])
+    .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+    .map((block) => block.text)
+    .join('\n');
 
 describe('metGetObject', () => {
   beforeEach(() => {
@@ -405,6 +453,352 @@ describe('metGetObject', () => {
     expect(text).toContain('**Constituents:** —');
     // Empty failed[] renders an explicit placeholder, not an omitted section.
     expect(text).toContain('**Failed fetches:** none');
+  });
+
+  /**
+   * The parts of the Artist, Department, and Accession/Credit lines that the
+   * attribution, departmentId, and rights fields must leave as they are.
+   */
+  describe('format — the record lines new fields extend keep their existing parts', () => {
+    const text = renderText(sampleRecord);
+
+    it('renders an unqualified name and bio as it always has', () => {
+      expect(lineOf(text, '**Artist:**')).toMatch(
+        /^\*\*Artist:\*\* Vincent van Gogh \(Dutch, Zundert 1853–1890 Auvers-sur-Oise\)/,
+      );
+    });
+
+    it('renders the named artist’s dates on their own line', () => {
+      expect(lineOf(text, '**Artist dates:**')).toBe('**Artist dates:** 1853–1890');
+    });
+
+    it('keeps department, object name, and classification on the Department line', () => {
+      const line = lineOf(text, '**Department:**');
+      expect(line).toMatch(/^\*\*Department:\*\* European Paintings \| /);
+      expect(line).toMatch(
+        / \| \*\*Object name:\*\* Painting \| \*\*Classification:\*\* Paintings$/,
+      );
+    });
+
+    it('keeps the accession number, credit line, and gallery values', () => {
+      expect(lineOf(text, '**Accession:**')).toMatch(/^\*\*Accession:\*\* 93\.21/);
+      expect(lineOf(text, '**Credit:**')).toBe('**Credit:** Purchase');
+      expect(lineOf(text, '**Gallery:**')).toBe('**Gallery:** 825');
+    });
+  });
+
+  describe('artist attribution qualifier and role (#38)', () => {
+    /** 437403's attribution: a "Style of" work whose dates are Rembrandt's own. */
+    const styleOf = {
+      ...sampleRecord,
+      objectID: 437403,
+      artistPrefix: 'Style of',
+      artistDisplayName: 'Rembrandt',
+      artistSuffix: '',
+      artistRole: 'Artist',
+      artistDisplayBio: 'Dutch, ca. 1655',
+      artistBeginDate: '1606',
+      artistEndDate: '1669',
+    };
+    /** 456947's: a patron, with the reign in the suffix and no bio. */
+    const patron = {
+      ...sampleRecord,
+      objectID: 456947,
+      artistDisplayName: 'Sultan Abdülhamid II',
+      artistSuffix: '(r. 1876–1909)',
+      artistRole: 'Patron',
+      artistDisplayBio: '',
+      artistBeginDate: '1842',
+      artistEndDate: '1918',
+    };
+    /** Object 338304's attribution in the Open Access CSV, bio left empty: a comma suffix. */
+    const commaSuffix = {
+      ...sampleRecord,
+      objectID: 338304,
+      artistPrefix: 'Published by',
+      artistDisplayName: 'Thielman Kerver',
+      artistSuffix: ', Paris',
+      artistRole: 'Publisher',
+      artistDisplayBio: '',
+    };
+    const artistLine = (record: RecordOutput) => lineOf(renderText(record), '**Artist:**');
+
+    it('renders a "Style of" attribution with its qualifier and role', () => {
+      expect(artistLine(styleOf)).toBe(
+        '**Artist:** Style of Rembrandt (Dutch, ca. 1655) | **Artist role:** Artist',
+      );
+    });
+
+    it('leaves the named artist’s dates on the Artist dates line', () => {
+      expect(lineOf(renderText(styleOf), '**Artist dates:**')).toBe('**Artist dates:** 1606–1669');
+    });
+
+    it('renders a patron with the suffix after a space, and the role', () => {
+      expect(artistLine(patron)).toBe(
+        '**Artist:** Sultan Abdülhamid II (r. 1876–1909) | **Artist role:** Patron',
+      );
+    });
+
+    it('appends a suffix that starts with a comma directly, with no space', () => {
+      expect(artistLine(commaSuffix)).toBe(
+        '**Artist:** Published by Thielman Kerver, Paris | **Artist role:** Publisher',
+      );
+    });
+
+    it('renders a placeholder for an empty attribution and an empty role', () => {
+      expect(artistLine(sparseRecord)).toBe('**Artist:** — | **Artist role:** —');
+    });
+
+    it('renders an unqualified record’s name and bio as before, plus the role', () => {
+      expect(artistLine(sampleRecord)).toBe(
+        '**Artist:** Vincent van Gogh (Dutch, Zundert 1853–1890 Auvers-sur-Oise) | **Artist role:** Artist',
+      );
+    });
+
+    it('trims the whitespace the Met leaves around a prefix or suffix', () => {
+      expect(artistLine({ ...styleOf, artistPrefix: 'Style of ' })).toBe(
+        '**Artist:** Style of Rembrandt (Dutch, ca. 1655) | **Artist role:** Artist',
+      );
+      expect(artistLine({ ...commaSuffix, artistSuffix: ' , Paris ' })).toBe(
+        '**Artist:** Published by Thielman Kerver, Paris | **Artist role:** Publisher',
+      );
+    });
+
+    it('renders a suffix alone when the record names no one', () => {
+      expect(artistLine({ ...sparseRecord, artistSuffix: 'Chinese, 13th century' })).toBe(
+        '**Artist:** Chinese, 13th century | **Artist role:** —',
+      );
+    });
+
+    it('escapes a qualifier, suffix, and role like the name', () => {
+      expect(
+        artistLine({
+          ...styleOf,
+          artistPrefix: '*Attributed to*',
+          artistDisplayName: 'Unknown_Maker',
+          artistSuffix: '[?]',
+          artistRole: '<Artist>',
+        }),
+      ).toBe(
+        '**Artist:** \\*Attributed to\\* Unknown\\_Maker \\[?\\] (Dutch, ca. 1655) | **Artist role:** \\<Artist>',
+      );
+    });
+
+    it('carries the three fields as sent on structuredContent, through output validation', async () => {
+      mockRecords([styleOf, patron]);
+      const called = await runToolContract(metGetObject, { objectIDs: [437403, 456947] });
+
+      const { objects } = called.structuredContent as { objects: RecordOutput[] };
+      expect(
+        objects.map((o) => [o.artistPrefix, o.artistDisplayName, o.artistSuffix, o.artistRole]),
+      ).toEqual([
+        ['Style of', 'Rembrandt', '', 'Artist'],
+        ['', 'Sultan Abdülhamid II', '(r. 1876–1909)', 'Patron'],
+      ]);
+      const text = contentText(called);
+      expect(text).toContain(
+        '**Artist:** Style of Rembrandt (Dutch, ca. 1655) | **Artist role:** Artist',
+      );
+      expect(text).toContain(
+        '**Artist:** Sultan Abdülhamid II (r. 1876–1909) | **Artist role:** Patron',
+      );
+    });
+
+    it('requires all three on the output schema', () => {
+      const { artistPrefix: _prefix, ...withoutPrefix } = styleOf;
+      expect(metGetObject.output.safeParse({ objects: [styleOf], failed: [] }).success).toBe(true);
+      expect(metGetObject.output.safeParse({ objects: [withoutPrefix], failed: [] }).success).toBe(
+        false,
+      );
+    });
+  });
+
+  describe('rights, metadata date, and accession year (#41)', () => {
+    /** 437403's acquisition fields: the credit line's year (1959) is not accessionYear's (1960). */
+    const timken = {
+      ...sampleRecord,
+      objectID: 437403,
+      accessionNumber: '60.71.14',
+      accessionYear: '1960',
+      creditLine: 'Bequest of Lillian S. Timken, 1959',
+      rightsAndReproduction: '',
+      metadataDate: '2025-09-17T04:49:46.407Z',
+    };
+    /** 488978's: a copyrighted work carrying its rights holder. */
+    const pollock = {
+      ...sampleRecord,
+      objectID: 488978,
+      isPublicDomain: false,
+      accessionNumber: '57.92',
+      accessionYear: '1957',
+      creditLine: 'George A. Hearn Fund, 1957',
+      rightsAndReproduction:
+        '© 2026 Pollock-Krasner Foundation / Artists Rights Society (ARS), New York',
+      metadataDate: '2026-10-01T04:59:29.693Z',
+    };
+
+    it('renders the accession, credit, rights, and metadata-date lines in that order', () => {
+      const lines = renderText(timken).split('\n');
+      const start = lines.findIndex((line) => line.startsWith('**Accession:**'));
+      expect(lines.slice(start, start + 4)).toEqual([
+        '**Accession:** 60.71.14 | **Accession year:** 1960',
+        '**Credit:** Bequest of Lillian S. Timken, 1959',
+        '**Rights:** —',
+        '**Metadata date:** 2025-09-17T04:49:46.407Z',
+      ]);
+    });
+
+    it('renders the rights holder of a copyrighted work', () => {
+      expect(lineOf(renderText(pollock), '**Rights:**')).toBe(
+        '**Rights:** © 2026 Pollock-Krasner Foundation / Artists Rights Society (ARS), New York',
+      );
+    });
+
+    it('renders a placeholder for each of the three on a record with none', () => {
+      const text = renderText(sparseRecord);
+      expect(lineOf(text, '**Accession:**')).toBe('**Accession:** — | **Accession year:** —');
+      expect(lineOf(text, '**Rights:**')).toBe('**Rights:** —');
+      expect(lineOf(text, '**Metadata date:**')).toBe('**Metadata date:** —');
+    });
+
+    it('renders a full-date accessionYear and any fraction length exactly as sent', () => {
+      // 286850: a full-date accessionYear and a metadataDate with no fraction;
+      // 512: a two-digit fraction.
+      const text = renderText(
+        {
+          ...sampleRecord,
+          objectID: 286850,
+          accessionNumber: '2005.100.429',
+          accessionYear: '2005-02-15',
+          metadataDate: '2025-03-06T04:54:30Z',
+        },
+        { ...sampleRecord, objectID: 512, metadataDate: '2023-02-07T04:46:51.34Z' },
+      );
+      expect(text).toContain('**Accession:** 2005.100.429 | **Accession year:** 2005-02-15');
+      expect(text).toContain('**Metadata date:** 2025-03-06T04:54:30Z');
+      expect(text).toContain('**Metadata date:** 2023-02-07T04:46:51.34Z');
+    });
+
+    it('escapes rights text like the neighbouring prose', () => {
+      expect(
+        lineOf(
+          renderText({ ...pollock, rightsAndReproduction: '© *Estate* of [X]' }),
+          '**Rights:**',
+        ),
+      ).toBe('**Rights:** © \\*Estate\\* of \\[X\\]');
+    });
+
+    it('carries the three fields as sent on structuredContent, through output validation', async () => {
+      mockRecords([timken, pollock]);
+      const called = await runToolContract(metGetObject, { objectIDs: [437403, 488978] });
+
+      const { objects } = called.structuredContent as { objects: RecordOutput[] };
+      expect(
+        objects.map((o) => [o.accessionYear, o.rightsAndReproduction, o.metadataDate]),
+      ).toEqual([
+        ['1960', '', '2025-09-17T04:49:46.407Z'],
+        [
+          '1957',
+          '© 2026 Pollock-Krasner Foundation / Artists Rights Society (ARS), New York',
+          '2026-10-01T04:59:29.693Z',
+        ],
+      ]);
+      expect(contentText(called)).toContain(
+        '**Rights:** © 2026 Pollock-Krasner Foundation / Artists Rights Society (ARS), New York',
+      );
+    });
+  });
+
+  describe('departmentId (#42)', () => {
+    it('renders the resolved ID on the Department line', () => {
+      expect(lineOf(renderText(sampleRecord), '**Department:**')).toBe(
+        '**Department:** European Paintings | **departmentId:** 11 | **Object name:** Painting | **Classification:** Paintings',
+      );
+    });
+
+    it('renders a placeholder when the department was not recognized', () => {
+      expect(renderText(sparseRecord)).toContain('**departmentId:** —');
+      expect(
+        lineOf(
+          renderText({ ...sampleRecord, department: 'Department of Unknowns', departmentId: null }),
+          '**Department:**',
+        ),
+      ).toBe(
+        '**Department:** Department of Unknowns | **departmentId:** — | **Object name:** Painting | **Classification:** Paintings',
+      );
+    });
+
+    it('accepts an integer or null on the output schema, and nothing else', () => {
+      const parses = (departmentId: unknown) =>
+        metGetObject.output.safeParse({ objects: [{ ...sampleRecord, departmentId }], failed: [] })
+          .success;
+      const { departmentId: _id, ...withoutId } = sampleRecord;
+
+      expect(parses(11)).toBe(true);
+      expect(parses(null)).toBe(true);
+      expect(parses(1.5)).toBe(false);
+      expect(parses('11')).toBe(false);
+      expect(metGetObject.output.safeParse({ objects: [withoutId], failed: [] }).success).toBe(
+        false,
+      );
+    });
+
+    it('carries the ID, or null, on both surfaces', async () => {
+      mockRecords([sampleRecord, { ...sparseRecord, objectID: 2 }]);
+      const called = await runToolContract(metGetObject, { objectIDs: [437980, 2] });
+
+      const { objects } = called.structuredContent as { objects: RecordOutput[] };
+      expect(objects.map((o) => o.departmentId)).toEqual([11, null]);
+      const text = contentText(called);
+      expect(text).toContain('**Department:** European Paintings | **departmentId:** 11 |');
+      expect(text).toContain('**Department:** — | **departmentId:** — |');
+    });
+  });
+
+  /**
+   * `/v1.1/search` indexes IDs `/v1/objects/{id}` does not serve, so running the
+   * search again hands back the same ID: a 404's guidance is to drop it.
+   */
+  describe('not-found guidance never sends the caller back to search', () => {
+    it('tells an all_not_found caller to drop the IDs, on both surfaces', async () => {
+      mockGetObject.mockResolvedValue(null);
+      const called = await runToolContract(metGetObject, { objectIDs: [706047] });
+
+      const { hint } = (
+        called.structuredContent as { error: { data: { recovery: { hint: string } } } }
+      ).error.data.recovery;
+      expect(hint).toBe(
+        'The search index can carry IDs the object endpoint no longer serves, so searching again returns the same IDs. Drop these IDs rather than re-checking them with met_search_collections.',
+      );
+      expect(contentText(called)).toContain(`Recovery: ${hint}`);
+    });
+
+    it('words a per-ID 404 in failed[] the same way', async () => {
+      const { result } = await run([sampleRecord], [437980, 706047]);
+
+      expect(result.failed).toEqual([
+        {
+          objectID: 706047,
+          error:
+            'Object 706047 not found in the Met collection — the object endpoint does not serve it, though the search index can still list it. Drop this ID rather than searching for it again.',
+        },
+      ]);
+    });
+
+    it('does not tell an all_failed caller to verify an ID through search', async () => {
+      mockGetObject.mockRejectedValue(new Error('network error'));
+      const called = await runToolContract(metGetObject, { objectIDs: [999999] });
+
+      const { reason, recovery } = (
+        called.structuredContent as {
+          error: { data: { reason: string; recovery: { hint: string } } };
+        }
+      ).error.data;
+      expect(reason).toBe('all_failed');
+      expect(recovery.hint).toBe(
+        'Retry after a brief delay. If one ID keeps failing across retries, drop it from the batch.',
+      );
+    });
   });
 
   describe('batch byte budget (#15)', () => {
@@ -1055,6 +1449,456 @@ describe('metGetObject', () => {
     });
   });
 
+  describe('opt-in images (#36)', () => {
+    let fetchMock: ReturnType<typeof vi.fn>;
+
+    beforeEach(() => {
+      // Every image request fails the test unless a case stages its own answer.
+      fetchMock = vi.fn().mockRejectedValue(new Error('unmocked fetch'));
+      vi.stubGlobal('fetch', fetchMock);
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    });
+
+    /** A CC0 record whose web-large rendition sits on the Met image host. */
+    const cc0Record = (objectID: number) => ({
+      ...sparseRecord,
+      objectID,
+      isPublicDomain: true,
+      hasCC0Image: true,
+      primaryImage: `https://images.metmuseum.org/CRDImages/ep/original/DP${objectID}.jpg`,
+      primaryImageSmall: `https://images.metmuseum.org/CRDImages/ep/web-large/DP${objectID}.jpg`,
+    });
+
+    describe('default off — the response before the input existed', () => {
+      /** content[] for a CC0 record, a non-CC0 record, and a 404, captured before the input existed. */
+      const DEFAULT_OFF_TEXT =
+        '## (Untitled) — Object 437403\n**isPublicDomain:** Yes (CC0) | **hasCC0Image:** Yes | **isHighlight:** No | **isTimelineWork:** No\n**Artist:** — | **Artist role:** —\n**Nationality:** —\n**Artist dates:** —\n**Department:** — | **departmentId:** — | **Object name:** — | **Classification:** —\n**Date:** — (0–0)\n**Medium:** —\n**Dimensions:** —\n**Culture:** —\n**Period:** —\n**Dynasty:** —\n**Geography:** —\n**Measurements:** —\n**Accession:** — | **Accession year:** —\n**Credit:** —\n**Rights:** —\n**Metadata date:** —\n**Gallery:** —\n**URL:** —\n**Image (full):** https://images.metmuseum.org/CRDImages/ep/original/DP437403.jpg\n**Image (small):** https://images.metmuseum.org/CRDImages/ep/web-large/DP437403.jpg\n**Additional images:** —\n**Wikidata:** —\n**Tags:** —\n**Constituents:** —\n\n## (Untitled) — Object 488978\n**isPublicDomain:** No | **hasCC0Image:** No | **isHighlight:** No | **isTimelineWork:** No\n**Artist:** — | **Artist role:** —\n**Nationality:** —\n**Artist dates:** —\n**Department:** — | **departmentId:** — | **Object name:** — | **Classification:** —\n**Date:** — (0–0)\n**Medium:** —\n**Dimensions:** —\n**Culture:** —\n**Period:** —\n**Dynasty:** —\n**Geography:** —\n**Measurements:** —\n**Accession:** — | **Accession year:** —\n**Credit:** —\n**Rights:** —\n**Metadata date:** —\n**Gallery:** —\n**URL:** —\n**Image (full):** —\n**Image (small):** —\n**Additional images:** —\n**Wikidata:** —\n**Tags:** —\n**Constituents:** —\n\n## Failed Fetches\n- **999:** Object 999 not found in the Met collection — the object endpoint does not serve it, though the search index can still list it. Drop this ID rather than searching for it again.';
+
+      /** The deferred notice for a 50,000 + 30,000-byte batch, captured before the input existed. */
+      const DEFAULT_OFF_NOTICE =
+        "Returned 1 of 2 fetched records — 50000 bytes of serialized structuredContent against a 60000-byte budget measured on that surface alone; content[] renders the same records again, so the delivered response is roughly twice that. The remaining 1 would exceed the budget. Re-call met_get_object with the deferred objectIDs to retrieve them; each record's listed size is on the same structuredContent scale, so sum them against the budget before requesting several.";
+
+      it('fetches nothing and adds no field or block, on either surface', async () => {
+        mockRecords([cc0Record(437403), { ...sparseRecord, objectID: 488978 }]);
+        const called = await runToolContract(metGetObject, { objectIDs: [437403, 488978, 999] });
+
+        expect(fetchMock).not.toHaveBeenCalled();
+        expect(Object.keys(called.structuredContent ?? {})).toEqual(['objects', 'failed']);
+        expect(called.content).toHaveLength(1);
+        expect(contentText(called)).toBe(DEFAULT_OFF_TEXT);
+      });
+
+      it('collects no content block from a direct handler call', async () => {
+        mockRecords([cc0Record(437403)]);
+        const ctx = createMockContext({ errors: metGetObject.errors });
+        const result = await metGetObject.handler(
+          metGetObject.input.parse({ objectIDs: [437403] }),
+          ctx,
+        );
+
+        expect(getContentBlocks(ctx)).toEqual([]);
+        expect('images' in metGetObject.output.parse(result)).toBe(false);
+      });
+
+      it('keeps the deferred notice and the keys of a deferring batch as they were', async () => {
+        mockRecords([sizedRecord(1, 50_000), sizedRecord(2, 30_000)]);
+        const called = await runToolContract(metGetObject, { objectIDs: [1, 2] });
+        const structured = called.structuredContent as { notice?: string };
+
+        expect(fetchMock).not.toHaveBeenCalled();
+        expect(Object.keys(structured)).toEqual(['objects', 'failed', 'deferred', 'notice']);
+        expect(structured.notice).toBe(DEFAULT_OFF_NOTICE);
+        // The record text, then the notice as the enrichment trailer — no caption
+        // or image block ahead of either.
+        expect(called.content.map((block) => block.type)).toEqual(['text', 'text']);
+        expect(called.content[1]).toEqual({ type: 'text', text: `\n\n> ${DEFAULT_OFF_NOTICE}` });
+      });
+    });
+
+    /** The web-large URL `cc0Record` gives an object. */
+    const webLarge = (objectID: number) =>
+      `https://images.metmuseum.org/CRDImages/ep/web-large/DP${objectID}.jpg`;
+
+    /** The bytes the image host serves for an object — distinct per object, so each block traces to its record. */
+    const imageBytes = (objectID: number) => new TextEncoder().encode(`JPEG ${objectID}`);
+    const base64Of = (objectID: number) => Buffer.from(imageBytes(objectID)).toString('base64');
+
+    /**
+     * The image host: each object's web-large path answers its bytes as
+     * image/jpeg unless `answers` stages another exchange for that object. Any
+     * other URL rejects, so a request off the pinned host fails the test.
+     */
+    function imageHost(answers: Record<number, () => Promise<Response>> = {}) {
+      return (request: unknown) => {
+        const url = new URL(String(request));
+        const objectID = Number(/\/DP(\d+)\.jpg$/.exec(url.pathname)?.[1]);
+        if (url.origin !== 'https://images.metmuseum.org' || !objectID) {
+          return Promise.reject(new Error(`unrouted fetch ${url.href}`));
+        }
+        const staged = answers[objectID];
+        return staged
+          ? staged()
+          : Promise.resolve(
+              new Response(imageBytes(objectID), { headers: { 'content-type': 'image/jpeg' } }),
+            );
+      };
+    }
+
+    /** The URLs the call requested from the image host, in call order. */
+    const imageRequests = () => fetchMock.mock.calls.map(([request]) => String(request));
+
+    /** The caption and image blocks `content[]` opens with for each attached object. */
+    const pairs = (...objectIDs: number[]) =>
+      objectIDs.flatMap((objectID) => [
+        { type: 'text', text: `Image of object ${objectID} (primaryImageSmall)` },
+        { type: 'image', data: base64Of(objectID), mimeType: 'image/jpeg' },
+      ]);
+
+    type ImageEntry = { objectID: number; status: string };
+
+    /** A CC0 record padded to roughly `bytes` of serialized structuredContent. */
+    const heavyCc0 = (objectID: number, bytes: number) => {
+      const base = cc0Record(objectID);
+      return { ...base, creditLine: 'x'.repeat(bytes - utf8Bytes(base)) };
+    };
+
+    const imagesCall = (objectIDs: number[], context?: { signal: AbortSignal }) =>
+      runToolContract(
+        metGetObject,
+        { objectIDs, includeImages: true },
+        context ? { context } : undefined,
+      );
+
+    describe('attachment', () => {
+      it('attaches the first 3 CC0 records in request order and reports the other two over_cap', async () => {
+        const ids = [437403, 467642, 286850, 100153, 36033];
+        mockRecords(ids.map(cc0Record));
+        fetchMock.mockImplementation(imageHost());
+        const called = await imagesCall(ids);
+
+        expect(called.isError).toBeFalsy();
+        expect(imageRequests()).toEqual([webLarge(437403), webLarge(467642), webLarge(286850)]);
+        expect((called.structuredContent as { images: ImageEntry[] }).images).toEqual([
+          { objectID: 437403, status: 'attached' },
+          { objectID: 467642, status: 'attached' },
+          { objectID: 286850, status: 'attached' },
+          { objectID: 100153, status: 'over_cap' },
+          { objectID: 36033, status: 'over_cap' },
+        ]);
+        // content[] opens with the caption/image pairs, then the format() text.
+        expect(called.content.slice(0, 6)).toEqual(pairs(437403, 467642, 286850));
+        expect(called.content.map((block) => block.type)).toEqual([
+          'text',
+          'image',
+          'text',
+          'image',
+          'text',
+          'image',
+          'text',
+        ]);
+        expect((called.content[6] as { text: string }).text).toMatch(
+          /^## \(Untitled\) — Object 437403/,
+        );
+        // The bytes ride content[] only.
+        const structured = JSON.stringify(called.structuredContent);
+        for (const objectID of ids.slice(0, 3)) {
+          expect(structured).not.toContain(base64Of(objectID));
+        }
+        expect(contentText(called)).toContain(
+          '## Images\n- **437403:** attached\n- **467642:** attached\n- **286850:** attached\n- **100153:** over_cap\n- **36033:** over_cap',
+        );
+      });
+
+      it('collects the pairs through ctx.content and validates images against the output schema', async () => {
+        const ids = [437403, 467642];
+        mockRecords(ids.map(cc0Record));
+        fetchMock.mockImplementation(imageHost());
+        const ctx = createMockContext({ errors: metGetObject.errors });
+        const result = await metGetObject.handler(
+          metGetObject.input.parse({ objectIDs: ids, includeImages: true }),
+          ctx,
+        );
+
+        expect(getContentBlocks(ctx)).toEqual(pairs(437403, 467642));
+        expect(metGetObject.output.parse(result).images).toEqual([
+          { objectID: 437403, status: 'attached' },
+          { objectID: 467642, status: 'attached' },
+        ]);
+      });
+
+      it('keeps request order when the image fetches complete in reverse', async () => {
+        // The first image answers last; a completion-ordered attach would reverse the pairs.
+        const ids = [437403, 467642, 286850];
+        mockRecords(ids.map(cc0Record));
+        const delayed = (objectID: number, ms: number) => () =>
+          new Promise<Response>((resolve) =>
+            setTimeout(
+              () =>
+                resolve(
+                  new Response(imageBytes(objectID), { headers: { 'content-type': 'image/jpeg' } }),
+                ),
+              ms,
+            ),
+          );
+        fetchMock.mockImplementation(
+          imageHost({ 437403: delayed(437403, 30), 467642: delayed(467642, 15) }),
+        );
+        const ctx = createMockContext({ errors: metGetObject.errors });
+        await metGetObject.handler(
+          metGetObject.input.parse({ objectIDs: ids, includeImages: true }),
+          ctx,
+        );
+
+        expect(getContentBlocks(ctx)).toEqual(pairs(437403, 467642, 286850));
+      });
+
+      it('attaches exactly 3 CC0 records with no over_cap entry when the batch holds no more', async () => {
+        const ids = [437403, 488978, 467642, 286850];
+        mockRecords([
+          cc0Record(437403),
+          { ...sparseRecord, objectID: 488978 },
+          cc0Record(467642),
+          cc0Record(286850),
+        ]);
+        fetchMock.mockImplementation(imageHost());
+        const called = await imagesCall(ids);
+
+        expect((called.structuredContent as { images: ImageEntry[] }).images).toEqual([
+          { objectID: 437403, status: 'attached' },
+          { objectID: 488978, status: 'no_cc0_image' },
+          { objectID: 467642, status: 'attached' },
+          { objectID: 286850, status: 'attached' },
+        ]);
+        expect(called.content.slice(0, 6)).toEqual(pairs(437403, 467642, 286850));
+      });
+
+      it('gives a non-CC0 record no_cc0_image, a deferred record and a failed ID no entry, and fetches only the returned CC0 image', async () => {
+        // 437403 (40 KB) and 488978 fit; 999 is a 404; 467642 (30 KB) would cross
+        // the 60,000-byte budget, so it is deferred.
+        mockRecords([
+          heavyCc0(437403, 40_000),
+          { ...sparseRecord, objectID: 488978 },
+          heavyCc0(467642, 30_000),
+        ]);
+        fetchMock.mockImplementation(imageHost());
+        const called = await imagesCall([437403, 488978, 999, 467642]);
+        const structured = called.structuredContent as {
+          objects: { objectID: number }[];
+          failed: { objectID: number }[];
+          deferred: { objectID: number }[];
+          images: ImageEntry[];
+          notice: string;
+        };
+
+        expect(structured.objects.map((o) => o.objectID)).toEqual([437403, 488978]);
+        expect(structured.failed.map((f) => f.objectID)).toEqual([999]);
+        expect(structured.deferred.map((d) => d.objectID)).toEqual([467642]);
+        expect(structured.images).toEqual([
+          { objectID: 437403, status: 'attached' },
+          { objectID: 488978, status: 'no_cc0_image' },
+        ]);
+        expect(imageRequests()).toEqual([webLarge(437403)]);
+        expect(called.content.slice(0, 2)).toEqual(pairs(437403));
+
+        const text = contentText(called);
+        expect(text).toContain('## Images\n- **437403:** attached\n- **488978:** no_cc0_image');
+        expect(text).not.toContain('- **467642:** attached');
+        expect(text.indexOf('## Failed Fetches')).toBeLessThan(text.indexOf('## Deferred'));
+        expect(text.indexOf('## Deferred')).toBeLessThan(text.indexOf('## Images'));
+      });
+
+      it('fetches nothing and returns the declared error when no record comes back', async () => {
+        mockGetObject.mockResolvedValue(null);
+        const called = await imagesCall([999998, 999999]);
+
+        expect(called.isError).toBe(true);
+        expect(
+          (called.structuredContent as { error: { data: { reason: string } } }).error.data.reason,
+        ).toBe('all_not_found');
+        expect(fetchMock).not.toHaveBeenCalled();
+      });
+
+      it('rejects an includeImages value that is not a boolean', async () => {
+        const called = await runToolContract(metGetObject, {
+          objectIDs: [437403],
+          includeImages: 'yes',
+        } as unknown as z.input<typeof metGetObject.input>);
+
+        expect(called.isError).toBe(true);
+        expect((called.structuredContent as { error: { code: number } }).error.code).toBe(
+          JsonRpcErrorCode.InvalidParams,
+        );
+        expect(mockGetObject).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('unavailable — the record stays, the call succeeds', () => {
+      it('reports a 403, a non-image body, and a redirect unavailable, and still attaches the next image', async () => {
+        const ids = [437403, 467642, 286850, 100153];
+        mockRecords(ids.map(cc0Record));
+        fetchMock.mockImplementation(
+          imageHost({
+            // The image host's 403 is one missing image, not the API firewall.
+            437403: () => Promise.resolve(new Response('<html>Forbidden</html>', { status: 403 })),
+            467642: () =>
+              Promise.resolve(
+                new Response('<html>not an image</html>', {
+                  headers: { 'content-type': 'text/html' },
+                }),
+              ),
+            // What fetch does with a 3xx under `redirect: 'error'`.
+            286850: () => Promise.reject(new TypeError('fetch failed: unexpected redirect')),
+          }),
+        );
+        const called = await imagesCall(ids);
+
+        expect(called.isError).toBeFalsy();
+        expect((called.structuredContent as { objects: unknown[] }).objects).toHaveLength(4);
+        expect((called.structuredContent as { images: ImageEntry[] }).images).toEqual([
+          { objectID: 437403, status: 'unavailable' },
+          { objectID: 467642, status: 'unavailable' },
+          { objectID: 286850, status: 'unavailable' },
+          // A failed fetch still spends its slot: the cap counts attempts.
+          { objectID: 100153, status: 'over_cap' },
+        ]);
+        expect(called.content.map((block) => block.type)).toEqual(['text']);
+        expect(contentText(called)).not.toContain('upstream_blocked');
+        for (const [, init] of fetchMock.mock.calls) {
+          expect((init as RequestInit).redirect).toBe('error');
+        }
+      });
+
+      it('never requests a look-alike host, an http URL, or an empty one, and gives each a slot', async () => {
+        mockRecords([
+          {
+            ...cc0Record(1),
+            primaryImageSmall: 'https://images.metmuseum.org.evil.example/DP1.jpg',
+          },
+          {
+            ...cc0Record(2),
+            primaryImageSmall: 'http://images.metmuseum.org/CRDImages/ep/web-large/DP2.jpg',
+          },
+          { ...cc0Record(3), primaryImageSmall: '' },
+          cc0Record(4),
+        ]);
+        fetchMock.mockImplementation(imageHost());
+        const called = await imagesCall([1, 2, 3, 4]);
+
+        expect(fetchMock).not.toHaveBeenCalled();
+        expect((called.structuredContent as { images: ImageEntry[] }).images).toEqual([
+          { objectID: 1, status: 'unavailable' },
+          { objectID: 2, status: 'unavailable' },
+          { objectID: 3, status: 'unavailable' },
+          { objectID: 4, status: 'over_cap' },
+        ]);
+      });
+
+      it("reports unavailable without a request once the call's time budget is spent", async () => {
+        vi.useFakeTimers({ toFake: ['Date'] });
+        // The record fetch outlasts the 30 s call budget before images start.
+        mockGetObject.mockImplementation((objectID: number) => {
+          vi.setSystemTime(Date.now() + 31_000);
+          return cc0Record(objectID);
+        });
+        const called = await imagesCall([437403]);
+
+        expect(called.isError).toBeFalsy();
+        expect(fetchMock).not.toHaveBeenCalled();
+        expect((called.structuredContent as { images: ImageEntry[] }).images).toEqual([
+          { objectID: 437403, status: 'unavailable' },
+        ]);
+      });
+    });
+
+    it('ends the call as cancelled when the caller aborts during image fetches', async () => {
+      const controller = new AbortController();
+      mockRecords([cc0Record(437403), cc0Record(467642)]);
+      // The first image request is in flight when the caller goes away. Like a
+      // real fetch, a request made on an already-aborted signal rejects at once.
+      fetchMock.mockImplementation(
+        (_request: unknown, init?: RequestInit) =>
+          new Promise((_resolve, reject) => {
+            const signal = init?.signal;
+            if (signal?.aborted) return reject(signal.reason);
+            signal?.addEventListener('abort', () => reject(signal.reason));
+            controller.abort();
+          }),
+      );
+      const called = await imagesCall([437403, 467642], { signal: controller.signal });
+
+      expect(called.isError).toBe(true);
+      expect((called.structuredContent as { error: { code: number } }).error.code).toBe(
+        JsonRpcErrorCode.RequestCancelled,
+      );
+      expect(called.content.some((block) => block.type === 'image')).toBe(false);
+    });
+
+    describe('the deferred notice', () => {
+      it('adds the attached image blocks to the delivered size it states', async () => {
+        mockRecords([heavyCc0(1, 50_000), heavyCc0(2, 30_000)]);
+        fetchMock.mockImplementation(imageHost());
+        const called = await imagesCall([1, 2]);
+        const structured = called.structuredContent as { notice: string; images: ImageEntry[] };
+
+        expect(structured.images).toEqual([{ objectID: 1, status: 'attached' }]);
+        expect(structured.notice).toContain(
+          `so the delivered response is roughly twice that, plus 1 attached image block (${base64Of(1).length} bytes of base64). The remaining 1 would exceed the budget.`,
+        );
+        expect(contentText(called)).toContain(
+          `plus 1 attached image block (${base64Of(1).length} bytes of base64)`,
+        );
+      });
+
+      it('keeps its wording when no image block was attached', async () => {
+        mockRecords([{ ...heavyCc0(1, 50_000), hasCC0Image: false }, heavyCc0(2, 30_000)]);
+        const called = await imagesCall([1, 2]);
+        const notice = (called.structuredContent as { notice: string }).notice;
+
+        expect(fetchMock).not.toHaveBeenCalled();
+        expect(notice).toContain(
+          'so the delivered response is roughly twice that. The remaining 1',
+        );
+        expect(notice).not.toContain('image block');
+      });
+    });
+
+    describe('format and descriptions', () => {
+      it('renders ## Images after the failed and deferred sections, one line per entry', () => {
+        const text = (
+          metGetObject.format!({
+            objects: [sampleRecord],
+            failed: [{ objectID: 99, error: 'Not found.' }],
+            deferred: [{ objectID: 7, bytes: 30_000 }],
+            images: [{ objectID: 437980, status: 'unavailable' }],
+          })[0] as { text: string }
+        ).text;
+
+        expect(
+          text.endsWith(
+            '## Deferred — batch byte budget\n- **7:** 30000 bytes\n\n## Images\n- **437980:** unavailable',
+          ),
+        ).toBe(true);
+      });
+
+      it('tells the caller a structuredContent-only client will not show the images', () => {
+        const description = metGetObject.input.shape.includeImages.description ?? '';
+        expect(description).toContain('structuredContent');
+        expect(description).toContain('will not show');
+      });
+
+      it('states the measured long edge of primaryImageSmall', () => {
+        const description =
+          metGetObject.output.shape.objects.element.shape.primaryImageSmall.description ?? '';
+        expect(description).not.toContain('800');
+        expect(description).toContain('600');
+      });
+    });
+  });
+
   // --- inputAliases: `ids` reaches the declared `objectIDs` ---
   // The rewrite runs in parseToolArguments, above the handler, so the full tool
   // contract is the only seam that exercises it.
@@ -1093,10 +1937,10 @@ describe('metGetObject', () => {
     });
 
     it('still rejects an undeclared key that maps to no alias', async () => {
-      const result = await call({ objectIDs: [437980], includeImages: true });
+      const result = await call({ objectIDs: [437980], includeAdditionalImages: true });
 
       expect(result.isError).toBe(true);
-      expect(textOf(result)).toContain('includeImages');
+      expect(textOf(result)).toContain('includeAdditionalImages');
       expect(mockGetObject).not.toHaveBeenCalled();
     });
 
@@ -1112,8 +1956,8 @@ describe('metGetObject', () => {
       ).error;
       expect(error.code).toBe(JsonRpcErrorCode.NotFound);
       expect(error.data.reason).toBe('all_not_found');
-      expect(error.data.recovery.hint).toContain('met_search_collections');
-      expect(textOf(result)).toContain('Recovery: Verify the IDs');
+      expect(error.data.recovery.hint).toContain('Drop these IDs');
+      expect(textOf(result)).toContain('Recovery: The search index can carry IDs');
       expect(textOf(result)).toContain('all_not_found');
     });
   });
