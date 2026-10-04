@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.8.0](changelog/0.8.x/0.8.0.md) — 2026-10-04 · ⚠️ Breaking
+
+met_get_object can attach up to three CC0 images and returns attribution, rights, revision-date, and departmentId fields; met_search_collections answers zero matches as a success; a Met 5xx outage fails as upstream_unavailable on every tool.
+
 ## [0.7.0](changelog/0.7.x/0.7.0.md) — 2026-09-30
 
 met_list_objects browses the collection by department and update date with no paging limit, every tool call runs under one MET_CALL_DEADLINE_MS budget, and a Met firewall 403 fails as upstream_blocked instead of inviting a retry.

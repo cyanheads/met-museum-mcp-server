@@ -1,6 +1,6 @@
 # met-museum-mcp-server - Directory Structure
 
-Generated on: 2026-09-30 16:00:46
+Generated on: 2026-10-04 13:11:13
 
 ```text
 met-museum-mcp-server/
@@ -31,6 +31,7 @@ met-museum-mcp-server/
 │   ├── 0.5.x/
 │   ├── 0.6.x/
 │   ├── 0.7.x/
+│   ├── 0.8.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
@@ -137,6 +138,7 @@ met-museum-mcp-server/
 │   ├── lint-mcp.ts
 │   ├── lint-packaging.ts
 │   ├── list-skills.ts
+│   ├── prune-musl-packages.ts
 │   ├── release-github.ts
 │   └── tree.ts
 ├── src/
@@ -167,8 +169,11 @@ met-museum-mcp-server/
 │   ├── services/
 │   │   └── met/
 │   │       ├── met-service-base-url.test.ts
+│   │       ├── met-service-combined-departments.test.ts
 │   │       ├── met-service-deadline.test.ts
+│   │       ├── met-service-error-page.test.ts
 │   │       ├── met-service-upstream-blocked.test.ts
+│   │       ├── met-service-upstream-unavailable.test.ts
 │   │       └── met-service.test.ts
 │   ├── tools/
 │   │   ├── met-get-object.tool.test.ts
