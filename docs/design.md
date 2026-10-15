@@ -8,7 +8,7 @@
 |:-----|:------------|:-----------|:------------|
 | `met_search_collections` | Search the Met collection by keyword and filters; returns total count and one page of matched object IDs | `q`, `matchField`, `hasImages`, `isHighlight`, `isOnView`, `medium`, `departmentId`, `geoLocation`, `dateBegin`, `dateEnd`, `limit`, `offset` | `readOnlyHint: true`, `idempotentHint: true` |
 | `met_list_objects` | Browse without a keyword: every object ID in one department, every object created or revised on or after a date, or both; ascending, paged with no depth limit | `departmentId`, `updatedSince`, `limit`, `offset` | `readOnlyHint: true`, `idempotentHint: true` |
-| `met_get_object` | Fetch full records for one or more object IDs (batch, concurrency-limited, partial-success), optionally with up to 3 CC0 images as image content | `objectIDs` (array, max 20), `includeImages` | `readOnlyHint: true`, `idempotentHint: true` |
+| `met_get_object` | Fetch full records for one or more object IDs (batch, concurrency-limited, partial-success), optionally with up to 3 CC0 images as image content | `objectIDs` (array, max 500; the first 20 distinct are fetched), `includeImages` | `readOnlyHint: true`, `idempotentHint: true` |
 | `met_list_departments` | Return the 19 curatorial departments with their IDs and display names | — | `readOnlyHint: true`, `idempotentHint: true` |
 
 ### Resources
@@ -106,8 +106,8 @@ z.object({
     .describe('Earliest object date (year, inclusive; negative = BCE). Requires dateEnd.'),
   dateEnd: z.number().int().optional()
     .describe('Latest object date (year, inclusive; negative = BCE). Requires dateBegin.'),
-  limit: z.number().int().min(1).max(500).default(20)
-    .describe('Page size. Paging reaches only the first 10,000 matches; a page that would cross 10,000 is cut short there.'),
+  limit: z.number().int().min(1).max(10_000).default(20)
+    .describe('Page size, at most 500 IDs (the Met search maximum); a larger value, up to 10,000, reads a 500-ID page and the notice says so (Decision #24). Paging reaches only the first 10,000 matches; a page that would cross 10,000 is cut short there.'),
   offset: z.number().int().min(0).default(0)
     .describe('Zero-based index of the first match to return; pass nextOffset to continue. An offset at or beyond 10,000 or total returns an empty page, not an error. Tied relevance can repeat or skip an ID at a page boundary.'),
 })
@@ -120,7 +120,7 @@ z.object({
   total: z.number().int()
     .describe('Total matching objects — can exceed 10,000, the most that paging reaches.'),
   objectIDs: z.array(z.number().int())
-    .describe('Object IDs for this page, up to `limit` results; for departmentId 7 or 17 only that department\'s, so possibly fewer, or none, while more remain.'),
+    .describe('Object IDs for this page, up to `limit` results and never more than 500; for departmentId 7 or 17 only that department\'s, so possibly fewer, or none, while more remain.'),
   returned: z.number().int()
     .describe('Count of object IDs in this page.'),
   truncated: z.boolean()
@@ -133,7 +133,9 @@ z.object({
     .describe('The resolved offset. Nonzero and at or beyond min(total, 10,000), the page is empty because the offset ran past what paging reaches.'),
 })
 // enrichment: {
-//   notice?: string — total 0: the zero-match guidance, composed from the levers the call used (Decision #17);
+//   notice?: string — limit above 500 with matches remaining past the page: the page was read with limit 500,
+//                     continue from nextOffset (Decision #24);
+//                     total 0: the zero-match guidance, composed from the levers the call used (Decision #17);
 //                     total > 10,000: the window; departmentId 7 or 17: the combined set — total counts both
 //                     departments and a page can hold fewer than limit IDs, or the department filter could not
 //                     be applied (Decision #21). Every notice for one response is joined into one string.
@@ -180,6 +182,13 @@ errors: [
     recovery: 'The Met API is failing on its side, so changing the request will not help. Wait a few minutes before retrying.',
   },
   {
+    reason: 'upstream_rate_limited',
+    code: JsonRpcErrorCode.RateLimited,
+    thrownBy: 'service', // Decision #23
+    when: "The Met API answered HTTP 429 to the department lookup or the search until the retry ladder ran out, or asked for a wait longer than the ladder or the call's time budget allows — it throttles this server's address, not one query.",
+    recovery: 'Wait the period this error names, or about a minute when it names none, then retry with fewer requests at once.',
+  },
+  {
     reason: 'retry_deadline_exceeded',
     code: JsonRpcErrorCode.Timeout,
     thrownBy: 'service', // Decision #18
@@ -220,8 +229,8 @@ z.object({
     .describe('One curatorial department; valid IDs come from met_list_departments, and an unknown ID is rejected (invalid_department).'),
   updatedSince: blankAsUnset(z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional())
     .describe('Objects whose record was created or revised on or after this date, the day itself included, as YYYY-MM-DD with no time part. It compares the UTC date of each record\'s metadataDate, which met_get_object returns. A date later than the newest update returns an empty list, not an error.'),
-  limit: z.number().int().min(1).max(500).default(20)
-    .describe('Maximum number of object IDs to return in this page.'),
+  limit: z.number().int().min(1).max(10_000).default(20)
+    .describe('Page size, at most 500 IDs; a larger value, up to 10,000, reads a 500-ID page and the notice says so (Decision #24).'),
   offset: z.number().int().min(0).default(0)
     .describe('Zero-based index of the first ID; pass nextOffset to continue. Every ID is reachable; an offset at or past total returns an empty page, not an error.'),
 })
@@ -234,7 +243,7 @@ z.object({
   total: z.number().int()
     .describe('Objects matching the filters. Paging reaches every one — there is no 10,000 window here.'),
   objectIDs: z.array(z.number().int())
-    .describe('Object IDs for this page in ascending order, up to `limit` results.'),
+    .describe('Object IDs for this page in ascending order, up to `limit` results and never more than 500.'),
   returned: z.number().int()
     .describe('Count of object IDs in this page.'),
   offset: z.number().int()
@@ -247,7 +256,9 @@ z.object({
     .describe('The offset to pass on the next call, or null when this page ends the list.'),
 })
 // enrichment: {
-//   notice?: string — present only when total is 0, naming the filters that matched nothing and how to widen the list.
+//   notice?: string — total 0: the filters that matched nothing and how to widen the list; limit above 500
+//                     with IDs remaining past the page: the page was read with limit 500, continue from
+//                     nextOffset (Decision #24). The two never apply together.
 //   effectiveQuery?: string — every success: the filters as sent (updatedSince after its clamp to 1753-01-01),
 //                     `name=` + JSON-encoded value (`departmentId=10, updatedSince="2026-09-01"`), or
 //                     `no filter (whole collection)` — a blank updatedSince, read as unset, included.
@@ -286,6 +297,13 @@ errors: [
     recovery: 'The Met API is failing on its side, so changing the request will not help. Wait a few minutes before retrying.',
   },
   {
+    reason: 'upstream_rate_limited',
+    code: JsonRpcErrorCode.RateLimited,
+    thrownBy: 'service', // Decision #23
+    when: "The Met API answered HTTP 429 to the department lookup or the ID list until the retry ladder ran out, or asked for a wait longer than the ladder or the call's time budget allows — it throttles this server's address, not one filter.",
+    recovery: 'Wait the period this error names, or about a minute when it names none, then retry with fewer requests at once.',
+  },
+  {
     reason: 'retry_deadline_exceeded',
     code: JsonRpcErrorCode.Timeout,
     thrownBy: 'service', // Decision #18
@@ -313,7 +331,7 @@ errors: [
 
 ### `met_get_object`
 
-**Purpose:** Fetch full records for one or more object IDs. Batch-fetches up to 20 at a time with concurrency limiting and partial-success — the intended follow-on to `met_search_collections` and `met_list_objects`.
+**Purpose:** Fetch full records for one or more object IDs. Batch-fetches up to 20 distinct IDs per call with concurrency limiting and partial-success, and accepts a full 500-ID page, returning the distinct IDs past the first 20 unrequested in `remainingIDs` — the intended follow-on to `met_search_collections` and `met_list_objects`.
 
 **Upstream endpoint:** `GET /v1/objects/{id}` (per ID)
 
@@ -321,8 +339,8 @@ errors: [
 
 ```ts
 z.object({
-  objectIDs: z.array(z.number().int().positive()).min(1).max(20)
-    .describe('One or more Met object IDs to fetch. Maximum 20 per call. IDs come from met_search_collections or met_list_objects. A repeated ID is fetched and returned once, at its first position. Partial failures are reported per ID rather than failing the whole batch.'),
+  objectIDs: z.array(z.number().int().positive()).min(1).max(500)
+    .describe('One or more Met object IDs to fetch, up to 500 — a full met_search_collections or met_list_objects page. A repeated ID is fetched and returned once, at its first position. The first 20 distinct IDs are fetched; the rest come back unrequested in remainingIDs. Partial failures are reported per ID rather than failing the whole batch.'),
   includeImages: z.boolean().default(false)
     .describe('Also attach the web-display image (primaryImageSmall, about 600 px on the long edge) of the first 3 returned records that have hasCC0Image true, in request order, as image blocks in content[], each after a caption naming its objectID. images[] reports what happened for every returned record. The image bytes ride content[] only, so a client that hands the model only structuredContent will not show the images. Default false: no image is fetched.'),
 })
@@ -408,6 +426,10 @@ z.object({
       .describe('Historical period (e.g., "New Kingdom, Ramesside", "Meiji period"). Often empty.'),
     dynasty: z.string()
       .describe('Dynasty for applicable cultures (e.g., "Dynasty 19"). Often empty.'),
+    reign: z.string()
+      .describe('Reign the object dates to, for applicable cultures (e.g., "Joint reign of Hatshepsut and Thutmose III"). Often empty.'),
+    portfolio: z.string()
+      .describe('Print series or portfolio the object belongs to, with its plate or number (e.g., "Birds of America, plate LXXI"). Often empty.'),
     accessionNumber: z.string()
       .describe('The Met\'s accession number for the object.'),
     accessionYear: z.string()
@@ -479,13 +501,16 @@ z.object({
   })).optional()
     .describe('Records that were fetched but did not fit the call’s cumulative budget on serialized structuredContent bytes, in request order. Re-call met_get_object with these IDs to retrieve them. Absent when every fetched record fit.'),
 
+  remainingIDs: z.array(z.number().int()).optional()
+    .describe('The distinct object IDs past the first 20, in request order. These were not requested, unlike deferred[] (fetched, withheld by the byte budget) and the failed[] entries an upstream block, throttle, or outage left unrequested. Re-call met_get_object with them. Absent when the call held 20 or fewer distinct IDs.'),
+
   images: z.array(z.object({
     objectID: z.number().int()
       .describe('Object ID of a returned record.'),
     status: z.enum(['attached', 'no_cc0_image', 'over_cap', 'unavailable'])
       .describe('attached: the image rides content[], after a caption naming the objectID. no_cc0_image: the record has no CC0 image, so nothing was fetched. over_cap: 3 earlier CC0 records took the image slots — request this ID among the first 3 CC0 records of another call to see its image. unavailable: the image host returned no image in time, or the URL was not on the Met image host.'),
   })).optional()
-    .describe('Image outcome for each record in objects[], in request order; deferred and failed IDs get no entry. Present only when includeImages is true.'),
+    .describe('Image outcome for each record in objects[], in request order; deferred, failed, and over-cap IDs get no entry. Present only when includeImages is true.'),
 })
 ```
 
@@ -494,7 +519,7 @@ z.object({
 ```ts
 enrichment: {
   notice: z.string().optional()
-    .describe('How to retrieve the deferred records, with the budget applied. Present only when the batch byte budget deferred a record.'),
+    .describe('Present when the call held more than 20 distinct object IDs, or when the batch byte budget deferred a record; both apply as one string, the over-cap sentence first. Past the cap it says how many IDs were requested and that the rest are in remainingIDs; for deferred records, how to retrieve them, with the budget applied.'),
 }
 ```
 
@@ -512,7 +537,7 @@ errors: [
   {
     reason: 'all_failed',
     code: JsonRpcErrorCode.ServiceUnavailable,
-    when: 'No object was fetched, no failure was a firewall block or a 500/502/503/504 outage, and the failures were neither all 404s nor all time-budget expiries — network errors, other HTTP errors, or 404s beside expiries.',
+    when: 'No object was fetched, no failure was a firewall block, an HTTP 429 rate limit, or a 500/502/503/504 outage, and the failures were neither all 404s nor all time-budget expiries — network errors, other HTTP errors, or 404s beside expiries.',
     recovery: 'Retry after a brief delay. If one ID keeps failing across retries, drop it from the batch.',
   },
   {
@@ -522,6 +547,13 @@ errors: [
     // Raised by the handler with ctx.fail once the batch fetched nothing — Decision #19
     when: "No object was fetched and the Met API's firewall refused requests with HTTP 403 — it blocks this server's address, not one object.",
     recovery: 'Wait several minutes before retrying, and send fewer requests.',
+  },
+  {
+    reason: 'upstream_rate_limited',
+    code: JsonRpcErrorCode.RateLimited,
+    // Raised by the handler with ctx.fail once the batch fetched nothing — Decision #23
+    when: "No object was fetched and the Met API answered HTTP 429 until a fetch's retries ran out, or asked for a wait longer than the retries or the call's time budget allow — it throttles this server's address, not one object.",
+    recovery: 'Wait the period this error names, or about a minute when it names none, then retry with fewer requests at once.',
   },
   {
     reason: 'upstream_unavailable',
@@ -553,6 +585,7 @@ errors: [
 - `artistEndDate` carries `9999` for a maker still living or active (object `20121`, "1837–present") and occasionally another future year (object `79199`, `2112`). No death or closing year lies in the future, so a bare integer later than the current UTC year normalizes to `''`, the field's documented empty value; a year up to the current one and a full date (`2005-08-01`) pass through. `artistBeginDate` is left as sent. `content[]` renders a range with one bound open (`1837–`, `–1890`) and `—` only when both are empty.
 - The attribution arrives in four flat fields: `artistPrefix` (`Style of`, `Published by`), `artistDisplayName`, `artistSuffix` (`(r. 1876–1909)`, `, Paris`), and `artistRole` (`Patron`, `Publisher`). Each is free text, `''` when absent, kept raw on the record; `artistDisplayName` stays the bare name and `constituents[].name` stays as sent (the Met writes the prefix into it, not the suffix). `content[]` joins them on the Artist line: the trimmed prefix and name with a space, the trimmed suffix directly after a leading comma and after a space otherwise, the bio in parentheses as before, then ` | **Artist role:** <role>` — `**Artist:** Style of Rembrandt (Dutch, ca. 1655) | **Artist role:** Artist` for `437403`, `**Artist:** Sultan Abdülhamid II (r. 1876–1909) | **Artist role:** Patron` for `456947`. The Artist dates line is unchanged: `artistBeginDate`/`artistEndDate` belong to the person `artistDisplayName` names (Rembrandt's 1606–1669 on the "Style of" work), which their descriptions say. In the Open Access CSV, 23% of records with an artist carry a prefix on their first-listed constituent, 2.3% a suffix, and 42% a role other than `Artist`.
 - `rightsAndReproduction` (free text, so italic-stripped like other prose), `metadataDate`, and `accessionYear` pass through as strings, `''` when absent. The rights line names the holder of a copyrighted work (`488978`: `© 2026 Pollock-Krasner Foundation / Artists Rights Society (ARS), New York`); most non-public-domain records carry none, so an empty value is not a reuse grant. `metadataDate` is an ISO 8601 UTC timestamp sent as is — its fraction runs from none (`2025-03-06T04:54:30Z`) to three digits — and its UTC date is what `met_list_objects` `updatedSince` (`/v1/objects` `metadataDate`) compares, that day included, which the `updatedSince` description says. `accessionYear` is a year on nearly every record, a full date on a few (`286850`: `2005-02-15`), and on 18% of CSV records the credit line names a different year or none (`437403`: credit `…Timken, 1959`, `accessionYear` `1960`); neither date is reformatted. `content[]` renders `**Accession:** <number> | **Accession year:** <year>`, then Credit, `**Rights:**`, and `**Metadata date:**` lines, each `—` when empty.
+- `reign` and `portfolio` are free text like `period` and `dynasty` (italic-stripped, `''` when absent), and `content[]` renders them as `**Reign:**` and `**Portfolio:**` lines after Dynasty, `—` when empty. Both are sparse: in a 32-record sample (2026-10-15), `reign` was set on 3, all Egyptian Art (`544442`: `Joint reign of Hatshepsut and Thutmose III`), and `portfolio` on 1 (`383857`: `Birds of America, plate LXXI`), a series grouping the record otherwise carries only inside its title. The batch budget measures the normalized record, so both keys count against it.
 - `departmentId` is resolved from `department` through a static exact-match map (`DEPARTMENT_ID_BY_NAME`): the 19 `met_list_departments` names plus the five names records carry instead (see the table under `met_list_departments`). A name the map does not hold, an empty one included, resolves to `null`, never a guess and never `0`: a `0` reads as an ID a caller can pass on, and fails `met_list_objects` input validation (`min(1)`) instead of saying the name was not recognized. Reading the 19 `/v1/objects?departmentIds=` lists would be exact without a map, but costs 19 requests per cache window, close to the burst that has drawn the firewall block (Decision #19). `content[]` renders `**departmentId:** <id>` on the Department line, `—` for `null`.
 - Free-text fields can carry raw `<i>…</i>` pairs marking foreign terms (object `21814`'s title: `Sword guard (<i>Tsuba</i>) …`). The exact `<i>` and `</i>` tokens, either case, are removed from every free-text string of the record — URL-shaped fields, `accessionNumber`, `accessionYear`, `metadataDate`, `GalleryNumber`, and the artist date bounds excepted. Both surfaces are plain text and Markdown, never HTML, so this is presentation cleanup, not sanitization: any other `<` text stays literal and is escaped at render, and a value with no token is unchanged. For `constituents[].name` the entity decode runs first: the name arrives encoded as a whole, markup included, so its `<i>` pair reaches the server as `&lt;i&gt;` and is stripped once decoded.
 - Upstream catalog text is escaped at the `content[]` render boundary (`escapeMarkdown`, `src/utils/markdown.ts`) — real titles carry complete Markdown sequences. `structuredContent` keeps the raw value.
@@ -561,11 +594,13 @@ errors: [
 - `measurements` is `null` on the wire when the Met records none — pass through as nullable like `tags`/`constituents`. Within a populated array, `elementDescription` is itself nullable on the wire (object `544683`'s `Overall` element) and normalizes to `''`; `elementMeasurements` is an open `Record<string, number>` because sibling elements of one record carry different axis keys, and its keys are upstream text, so `format()` escapes them alongside the element name and description.
 - The records a single call returns are bounded by a cumulative budget on serialized `structuredContent` bytes (see Decision #12). The budget is spent in request order and admits whole records only; anything that does not fit is reported in `deferred[]` with its size, never truncated or dropped. `content[]` re-renders the admitted records, so the delivered response is roughly twice the budget — the disclosure states this rather than leaving the number to read as a response cap, and adds the count and base64 size of any attached image blocks (Decision #22).
 - `includeImages` (default `false`) runs after budget admission (Decision #22). Among the returned records, in request order, the first 3 with `hasCC0Image: true` have `primaryImageSmall` fetched by `MetService.fetchImage()`; each one that arrives becomes a text block `Image of object <objectID> (primaryImageSmall)` followed by `ctx.content.image(data, mimeType)`, emitted after all three settle so `content[]` keeps request order. `images[]` gives every returned record `attached`, `no_cc0_image`, `over_cap`, or `unavailable`, rendered as `## Images` after the failed and deferred sections; deferred and failed IDs get no entry. A fetch that fails still spends its slot. Off, nothing is fetched and the response carries no `images` field and no caption or image block.
-- `objectIDs` is de-duplicated before fetching, first occurrence keeping its position (see Decision #13), so a repeated ID is fetched once, charged to the budget once, and appears in exactly one of `objects[]`/`failed[]`/`deferred[]`.
+- `objectIDs` is de-duplicated before fetching, first occurrence keeping its position (see Decision #13), so a repeated ID is fetched once, charged to the budget once, and appears in exactly one of `objects[]`/`failed[]`/`deferred[]`/`remainingIDs`.
+- The first 20 distinct IDs are the call's requested IDs; the rest go to `remainingIDs` in request order, before any fetch, so the partition never depends on the upstream (Decision #24). Everything else in this list — the worker queue, the 403/429/5xx skips, budget admission, image slots — runs on the 20 alone. The notice reads "Requested the first 20 of 25 distinct object IDs, the per-call cap; the other 5 are in remainingIDs and were not requested. Re-call met_get_object with them.", joined ahead of any deferred notice in one string, and `content[]` renders `## Over the per-call cap — not requested` with the IDs after the deferred section. A batch that throws returns no `remainingIDs`: its message counts only the requested IDs and ends "The other 5 of 25 distinct object IDs, past the per-call cap of 20, were not requested."
 - Every fetch in a call shares one `MET_CALL_DEADLINE_MS` budget (Decision #18). An ID whose fetch runs out of it, or starts after it is spent, lands in `failed[]`; when that is every ID, the call throws `retry_deadline_exceeded`. A caller cancellation ends the call as cancelled rather than as a partial success.
 - A `failed[]` entry is the failure's message and its recovery, with one period between them. An `upstream_blocked` entry carries that reason's recovery instead of "Retry after a brief delay", and once one ID is blocked the IDs not yet started fail with it and send no request (Decision #19).
 - An `upstream_unavailable` entry (a ladder that ended on HTTP 500/502/503/504) likewise carries that reason's recovery. Once one ID's ladder ends that way, the IDs not yet started wait for every fetch still in flight; if the Met has then answered no ID in the call — no record, no 404 — they fail with the outage and send no request, so a 5xx outage costs at most `MET_BATCH_CONCURRENCY` × 4 requests (20 at the default) however many IDs were asked for. A ladder whose last attempt timed out or was reset carries no status and engages no skip; the call deadline bounds that case. Any answer turns the skip off, one that lands after the first ladder ended included, since the 5xx may then belong to one record (Decision #20).
-- When nothing was fetched, the call throws in this order: `all_not_found` (every ID a 404), `upstream_blocked` (any 403), `retry_deadline_exceeded` (every ID ran out of budget), `upstream_unavailable` (any 5xx outage), then `all_failed`.
+- An `upstream_rate_limited` entry (a ladder that ended on HTTP 429, a `Retry-After` too long to wait included) carries that reason's recovery, and its message names the wait the Met asked for. Once one ID's ladder ends that way, the IDs not yet started fail with it and send no request, as after a 403: a throttle covers the server's address, never one record. With a long `Retry-After` each first-wave ladder is one request, so a throttled batch costs at most `MET_BATCH_CONCURRENCY` requests (5 at the default); without one, `MET_BATCH_CONCURRENCY` × 4 (20) (Decision #23). A ladder the call's budget cuts after 429 answers still ends as `retry_deadline_exceeded`, and the IDs not yet started then fail as expiries without a request.
+- When nothing was fetched, the call throws in this order: `all_not_found` (every ID a 404), `upstream_blocked` (any 403), `upstream_rate_limited` (any 429-ended ladder), `retry_deadline_exceeded` (every ID ran out of budget), `upstream_unavailable` (any 5xx outage), then `all_failed`. `upstream_rate_limited` and `upstream_unavailable` carry the first such failure's `status` and `retryAfter`.
 - `GalleryNumber` is `""` (not null) when off display — preserve as-is; an empty string is meaningful ("not on display").
 
 ---
@@ -591,7 +626,7 @@ z.object({
 })
 ```
 
-**Error contract:** No domain failures — the endpoint is static data. Three infrastructure failures are declared, so each carries its recovery; the rest bubble as `ServiceUnavailable`.
+**Error contract:** No domain failures — the endpoint is static data. Four infrastructure failures are declared, so each carries its recovery; the rest bubble as `ServiceUnavailable`.
 
 ```ts
 errors: [
@@ -609,6 +644,13 @@ errors: [
     thrownBy: 'service', // Decision #20
     when: 'The Met API answered HTTP 500, 502, 503, or 504 until the retry ladder ran out — an outage on its side.',
     recovery: 'The Met API is failing on its side, so changing the request will not help. Wait a few minutes before retrying.',
+  },
+  {
+    reason: 'upstream_rate_limited',
+    code: JsonRpcErrorCode.RateLimited,
+    thrownBy: 'service', // Decision #23
+    when: "The Met API answered HTTP 429 until the retry ladder ran out, or asked for a wait longer than the ladder or the call's time budget allows — it throttles this server's address, not one endpoint.",
+    recovery: 'Wait the period this error names, or about a minute when it names none, then retry with fewer requests at once.',
   },
   {
     reason: 'retry_deadline_exceeded',
@@ -676,7 +718,7 @@ The object fetch is the only multi-upstream-call tool. For a batch of N IDs:
 | 1…N | `GET /v1/objects/{id}` | Fetch full record per ID | Up to `MET_BATCH_CONCURRENCY` in parallel |
 | +1…3 | `GET https://images.metmuseum.org/…` (`includeImages` only) | `primaryImageSmall` of the first 3 returned CC0 records | All at once, after budget admission (Decision #22) |
 
-A fixed pool of workers drains the IDs, each result written at its input position. Successes → `objects[]`. 404s, network errors, a spent call budget, a firewall block, and a 5xx outage → `failed[]`. If `failed` is non-empty but `objects` has results, return partial success. If nothing was fetched, throw, first match winning: `all_not_found` when every ID was a 404, `upstream_blocked` when any fetch met the firewall block, `retry_deadline_exceeded` when every ID ran out of the call's budget, `upstream_unavailable` when any fetch's ladder ended on HTTP 500/502/503/504, and `all_failed` otherwise.
+A fixed pool of workers drains the IDs, each result written at its input position. Successes → `objects[]`. 404s, network errors, a spent call budget, a firewall block, a rate limit, and a 5xx outage → `failed[]`. If `failed` is non-empty but `objects` has results, return partial success. If nothing was fetched, throw, first match winning: `all_not_found` when every ID was a 404, `upstream_blocked` when any fetch met the firewall block, `upstream_rate_limited` when any fetch's ladder ended on HTTP 429, `retry_deadline_exceeded` when every ID ran out of the call's budget, `upstream_unavailable` when any fetch's ladder ended on HTTP 500/502/503/504, and `all_failed` otherwise.
 
 ---
 
@@ -722,11 +764,11 @@ The Met API documents `title=true` as a flag that restricts keyword matching to 
 
 **Reversed (2026-10-04): `matchField`.** Both flags are exposed as one optional input, `matchField: 'title' | 'tags'`, sent as `title=true` or `tags=true` — a caller after a named work or a subject otherwise gets title and tag hits buried under incidental text matches. Each answers a subset of the unfiltered set and composes with the filters (`q=sunflower`: `title` 36, `tags` 23, `title` + `hasImages=true` 20, the intersection), and neither affects `q=*`. One enum rather than two `true`-only booleans named after the Met's parameters: with both flags the Met answers the title set alone (36 IDs, identical to `title=true`) and silently drops `tags`, so the enum puts the exclusivity in the schema instead of a handler check. The Met ignores `title=false` and `tags=false` (178), so there is no false arm. `artistOrCulture` stays out (Decision #1). `matchField` counts as a filter in the zero-match notice (Decision #17), while the keyword-only count stays all-fields.
 
-### 5. Batch input on `met_get_object` (max 20)
+### 5. Batch input on `met_get_object` (20 fetched per call)
 
-The API has no batch endpoint — each object ID requires its own HTTP GET. The search-returns-IDs-only design of the Met API makes serial fetching impractical (a 20-result search would take 20 serial round trips). Batch input drained by a fixed pool of workers, each recording its ID's outcome, solves this cleanly. Max 20 per call is a practical cap: 20 × ~150ms = ~3s worst case at concurrency 1, or ~600ms at concurrency 5. Larger batches should be multiple tool calls.
+The API has no batch endpoint — each object ID requires its own HTTP GET. The search-returns-IDs-only design of the Met API makes serial fetching impractical (a 20-result search would take 20 serial round trips). Batch input drained by a fixed pool of workers, each recording its ID's outcome, solves this cleanly. 20 per call is a practical cap: 20 × ~150ms = ~3s worst case at concurrency 1, or ~600ms at concurrency 5. Larger batches should be multiple tool calls.
 
-The cap bounds *latency*, not response size — a record's cost is driven by its `constituents`/`tags`/`additionalImages`/`measurements` counts, so three composite objects can cost more than twenty sparse ones. Response size is bounded separately (Decision #12); the input cap stays at 20.
+The cap bounds *latency*, not response size — a record's cost is driven by its `constituents`/`tags`/`additionalImages`/`measurements` counts, so three composite objects can cost more than twenty sparse ones. Response size is bounded separately (Decision #12); the fetch cap stays at 20. The schema itself accepts up to 500 IDs and the IDs past the first 20 distinct come back in `remainingIDs` (Decision #24).
 
 ### 6. Exclude `/objects` (full corpus enumeration) from the tool surface
 
@@ -813,7 +855,7 @@ Intersecting makes a filtered result sound but not complete. Decision #3's under
 
 The Met deprecated `GET /v1/search` on 2026-09-04 and retires it on 2026-10-01. Its replacement, `/v1.1/search`, runs on a different backend and pages upstream: `offset`/`limit` (at most 500 per page), nothing past `offset + limit = 10,000`, `total` still the full count, and HTTP 200 `objectIDs: null` for a page at or past the window.
 
-**Decision.** The tool's `limit`/`offset` pass straight through, one request per page, `limit` always sent (the upstream default is 100). `remaining`, `truncated`, and `nextOffset` are computed against `min(total, 10,000)`, and a `total` above 10,000 adds an `enrichment.notice` naming the window; `format()` gains a fourth marker, `(window end)`, for a last page that stops at the window short of `total`. `offset` stays uncapped in the schema because upstream still answers `total` past the window. `q` stays required: a blank keyword is the whole index, and filter-only browsing through search would reach only its first 10,000 results.
+**Decision.** The tool's `limit`/`offset` pass straight through, one request per page, `limit` always sent (the upstream default is 100); a `limit` above 500 is sent as 500 and disclosed (Decision #24). `remaining`, `truncated`, and `nextOffset` are computed against `min(total, 10,000)`, and a `total` above 10,000 adds an `enrichment.notice` naming the window; `format()` gains a fourth marker, `(window end)`, for a last page that stops at the window short of `total`. `offset` stays uncapped in the schema because upstream still answers `total` past the window. `q` stays required: a blank keyword is the whole index, and filter-only browsing through search would reach only its first 10,000 results.
 
 **Base URL.** `/v1/objects` and `/v1/departments` are not deprecated (`/v1.1/objects/{id}` → 404), so no single versioned base serves every endpoint. `MET_BASE_URL` now names the collection root and the service owns each path's version; a value ending in `/v1` — the old default's shape — is reduced to its root so existing overrides keep resolving. A value ending in `/v1.1` is reduced the same way: kept, it would nest every endpoint under it (`/v1.1/v1/objects/{id}` → 404), and `met_get_object` would report every ID as not found. Rewriting a trailing `/v1` to `/v1.1` for search was rejected: it breaks for a suffix-less local stub.
 
@@ -837,7 +879,7 @@ A zero result has two causes a caller fixes differently: the keyword matches not
 
 Each `MetService` retry ladder makes 4 attempts at `MET_REQUEST_TIMEOUT_MS` plus 5.25–8.75 s of backoff, so an upstream that stops answering costs about 47 s per ladder, and `met_get_object` runs one ladder per ID in waves of `MET_BATCH_CONCURRENCY`. MCP TypeScript SDK clients time a request out at 60 s by default, so a hung upstream reached the caller as an opaque transport timeout instead of the server's classified error.
 
-**Decision.** A tool call fixes one deadline, `MET_CALL_DEADLINE_MS` (default 30,000 ms) from its start, and every service method takes it as a required argument. Each ladder hands `withRetry` the time left as its `deadlineMs`, and each attempt's request timeout is capped by it. Expiry is `Timeout` (`-32004`) with `data.reason: 'retry_deadline_exceeded'`. A ladder that starts with the budget spent fails the same way without a request. `met_search_collections`, `met_list_objects`, and `met_list_departments` declare the reason (`thrownBy: 'service'`), so the expiry reaches their callers with a recovery hint. In `met_get_object` it lands the ID in `failed[]`. When nothing was fetched and every failure is the expiry — an ID whose fetch never started included — the handler throws one batch-level `retry_deadline_exceeded` with the same recovery, after the `all_not_found` and `upstream_blocked` checks: N copies of one spent budget are one timeout, not N upstream faults, so the caller gets the `Timeout` code and the budget's recovery rather than `all_failed`'s advice about failing IDs. A 404 or an upstream error beside the expiries takes the batch past the expiry, to `upstream_unavailable` when any failure was a 5xx outage (Decision #20) and to `all_failed` otherwise. The recovery says the budget ran out before a successful response, not that the API did not answer: a ladder of fast 5xx answers spends a short budget too. The keyword-only count stays one attempt, capped the same way and skipped when nothing is left. The default is half the SDK's 60 s and above the ~9 s a fast-failing ladder (an upstream 503) needs, so a fast failure still surfaces as the outage it is (`upstream_unavailable`) rather than as the expiry. The argument is required rather than defaulted: a default would quietly bring back per-ladder budgets.
+**Decision.** A tool call fixes one deadline, `MET_CALL_DEADLINE_MS` (default 30,000 ms) from its start, and every service method takes it as a required argument. Each ladder hands `withRetry` the time left as its `deadlineMs`, and each attempt's request timeout is capped by it. Expiry is `Timeout` (`-32004`) with `data.reason: 'retry_deadline_exceeded'`. A ladder that starts with the budget spent fails the same way without a request. `met_search_collections`, `met_list_objects`, and `met_list_departments` declare the reason (`thrownBy: 'service'`), so the expiry reaches their callers with a recovery hint. In `met_get_object` it lands the ID in `failed[]`. When nothing was fetched and every failure is the expiry — an ID whose fetch never started included — the handler throws one batch-level `retry_deadline_exceeded` with the same recovery, after the `all_not_found`, `upstream_blocked`, and `upstream_rate_limited` (Decision #23) checks: N copies of one spent budget are one timeout, not N upstream faults, so the caller gets the `Timeout` code and the budget's recovery rather than `all_failed`'s advice about failing IDs. A 404 or an upstream error beside the expiries takes the batch past the expiry, to `upstream_unavailable` when any failure was a 5xx outage (Decision #20) and to `all_failed` otherwise. The recovery says the budget ran out before a successful response, not that the API did not answer: a ladder of fast 5xx answers spends a short budget too. The keyword-only count stays one attempt, capped the same way and skipped when nothing is left. The default is half the SDK's 60 s and above the ~9 s a fast-failing ladder (an upstream 503) needs, so a fast failure still surfaces as the outage it is (`upstream_unavailable`) rather than as the expiry. The argument is required rather than defaulted: a default would quietly bring back per-ladder budgets.
 
 Rejected: a budget per ladder, which stacks per wave (a 20-ID batch waits `ceil(20 / MET_BATCH_CONCURRENCY) ×` the budget); and a lower `maxRetries`, which bounds attempts, not time, and drops retries that succeed after a transient blip. A caller cancellation stays a cancellation: `met_get_object`'s per-ID catch rethrows once the call's signal has aborted, so a cancelled batch never returns as a partial success.
 
@@ -851,7 +893,7 @@ The Collection API takes no credentials, so a 403 is its firewall refusing this 
 
 Against an upstream answering 503 to everything, each ID in a `met_get_object` batch ran its own four-attempt ladder: 8 IDs sent 32 requests and 20 IDs sent about 80, stopped only by the 30 s budget — the kind of burst that has drawn the firewall block (Decision #19). The other tools passed the failure through unclassified, with the upstream error page in `data.body` and `data.responseBody`, and an all-5xx batch ended as `all_failed`, whose recovery pointed at the IDs.
 
-**Decision.** `MetService.retry()` rethrows a ladder that ends on HTTP 500, 502, 503, or 504 — every attempt spent, or a `Retry-After` too long to wait — as `upstream_unavailable` (`ServiceUnavailable`, no `retryable` flag, since a later call can succeed). Its `data` is `{ reason, status }`, plus the upstream's `retryAfter` when it sent a `Retry-After`; the exhausted error, page included, rides as the `cause`, which reaches the log and never the caller. A persistent 504 moves from `-32004` to `-32000`, and the ladder itself is unchanged (Decision #16). 501 is permanent and 505 a protocol mismatch, so neither is an outage and both keep their own code and message (without the page, like every HTTP failure leaving the service). Every tool declares the reason with one recovery: the failure is the Met's, so changing the request will not help; wait a few minutes. In `met_get_object`, once an ID's ladder ends that way, the IDs not yet started wait for every fetch still in flight; if the Met has then answered no ID in the call — no record, no 404 — they fail with the outage and send no request, which bounds an outage at `MET_BATCH_CONCURRENCY` × 4 requests (20 at the default; both batches above now send 20). Any answer turns the skip off, one that lands after the first ladder ended included, so which answer arrives first never decides the outcome. A batch that fetched nothing throws `upstream_unavailable` after the `all_not_found`, `upstream_blocked`, and all-expiry checks, and before `all_failed`.
+**Decision.** `MetService.retry()` rethrows a ladder that ends on HTTP 500, 502, 503, or 504 — every attempt spent, or a `Retry-After` too long to wait — as `upstream_unavailable` (`ServiceUnavailable`, no `retryable` flag, since a later call can succeed). Its `data` is `{ reason, status }`, plus the upstream's `retryAfter` when it sent a `Retry-After`; the exhausted error, page included, rides as the `cause`, which reaches the log and never the caller. A persistent 504 moves from `-32004` to `-32000`, and the ladder itself is unchanged (Decision #16). 501 is permanent and 505 a protocol mismatch, so neither is an outage and both keep their own code and message (without the page, like every HTTP failure leaving the service). Every tool declares the reason with one recovery: the failure is the Met's, so changing the request will not help; wait a few minutes. In `met_get_object`, once an ID's ladder ends that way, the IDs not yet started wait for every fetch still in flight; if the Met has then answered no ID in the call — no record, no 404 — they fail with the outage and send no request, which bounds an outage at `MET_BATCH_CONCURRENCY` × 4 requests (20 at the default; both batches above now send 20). Any answer turns the skip off, one that lands after the first ladder ended included, so which answer arrives first never decides the outcome. A batch that fetched nothing throws `upstream_unavailable` after the `all_not_found`, `upstream_blocked`, `upstream_rate_limited` (Decision #23), and all-expiry checks, and before `all_failed`.
 
 Rejected: one attempt per queued ID, which still adds a request per remaining ID into the outage; an unconditional skip, which would fail healthy IDs if a 5xx were ever specific to one record (none observed); and deciding the skip the moment the first ladder ends, which fails healthy queued IDs whenever another first-wave fetch answers a moment later, and lets arrival order pick the outcome. Accepted cost: a batch whose whole first wave hit record-level 5xx fails its remaining IDs unrequested.
 
@@ -878,6 +920,30 @@ Rejected: an exact per-department `total` and dense pages, which needs every pag
 The 3 image fetches run concurrently: the cap bounds them, they go to the image CDN rather than the firewalled API, and running them in turn would stack their latencies inside the shared budget.
 
 Rejected: a separate image tool, which leaves this contract untouched but costs every client one more tool definition, and costs each image a second call plus either a record fetch from the firewall-sensitive API or a URL input needing the same pin. A byte cap, which tracks the wrong cost driver for a pixel-bounded rendition. Out of scope: `additionalImages` and the full-resolution `primaryImage`.
+
+### 23. A 429 that ends the retry ladder is a rate limit, and `met_get_object` stops feeding it
+
+The Met documents no 429, but the framework maps one to `RateLimited` (`-32003`) and honors its `Retry-After`, failing fast when the wait exceeds the 30 s backoff cap or the call's remaining budget. Against a controlled upstream answering 429 with `Retry-After: 120`, the three single-request tools returned `-32003` with no `data.reason` and no recovery, and their text omitted the wait; `met_get_object` returned `all_failed`, whose recovery says to retry after a brief delay, and dropped `retryAfter`. Without the header, a 20-ID batch sent 80 requests, four per ID, since only a 403 or a 5xx stopped the queue.
+
+**Decision.** `MetService.retry()` rethrows a ladder that ends on HTTP 429 — every attempt spent, or a `Retry-After` too long for the backoff cap or the remaining budget — as `upstream_rate_limited` (`RateLimited`, no `retryable` flag, since a later call can succeed). Its `data` is `{ reason, status: 429 }`, plus the raw `Retry-After` value when the Met sent one; the exhausted error, page included, rides as the `cause`. The message is "The Met API is rate-limiting requests from this server (HTTP 429)", plus "and asked for an N-second wait" when the header parses as delta-seconds or an HTTP-date (counted from now) to a wait of at least a second and at most a day, which is what carries the wait to `content[]`; a longer one reads "and asked for a wait of more than a day", and a wait of 0 (an HTTP-date already past included) or an unparseable value names none and stays raw in `data.retryAfter`, so the recovery's "about a minute" applies. The ladder is unchanged: a `Retry-After` that fits is still waited out, and a deadline that cuts the ladder after 429 answers still ends it as `retry_deadline_exceeded`. Every tool declares the reason with one static recovery: wait the period the error names, or about a minute when it names none, then retry with fewer requests at once. In `met_get_object`, once an ID's ladder ends on 429, the IDs not yet started fail with it and send no request, as after a 403 (Decision #19): a throttle covers the server's address, never one record, so the answered-nothing gate a 5xx needs (Decision #20) does not apply. That bounds a throttled batch at `MET_BATCH_CONCURRENCY` requests with a long `Retry-After` (5 at the default) and `MET_BATCH_CONCURRENCY` × 4 without one (20). A batch that fetched nothing throws `all_not_found`, `upstream_blocked`, `upstream_rate_limited`, the all-expiry `retry_deadline_exceeded`, `upstream_unavailable`, then `all_failed`, first match winning: the throttle names a wait, so it wins over a 5xx in the same batch, and a 429-ended ID is never an expiry, so the all-expiry check cannot match beside it. The batch throw carries the first throttled ID's `status` and `retryAfter`, as the outage throw does.
+
+Rejected: a per-throw recovery hint carrying the number, which duplicates the message on both surfaces and makes the four contracts differ; and a server-wide cooldown that holds every concurrent call after a 429, a cross-call change beyond one call's request budget. Accepted cost: healthy IDs queued behind a throttled one fail unrequested.
+
+### 24. Serve a capped input up to its cap and name the remainder, under a hard ceiling
+
+`met_get_object` with 21 IDs, and either list tool with `limit: 501`, failed validation before any work, and 21 copies of one ID failed before de-duplication could collapse them. Each rejection cost the caller a round trip for a request with one obvious reading.
+
+**Decision.** Each input keeps its per-call cap and gains a higher schema ceiling; between the two, the tool does the capped part and discloses the rest in the enrichment `notice`, joined with any other notice in one string.
+
+| Input | Per-call cap | Ceiling | Why this ceiling |
+|:--|:--|:--|:--|
+| `met_get_object.objectIDs` | 20 distinct IDs | 500 entries | One full search or list page, the largest ID list any tool here produces |
+| `met_search_collections.limit` | 500 | 10,000 | The search window: no page reaches past `offset + limit` = 10,000 |
+| `met_list_objects.limit` | 500 | 10,000 | The search tool's ceiling, so one rule covers both list tools |
+
+`met_get_object` de-duplicates, then takes the first 20 distinct IDs; the rest go to a new optional output field, `remainingIDs`, in request order. They differ from `deferred[]` (fetched, withheld by the byte budget) and from the `failed[]` entries a 403, 429, or 5xx left unrequested, which sit inside the 20. A batch that throws names the over-cap count and counts only the requested IDs, so "All 20 requested object IDs not found" never tells a caller to drop IDs nobody checked. A list tool's `limit` above 500 is sent as 500 — the Met search does the same silently (`q=horse&limit=600` returned the same 500 IDs as `limit=500`, 2026-10-15) — and `returned`, `remaining`, `truncated`, and `nextOffset` (offset + IDs served) describe the page served. The notice, "limit 600 is above the 500-ID page maximum, so this page was read with limit 500; continue from nextOffset.", appears only when matches remain past the page: a page that already ends paging is what the caller's `limit` would have returned too.
+
+Values past the ceilings, wrong types, a `limit` below 1, non-positive or non-integer IDs, and an empty `objectIDs` still fail validation. The list tools disclose through `notice` rather than `ctx.enrich.truncated()`, whose enrichment key would collide with their own `truncated` output field. Rejected names for the new field: `notRequested`, which collides with the "was not requested" wording of the skipped `failed[]` entries, and `deferredIDs`, which collides with `deferred[]`. Out of scope: higher upstream concurrency or response byte budgets.
 
 ---
 
@@ -920,9 +986,10 @@ Rejected: a separate image tool, which leaves this contract untouched but costs 
 - 404: `{ "message": "ObjectID not found" }` — object does not exist
 - 403 with an HTML block page — the Met's firewall refusing this server's address, on every endpoint, for minutes at a time (Decision #19)
 - 500, 502, 503, 504 with an HTML error page — an outage on the Met's side; retried, then classified as `upstream_unavailable` with the page kept out of the error (Decision #20). 501 and 505 are passed through unclassified.
-- Every HTTP failure carries its page into `fetchWithTimeout`'s error as `data.body` and `data.responseBody`. No error leaving `MetService` keeps either: a 501, a 505, or a 4xx other than 403 reaches the caller with its status-mapped code, its message, and `data.status`, the page riding only on the logged `cause` (2026-10-04).
+- 429 — the API documents none, but the framework maps one to `RateLimited` and honors its `Retry-After`; retried while the wait fits the backoff cap and the call's budget, then classified as `upstream_rate_limited` with the requested wait in the message, the raw header value in `data.retryAfter`, and the page kept out of the error (Decision #23).
+- Every HTTP failure carries its page into `fetchWithTimeout`'s error as `data.body` and `data.responseBody`. No error leaving `MetService` keeps either: a 501, a 505, or a 4xx other than 403 and 429 reaches the caller with its status-mapped code, its message, and `data.status`, the page riding only on the logged `cause` (2026-10-04).
 - 200 with `{ total, objectIDs: null }` — an empty search page: zero matches, or an `offset` at or past the reachable window (not an HTTP error)
 
-**Rate limit.** The documented limit is 80 requests per second, but the firewall has blocked a burst far below it (Decision #19). Treat the API with care: no more than 5 parallel requests (handled by `MET_BATCH_CONCURRENCY`).
+**Rate limit.** The documented limit is 80 requests per second, but the firewall has blocked a burst far below it (Decision #19). Treat the API with care: no more than 5 parallel requests (handled by `MET_BATCH_CONCURRENCY`). The documentation names no 429 response; should the API or its CDN answer one, every tool surfaces it as `upstream_rate_limited` and `met_get_object` stops requesting the rest of the batch (Decision #23).
 
 **No auth.** No API key. No OAuth. Plain HTTPS GET.
