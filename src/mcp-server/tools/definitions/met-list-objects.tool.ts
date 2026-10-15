@@ -8,6 +8,8 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import {
   getMetService,
   METADATA_DATE_FLOOR,
+  PAGE_MAX_IDS,
+  SEARCH_RESULT_WINDOW,
   startCallDeadline,
 } from '@/services/met/met-service.js';
 
@@ -96,9 +98,11 @@ export const metListObjects = tool('met_list_objects', {
       .number()
       .int()
       .min(1)
-      .max(500)
+      .max(SEARCH_RESULT_WINDOW)
       .default(20)
-      .describe('Maximum number of object IDs to return in this page.'),
+      .describe(
+        'Maximum number of object IDs to return in this page. A page holds at most 500 IDs: a larger value, up to 10,000, reads a 500-ID page and the notice says so — continue from nextOffset.',
+      ),
     offset: z
       .number()
       .int()
@@ -117,7 +121,9 @@ export const metListObjects = tool('met_list_objects', {
       ),
     objectIDs: z
       .array(z.number().int().describe('A Met object ID.'))
-      .describe('Object IDs for this page in ascending order, up to `limit` results.'),
+      .describe(
+        'Object IDs for this page in ascending order, up to `limit` results and never more than 500.',
+      ),
     returned: z.number().int().describe('Count of object IDs in this page.'),
     offset: z
       .number()
@@ -149,7 +155,7 @@ export const metListObjects = tool('met_list_objects', {
       .string()
       .optional()
       .describe(
-        'Present only when total is 0: names the filters that matched nothing and how to widen the list.',
+        'Present when total is 0: names the filters that matched nothing and how to widen the list. Also present when a limit above 500 was read as a 500-ID page with IDs still remaining: says the page was read with limit 500 and to continue from nextOffset.',
       ),
     effectiveQuery: z
       .string()
@@ -195,6 +201,14 @@ export const metListObjects = tool('met_list_objects', {
         'The Met API is failing on its side, so changing the request will not help. Wait a few minutes before retrying.',
     },
     {
+      reason: 'upstream_rate_limited',
+      code: JsonRpcErrorCode.RateLimited,
+      thrownBy: 'service',
+      when: "The Met API answered HTTP 429 to the department lookup or the ID list until the retry ladder ran out, or asked for a wait longer than the ladder or the call's time budget allows — it throttles this server's address, not one filter.",
+      recovery:
+        'Wait the period this error names, or about a minute when it names none, then retry with fewer requests at once.',
+    },
+    {
       reason: 'retry_deadline_exceeded',
       code: JsonRpcErrorCode.Timeout,
       thrownBy: 'service',
@@ -238,21 +252,31 @@ export const metListObjects = tool('met_list_objects', {
       }
     }
 
+    const pageLimit = Math.min(input.limit, PAGE_MAX_IDS);
+
     ctx.log.info('Met object list', {
       departmentId,
       updatedSince,
       appliedUpdatedSince,
       limit: input.limit,
+      pageLimit,
       offset: input.offset,
     });
 
     const result = await getMetService().listObjects(
-      { ...input, updatedSince: appliedUpdatedSince },
+      { ...input, limit: pageLimit, updatedSince: appliedUpdatedSince },
       ctx,
       deadline,
     );
 
+    // The two never meet: an empty list has nothing left past the page.
     if (result.total === 0) ctx.enrich.notice(emptyListNotice(departmentId, updatedSince));
+    // Only when IDs remain past the page; a page that already ends the list lost nothing to the cap.
+    if (input.limit > PAGE_MAX_IDS && result.truncated) {
+      ctx.enrich.notice(
+        `limit ${input.limit} is above the ${PAGE_MAX_IDS}-ID page maximum, so this page was read with limit ${PAGE_MAX_IDS}; continue from nextOffset.`,
+      );
+    }
     ctx.enrich.echo(describeFilters(departmentId, appliedUpdatedSince));
     return result;
   },

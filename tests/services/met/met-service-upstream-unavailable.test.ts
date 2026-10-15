@@ -383,6 +383,23 @@ describe('a Met API 5xx outage (#33)', () => {
       },
     );
 
+    it('25 IDs: the outage bound holds on the 20 requested, and the throw names the 5 past the cap (#50)', async () => {
+      fetchMock.mockImplementation(unavailable);
+      const ids = Array.from({ length: 25 }, (_, i) => 1001 + i);
+
+      const result = await settle(() => runToolContract(metGetObject, { objectIDs: ids }));
+
+      expectUnavailable(
+        result,
+        503,
+        `No object could be fetched. ${outageMessage(503)} The other 5 of 25 distinct object IDs, past the per-call cap of 20, were not requested.`,
+      );
+      expect(fetchMock).toHaveBeenCalledTimes(20);
+      expect(new Set(fetchMock.mock.calls.map((c) => objectIdOf(c[0])))).toEqual(
+        new Set([1001, 1002, 1003, 1004, 1005]),
+      );
+    });
+
     describe('a first-wave fetch still in flight when a ladder ends on the outage', () => {
       /** 1001 answers `late` at 9 s; 1002–1005 answer 503; the queued IDs are healthy. */
       const lateFirst = (late: () => Response) => (request: unknown) => {

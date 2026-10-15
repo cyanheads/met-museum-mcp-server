@@ -260,6 +260,43 @@ describe('a 403 from the Met API (#31)', () => {
       expect(textOf(result)).toContain(`**1008:** ${byId.get(1008)}`);
     });
 
+    describe('past the per-call cap (#50)', () => {
+      const requested = Array.from({ length: 25 }, (_, i) => 1001 + i);
+
+      it('skips only the requested IDs behind the block; remainingIDs are never requested and stay whole', async () => {
+        // 1001 answers late, so the block is known before the queue drains.
+        fetchMock.mockImplementation((request: unknown) =>
+          objectIdOf(request) === 1001
+            ? new Promise<Response>((resolve) => {
+                setTimeout(() => resolve(jsonResponse({ objectID: 1001, title: 'Answered' })), 20);
+              })
+            : blocked(),
+        );
+
+        const result = await runToolContract(metGetObject, { objectIDs: requested });
+
+        expect(result.isError).toBeFalsy();
+        expect(fetchMock).toHaveBeenCalledTimes(5);
+        const structured = result.structuredContent as {
+          failed: { objectID: number }[];
+          remainingIDs?: number[];
+        };
+        expect(structured.failed.map((f) => f.objectID)).toEqual(requested.slice(1, 20));
+        expect(structured.remainingIDs).toEqual(requested.slice(20));
+      });
+
+      it('names the unrequested over-cap count in the batch-level upstream_blocked', async () => {
+        fetchMock.mockImplementation(blocked);
+
+        const error = expectBlocked(await runToolContract(metGetObject, { objectIDs: requested }));
+
+        expect(error.message).toMatch(
+          / The other 5 of 25 distinct object IDs, past the per-call cap of 20, were not requested\.$/,
+        );
+        expect(fetchMock).toHaveBeenCalledTimes(5);
+      });
+    });
+
     it('keeps all_not_found when every ID is a 404 and none was refused', async () => {
       fetchMock.mockImplementation(() =>
         Promise.resolve(new Response('{"message":"ObjectID not found"}', { status: 404 })),

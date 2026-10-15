@@ -11,6 +11,7 @@ import {
   getMetService,
   type MetService,
   type ObjectRecord,
+  PAGE_MAX_IDS,
   startCallDeadline,
 } from '@/services/met/met-service.js';
 import { escapeMarkdown, isHttpUrl } from '@/utils/markdown.js';
@@ -239,6 +240,16 @@ const ObjectSchema = z
     dynasty: z
       .string()
       .describe('Dynasty for applicable cultures (e.g., "Dynasty 19"). Often empty.'),
+    reign: z
+      .string()
+      .describe(
+        'Reign the object dates to, for applicable cultures (e.g., "Joint reign of Hatshepsut and Thutmose III"). Often empty.',
+      ),
+    portfolio: z
+      .string()
+      .describe(
+        'Print series or portfolio the object belongs to, with its plate or number (e.g., "Birds of America, plate LXXI"). Often empty.',
+      ),
     accessionNumber: z.string().describe("The Met's accession number for the object."),
     accessionYear: z
       .string()
@@ -307,6 +318,13 @@ const ObjectSchema = z
  */
 const BATCH_BUDGET_BYTES = 60_000;
 
+/**
+ * How many distinct IDs one call fetches. The distinct IDs past it are returned
+ * unrequested in `remainingIDs`, so a list longer than the cap is served in part
+ * and named in full rather than refused.
+ */
+const OBJECT_CAP = 20;
+
 const utf8 = new TextEncoder();
 
 /**
@@ -365,14 +383,14 @@ async function attachImages(
   const images: ImageEntry[] = [];
   let attached = 0;
   let base64Bytes = 0;
-  for (const [index, { objectID, hasCC0Image, primaryImageSmall: url }] of objects.entries()) {
+  for (const [index, { objectID, hasCC0Image }] of objects.entries()) {
     const result = fetched[index];
     if (result == null) {
       images.push({ objectID, status: hasCC0Image ? 'over_cap' : 'no_cc0_image' });
       continue;
     }
     if (!result.ok) {
-      ctx.log.warning('Met image unavailable', { objectID, url, detail: result.detail });
+      ctx.log.warning('Met image unavailable', { objectID, detail: result.detail });
       images.push({ objectID, status: 'unavailable' });
       continue;
     }
@@ -388,7 +406,7 @@ async function attachImages(
 export const metGetObject = tool('met_get_object', {
   title: 'Get Met Objects',
   description:
-    'Fetch full records for one or more Met Museum object IDs. Accepts up to 20 IDs per call and returns partial success — a single 404 does not fail the whole batch; per-ID failures are reported separately. Object IDs come from met_search_collections (keyword search) or met_list_objects (browse by department or update date). Non-public-domain objects return empty image URLs. The constituents array is null for anonymous or unattributed works; tags and measurements are null when the Met records none. Records are returned whole and never truncated, so a batch of unusually large records may return fewer than requested — any that did not fit are listed in deferred[] with their sizes, to be re-requested in a follow-up call. Set includeImages to also receive the CC0 images of up to 3 returned records as image content a vision-capable model can look at.',
+    'Fetch full records for one or more Met Museum object IDs. Fetches up to 20 distinct IDs per call; a list of up to 500 (a full search or list page) is accepted, and the distinct IDs past the first 20 come back unrequested in remainingIDs for a follow-up call. Returns partial success — a single 404 does not fail the whole batch; per-ID failures are reported separately. Object IDs come from met_search_collections (keyword search) or met_list_objects (browse by department or update date). Non-public-domain objects return empty image URLs. The constituents array is null for anonymous or unattributed works; tags and measurements are null when the Met records none. Records are returned whole and never truncated, so a batch of unusually large records may return fewer than requested — any that did not fit are listed in deferred[] with their sizes, to be re-requested in a follow-up call. Set includeImages to also receive the CC0 images of up to 3 returned records as image content a vision-capable model can look at.',
   annotations: { readOnlyHint: true, idempotentHint: true },
   /**
    * `ids` can only mean the ID list: the tool's other input is the
@@ -406,9 +424,9 @@ export const metGetObject = tool('met_get_object', {
           .describe('A Met object ID from met_search_collections or met_list_objects.'),
       )
       .min(1)
-      .max(20)
+      .max(PAGE_MAX_IDS)
       .describe(
-        'One or more Met object IDs to fetch. Maximum 20 per call. IDs come from met_search_collections or met_list_objects. A repeated ID is fetched and returned once, at its first position. Partial failures are reported per ID rather than failing the whole batch.',
+        'One or more Met object IDs to fetch, up to 500 — a full met_search_collections or met_list_objects page. A repeated ID is fetched and returned once, at its first position. The first 20 distinct IDs are fetched; the rest come back unrequested in remainingIDs. Partial failures are reported per ID rather than failing the whole batch.',
       ),
     includeImages: z
       .boolean()
@@ -451,6 +469,12 @@ export const metGetObject = tool('met_get_object', {
       .describe(
         'Records that were fetched but did not fit the call’s cumulative budget on serialized structuredContent bytes, in request order. Re-call met_get_object with these IDs to retrieve them. Absent when every fetched record fit.',
       ),
+    remainingIDs: z
+      .array(z.number().int().describe('A distinct object ID past the per-call cap.'))
+      .optional()
+      .describe(
+        'The distinct object IDs past the first 20, in request order. These were not requested, unlike deferred[] (fetched, withheld by the byte budget) and the failed[] entries an upstream block, throttle, or outage left unrequested. Re-call met_get_object with them. Absent when the call held 20 or fewer distinct IDs.',
+      ),
     images: z
       .array(
         z
@@ -462,7 +486,7 @@ export const metGetObject = tool('met_get_object', {
       )
       .optional()
       .describe(
-        'Image outcome for each record in objects[], in request order; deferred and failed IDs get no entry. Present only when includeImages is true.',
+        'Image outcome for each record in objects[], in request order; deferred, failed, and remainingIDs get no entry. Present only when includeImages is true.',
       ),
   }),
   enrichment: {
@@ -470,7 +494,7 @@ export const metGetObject = tool('met_get_object', {
       .string()
       .optional()
       .describe(
-        'How to retrieve the deferred records, with the budget applied. Present only when the batch byte budget deferred a record.',
+        'Present when the call held more than 20 distinct object IDs, or when the batch byte budget deferred a record; both apply as one string, the remainingIDs sentence first. Past the cap it says how many IDs were requested and that the rest are in remainingIDs; for deferred records, how to retrieve them, with the budget applied.',
       ),
   },
   errors: [
@@ -487,7 +511,7 @@ export const metGetObject = tool('met_get_object', {
     {
       reason: 'all_failed',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'No object was fetched, no failure was a firewall block or a 500/502/503/504 outage, and the failures were neither all 404s nor all time-budget expiries — network errors, other HTTP errors, or 404s beside expiries.',
+      when: 'No object was fetched, no failure was a firewall block, an HTTP 429 rate limit, or a 500/502/503/504 outage, and the failures were neither all 404s nor all time-budget expiries — network errors, other HTTP errors, or 404s beside expiries.',
       recovery:
         'Retry after a brief delay. If one ID keeps failing across retries, drop it from the batch.',
     },
@@ -497,6 +521,13 @@ export const metGetObject = tool('met_get_object', {
       retryable: false,
       when: "No object was fetched and the Met API's firewall refused requests with HTTP 403 — it blocks this server's address, not one object.",
       recovery: 'Wait several minutes before retrying, and send fewer requests.',
+    },
+    {
+      reason: 'upstream_rate_limited',
+      code: JsonRpcErrorCode.RateLimited,
+      when: "No object was fetched and the Met API answered HTTP 429 until a fetch's retries ran out, or asked for a wait longer than the retries or the call's time budget allow — it throttles this server's address, not one object.",
+      recovery:
+        'Wait the period this error names, or about a minute when it names none, then retry with fewer requests at once.',
     },
     {
       reason: 'upstream_unavailable',
@@ -524,10 +555,19 @@ export const metGetObject = tool('met_get_object', {
     // ID would otherwise be fetched twice, charged to the byte budget twice —
     // displacing a distinct record that would have fit — and, once the budget
     // was spent, land in both objects[] and deferred[], telling the caller to
-    // re-request a record it had already received.
-    const objectIDs = [...new Set(input.objectIDs)];
+    // re-request a record it had already received. The cap counts distinct IDs,
+    // so the cut comes after: everything below works on the requested IDs alone.
+    const distinctIDs = [...new Set(input.objectIDs)];
+    const objectIDs = distinctIDs.slice(0, OBJECT_CAP);
+    const remainingIDs = distinctIDs.slice(OBJECT_CAP);
+    const overCap = remainingIDs.length;
+    /** Appended to every batch-level throw, so the count it states never reads as covering IDs it never tried. */
+    const overCapNote =
+      overCap > 0
+        ? ` The other ${overCap} of ${distinctIDs.length} distinct object IDs, past the per-call cap of ${OBJECT_CAP}, ${overCap === 1 ? 'was' : 'were'} not requested.`
+        : '';
 
-    ctx.log.info('Met batch object fetch', { count: objectIDs.length });
+    ctx.log.info('Met batch object fetch', { count: objectIDs.length, overCap });
 
     type SuccessItem = {
       ok: true;
@@ -556,6 +596,21 @@ export const metGetObject = tool('met_get_object', {
     let blockMessage: string | undefined;
     const blockedHint = ctx.recoveryFor('upstream_blocked').recovery.hint;
     /**
+     * The first `upstream_rate_limited` failure: a ladder that ended on HTTP 429.
+     * Like the block, a throttle covers this server's address, never one record,
+     * so the IDs not yet started fail with it at once instead of each sending
+     * more requests into it.
+     */
+    let rateLimit: McpError | undefined;
+    const rateLimitHint = ctx.recoveryFor('upstream_rate_limited').recovery.hint;
+    /**
+     * Set when the call's budget cut a ladder whose last answer was HTTP 429. The
+     * ladder ends as an expiry, so `rateLimit` stays unset, but the throttle
+     * stands: the IDs not yet started fail as expiries without a request rather
+     * than each sending one into it with the budget nearly spent.
+     */
+    let throttledOut = false;
+    /**
      * The first `upstream_unavailable` failure: a ladder that ended on a 5xx.
      * Once every fetch started so far has settled and the Met has answered no ID
      * in this call — no record, no 404 — the outage reads as the API's rather
@@ -566,6 +621,12 @@ export const metGetObject = tool('met_get_object', {
     let outage: McpError | undefined;
     let metAnswered = false;
     const outageHint = ctx.recoveryFor('upstream_unavailable').recovery.hint;
+    /** The recovery a `failed[]` entry carries, by the upstream reason its fetch ended on. */
+    const upstreamHints = new Map<unknown, string>([
+      ['upstream_blocked', blockedHint],
+      ['upstream_rate_limited', rateLimitHint],
+      ['upstream_unavailable', outageHint],
+    ]);
     /** Each fetch in flight, as a promise that settles with it and never rejects. */
     const inFlight = new Set<Promise<unknown>>();
     /** A failure's detail, which may already end in a period, then its recovery. */
@@ -585,6 +646,30 @@ export const metGetObject = tool('met_get_object', {
             objectID,
             kind: 'error',
             error: withHint(`Object ${objectID} was not requested. ${blockMessage}`, blockedHint),
+          };
+          continue;
+        }
+        if (rateLimit !== undefined) {
+          results[index] = {
+            ok: false,
+            objectID,
+            kind: 'error',
+            error: withHint(
+              `Object ${objectID} was not requested. ${rateLimit.message}`,
+              rateLimitHint,
+            ),
+          };
+          continue;
+        }
+        if (throttledOut) {
+          results[index] = {
+            ok: false,
+            objectID,
+            kind: 'deadline',
+            error: withHint(
+              `Object ${objectID} was not requested: the Met API was rate-limiting requests from this server (HTTP 429) when this call's time budget ran out`,
+              rateLimitHint,
+            ),
           };
           continue;
         }
@@ -620,17 +705,23 @@ export const metGetObject = tool('met_get_object', {
           const message = err instanceof Error ? err.message : String(err);
           const failure = err instanceof McpError ? err : undefined;
           const reason = failure?.data?.reason;
-          const blocked = reason === 'upstream_blocked';
-          const unavailable = reason === 'upstream_unavailable';
-          if (blocked) blockMessage ??= message;
-          if (unavailable) outage ??= failure;
+          if (reason === 'upstream_blocked') blockMessage ??= message;
+          if (reason === 'upstream_rate_limited') rateLimit ??= failure;
+          if (reason === 'upstream_unavailable') outage ??= failure;
+          if (
+            reason === 'retry_deadline_exceeded' &&
+            failure?.cause instanceof McpError &&
+            failure.cause.data?.status === 429
+          ) {
+            throttledOut = true;
+          }
           results[index] = {
             ok: false,
             objectID,
             kind: reason === 'retry_deadline_exceeded' ? 'deadline' : 'error',
             error: withHint(
               `Failed to fetch object ${objectID}: ${message}`,
-              blocked ? blockedHint : unavailable ? outageHint : 'Retry after a brief delay.',
+              upstreamHints.get(reason) ?? 'Retry after a brief delay.',
             ),
           };
         } finally {
@@ -668,17 +759,37 @@ export const metGetObject = tool('met_get_object', {
       .map((item) => ({ objectID: item.objectID, bytes: item.bytes }));
 
     if (objects.length === 0) {
+      /** The batch-level message for an upstream cause: nothing came back, and why. */
+      const nothingFetched = (detail: string) =>
+        `No object could be fetched. ${detail}${overCapNote}`;
+      /** The status and `Retry-After` value a service failure carried, rethrown with it. */
+      const upstreamData = (failure: McpError) => {
+        const { status, retryAfter } = failure.data ?? {};
+        return { status, ...(retryAfter != null && { retryAfter }) };
+      };
       const allNotFound = failItems.every((f) => f.kind === 'not_found');
       if (allNotFound) {
         throw ctx.fail(
           'all_not_found',
-          objectIDs.length === 1
+          (objectIDs.length === 1
             ? `Object ${objectIDs[0]} was not found.`
-            : `All ${objectIDs.length} requested object IDs not found.`,
+            : `All ${objectIDs.length} requested object IDs not found.`) + overCapNote,
         );
       }
       if (blockMessage !== undefined) {
-        throw ctx.fail('upstream_blocked', `No object could be fetched. ${blockMessage}`);
+        throw ctx.fail('upstream_blocked', nothingFetched(blockMessage));
+      }
+      /**
+       * A throttle names a wait, so it wins over a 5xx outage in the same batch.
+       * A 429-ended ID is never an expiry, so the all-expiry check below cannot
+       * match beside it.
+       */
+      if (rateLimit !== undefined) {
+        throw ctx.fail(
+          'upstream_rate_limited',
+          nothingFetched(rateLimit.message),
+          upstreamData(rateLimit),
+        );
       }
       // A batch the budget ran out on is one expiry, not N upstream faults — but
       // only when nothing else failed: a 404 or an upstream error beside it falls
@@ -686,25 +797,26 @@ export const metGetObject = tool('met_get_object', {
       if (failItems.every((f) => f.kind === 'deadline')) {
         throw ctx.fail(
           'retry_deadline_exceeded',
-          objectIDs.length === 1
+          (objectIDs.length === 1
             ? `Object ${objectIDs[0]} could not be fetched before the call's time budget ran out.`
-            : `All ${objectIDs.length} object fetches ran out of the call's time budget.`,
+            : `All ${objectIDs.length} object fetches ran out of the call's time budget.`) +
+            overCapNote,
         );
       }
       // A 5xx outage anywhere in a batch that fetched nothing is the answer, not
       // the network errors or 404s beside it.
       if (outage !== undefined) {
-        const { status, retryAfter } = outage.data ?? {};
-        throw ctx.fail('upstream_unavailable', `No object could be fetched. ${outage.message}`, {
-          status,
-          ...(retryAfter != null && { retryAfter }),
-        });
+        throw ctx.fail(
+          'upstream_unavailable',
+          nothingFetched(outage.message),
+          upstreamData(outage),
+        );
       }
       throw ctx.fail(
         'all_failed',
-        objectIDs.length === 1
+        (objectIDs.length === 1
           ? `Object ${objectIDs[0]} could not be fetched.`
-          : `All ${objectIDs.length} object fetches failed.`,
+          : `All ${objectIDs.length} object fetches failed.`) + overCapNote,
       );
     }
 
@@ -720,21 +832,31 @@ export const metGetObject = tool('met_get_object', {
       ? await attachImages(objects, service, ctx, deadline)
       : undefined;
 
+    /** Every notice this response carries, sent as one string: `ctx.enrich.notice` is last-wins. */
+    const notices: string[] = [];
+    if (overCap > 0) {
+      const one = overCap === 1;
+      notices.push(
+        `Requested the first ${OBJECT_CAP} of ${distinctIDs.length} distinct object IDs, the per-call cap; the other ${overCap} ${one ? 'is' : 'are'} in remainingIDs and ${one ? 'was' : 'were'} not requested. Re-call met_get_object with ${one ? 'it' : 'them'}.`,
+      );
+    }
     if (deferred.length > 0) {
       // The image blocks are outside the budget but inside the response, so
       // the delivered size stated here has to count them.
       const imageClause = attachment?.attached
         ? `, plus ${attachment.attached} attached image block${attachment.attached === 1 ? '' : 's'} (${attachment.base64Bytes} bytes of base64)`
         : '';
-      ctx.enrich.notice(
+      notices.push(
         `Returned ${objects.length} of ${succeeded.length} fetched records — ${usedBytes} bytes of serialized structuredContent against a ${BATCH_BUDGET_BYTES}-byte budget measured on that surface alone; content[] renders the same records again, so the delivered response is roughly twice that${imageClause}. ` +
           `The remaining ${deferred.length} would exceed the budget. Re-call met_get_object with the deferred objectIDs to retrieve them; each record's listed size is on the same structuredContent scale, so sum them against the budget before requesting several.`,
       );
     }
+    if (notices.length > 0) ctx.enrich.notice(notices.join(' '));
     return {
       objects,
       failed,
       ...(deferred.length > 0 && { deferred }),
+      ...(overCap > 0 && { remainingIDs }),
       ...(attachment && { images: attachment.images }),
     };
   },
@@ -806,6 +928,8 @@ export const metGetObject = tool('met_get_object', {
       lines.push(`**Culture:** ${prose(obj.culture)}`);
       lines.push(`**Period:** ${prose(obj.period)}`);
       lines.push(`**Dynasty:** ${prose(obj.dynasty)}`);
+      lines.push(`**Reign:** ${prose(obj.reign)}`);
+      lines.push(`**Portfolio:** ${prose(obj.portfolio)}`);
       // Findspot detail joins the existing country/region line, each sub-field
       // omitted when empty — nine dashes on a record with no findspot would bury
       // the two fields that are usually populated.
@@ -886,6 +1010,11 @@ export const metGetObject = tool('met_get_object', {
       for (const d of result.deferred) {
         lines.push(`- **${d.objectID}:** ${d.bytes} bytes`);
       }
+    }
+
+    // On field presence too: absent unless the call held more than 20 distinct IDs.
+    if (result.remainingIDs?.length) {
+      lines.push('', '## Over the per-call cap — not requested', result.remainingIDs.join(', '));
     }
 
     // On field presence too: absent unless the caller set includeImages.

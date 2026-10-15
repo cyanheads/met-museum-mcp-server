@@ -258,13 +258,100 @@ describe('met_list_objects (#26)', () => {
       expect(page.nextOffset).toBeNull();
     });
 
-    it('accepts limit 1 and 500, and rejects 0, 501, and a negative offset at the schema', async () => {
+    it('accepts limit 1 and 500, and rejects 0 and a negative offset at the schema', async () => {
       expect(pageOf(await list({ limit: 1 })).objectIDs).toEqual(ALL_IDS_ASCENDING.slice(0, 1));
       expect(pageOf(await list({ limit: 500 })).returned).toBe(45);
 
-      for (const args of [{ limit: 0 }, { limit: 501 }, { offset: -1 }]) {
+      for (const args of [{ limit: 0 }, { offset: -1 }]) {
         expect(errorOf(await list(args)).code).toBe(JsonRpcErrorCode.InvalidParams);
       }
+    });
+  });
+
+  describe('limit above the 500-ID page (#50)', () => {
+    const ids = Array.from({ length: 12_000 }, (_, i) => 12_000 - i);
+    const notice = (limit: number) =>
+      `limit ${limit} is above the 500-ID page maximum, so this page was read with limit 500; continue from nextOffset.`;
+
+    beforeEach(() => {
+      fetchMock.mockImplementation(() =>
+        Promise.resolve(jsonResponse({ total: ids.length, objectIDs: ids })),
+      );
+    });
+
+    it('reads limit 600 as a 500-ID page continued from offset + IDs served, on both surfaces', async () => {
+      const result = await list({ offset: 100, limit: 600 });
+
+      expect(pageOf(result)).toEqual({
+        total: 12_000,
+        objectIDs: Array.from({ length: 500 }, (_, i) => 101 + i),
+        returned: 500,
+        offset: 100,
+        remaining: 11_400,
+        truncated: true,
+        nextOffset: 600,
+        notice: notice(600),
+        effectiveQuery: 'no filter (whole collection)',
+      });
+      const text = textOf(result);
+      expect(text).toContain('**Returned IDs:** 500 (truncated)');
+      expect(text).toContain('**Next offset:** 600');
+      expect(text).toContain(notice(600));
+    });
+
+    it('repairs limit "600" to 600 and reads it the same way', async () => {
+      const page = pageOf(await list({ limit: '600' }));
+
+      expect(page.returned).toBe(500);
+      expect(page.nextOffset).toBe(500);
+      expect(page.notice).toBe(notice(600));
+    });
+
+    it('accepts the 10,000 ceiling as a 500-ID page', async () => {
+      const page = pageOf(await list({ limit: 10_000 }));
+
+      expect(page.returned).toBe(500);
+      expect(page.notice).toBe(notice(10_000));
+    });
+
+    it('a last page shorter than 500 ends paging with no notice: the cap withheld nothing', async () => {
+      const page = pageOf(await list({ offset: 11_800, limit: 600 }));
+
+      expect(page.returned).toBe(200);
+      expect(page.objectIDs[0]).toBe(11_801);
+      expect(page.nextOffset).toBeNull();
+      expect(page.notice).toBeUndefined();
+    });
+
+    it('a list smaller than one page carries no notice', async () => {
+      fetchMock.mockImplementation(upstream);
+
+      const page = pageOf(await list({ limit: 600 }));
+
+      expect(page.returned).toBe(45);
+      expect(page.notice).toBeUndefined();
+    });
+
+    it('leaves limit 500 unchanged: the same page, no notice', async () => {
+      const page = pageOf(await list({ offset: 100, limit: 500 }));
+
+      expect(page.objectIDs).toEqual(Array.from({ length: 500 }, (_, i) => 101 + i));
+      expect(page.nextOffset).toBe(600);
+      expect(page.notice).toBeUndefined();
+    });
+
+    it.each([10_001, 0, -1, 1.5, 'abc', true])(
+      'still rejects limit %j at the schema, before any /v1/objects request',
+      async (limit) => {
+        expect(errorOf(await list({ limit })).code).toBe(JsonRpcErrorCode.InvalidParams);
+        expect(objectsRequests()).toHaveLength(0);
+      },
+    );
+
+    it('states the 500-ID page and the 10,000 ceiling in the limit and notice descriptions', () => {
+      expect(metListObjects.input.shape.limit.description).toContain('500');
+      expect(metListObjects.input.shape.limit.description).toContain('10,000');
+      expect(metListObjects.enrichment?.notice?.description).toContain('500');
     });
   });
 

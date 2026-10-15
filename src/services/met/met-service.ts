@@ -8,6 +8,7 @@ import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import {
   JsonRpcErrorCode,
   McpError,
+  rateLimited,
   serviceUnavailable,
   timeout,
 } from '@cyanheads/mcp-ts-core/errors';
@@ -17,6 +18,7 @@ import {
   type FetchWithTimeoutOptions,
   fetchWithTimeout,
   type RetryAttempt,
+  withExtra,
   withRetry,
 } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
@@ -36,12 +38,75 @@ import type {
 export const SEARCH_RESULT_WINDOW = 10_000;
 
 /**
+ * The most IDs one page of either list tool returns. It is `/v1.1/search`'s own
+ * `limit` maximum — upstream reads a larger `limit` as 500 without saying so —
+ * and `met_list_objects` pages its sorted list at the same size.
+ */
+export const PAGE_MAX_IDS = 500;
+
+/**
  * The server-error statuses a retry ladder that ends on them reports as
  * `upstream_unavailable`: an outage on the Met's side. 501 (permanent, never
  * retried) and 505 (a protocol mismatch) are not outages and keep their own
  * code and message.
  */
 const OUTAGE_STATUSES = new Set([500, 502, 503, 504]);
+
+/**
+ * The whole seconds a `Retry-After` value asks for, read as `withRetry` reads
+ * it (RFC 9110 §10.2.3): delta-seconds, or an HTTP-date as the wait from now,
+ * clamped at 0. `undefined` for any other value — absent, or one neither form
+ * parses — which leaves the wait unnamed.
+ */
+function retryAfterSeconds(retryAfter: unknown): number | undefined {
+  if (typeof retryAfter !== 'string') return;
+  const value = retryAfter.trim();
+  if (/^\d+$/.test(value)) return Number(value);
+  const dateMs = Date.parse(value);
+  if (Number.isNaN(dateMs)) return;
+  return Math.max(0, Math.ceil((dateMs - Date.now()) / 1000));
+}
+
+/**
+ * The article before a number read aloud: "an" when its leading group of three
+ * digits is spoken with a vowel first — 8, 11, 18, 80–89, 800–899, so "an
+ * 8-second" and "an 11000-second" wait — and "a" otherwise.
+ */
+function articleFor(n: number): 'a' | 'an' {
+  const digits = String(n);
+  const lead = Number(digits.slice(0, digits.length % 3 || 3));
+  const vowel =
+    lead === 8 ||
+    lead === 11 ||
+    lead === 18 ||
+    Math.floor(lead / 10) === 8 ||
+    Math.floor(lead / 100) === 8;
+  return vowel ? 'an' : 'a';
+}
+
+/**
+ * The longest wait the message names as a count of seconds. A `Retry-After`
+ * past it — an HTTP-date years out — reads "more than a day" instead.
+ */
+const MAX_NAMED_WAIT_SECONDS = 86_400;
+
+/**
+ * The `upstream_rate_limited` message: the throttle, and the wait the Met asked
+ * for when its `Retry-After` parses to at least a second. A wait of 0 — or an
+ * HTTP-date already past — names none, so the recovery's "about a minute"
+ * applies rather than an immediate retry into the throttle. The message is
+ * what carries the wait to `content[]`, where `data.retryAfter` does not render.
+ */
+function rateLimitMessage(retryAfter: unknown): string {
+  const seconds = retryAfterSeconds(retryAfter);
+  const wait =
+    seconds === undefined || seconds === 0
+      ? ''
+      : seconds > MAX_NAMED_WAIT_SECONDS
+        ? ' and asked for a wait of more than a day'
+        : ` and asked for ${articleFor(seconds)} ${seconds}-second wait`;
+  return `The Met API is rate-limiting requests from this server (HTTP 429)${wait}.`;
+}
 
 /**
  * `error` without the upstream page `fetchWithTimeout` attaches to an HTTP
@@ -154,6 +219,9 @@ export interface ListObjectsInput {
    */
   updatedSince?: string | undefined;
 }
+
+/** The Met API endpoint a request goes to, as its log records label it. */
+type MetEndpoint = 'search' | 'objects' | 'object' | 'departments';
 
 /** The filters that select one `/v1/objects` ID list — and key its cache entry. */
 type ObjectListFilters = Pick<ListObjectsInput, 'departmentId' | 'updatedSince'>;
@@ -271,9 +339,13 @@ export interface ObjectRecord {
   objectURL: string;
   objectWikidata_URL: string;
   period: string;
+  /** The print series or portfolio the object belongs to, with its plate (`Birds of America, plate LXXI`). */
+  portfolio: string;
   primaryImage: string;
   primaryImageSmall: string;
   region: string;
+  /** The reign the object dates to (`Joint reign of Hatshepsut and Thutmose III`), beside `period` and `dynasty`. */
+  reign: string;
   /** Rights holder and reproduction notice; most copyrighted records carry none. */
   rightsAndReproduction: string;
   tags:
@@ -511,7 +583,7 @@ export class MetService {
     const offset = input.offset ?? 0;
     return this.retry('MetService.search', ctx, deadline, async (attempt) => {
       const url = this.buildSearchUrl({ ...input, offset });
-      ctx.log.debug('Met search request', { url: url.toString() });
+      ctx.log.debug('Met search request', { endpoint: 'search', offset, limit: input.limit });
       const raw = await this.fetchSearch(url, ctx, attempt);
       const objectIDs = raw.objectIDs ?? [];
       const reachable = Math.min(raw.total, SEARCH_RESULT_WINDOW);
@@ -657,8 +729,8 @@ export class MetService {
     const ownDeadline = startCallDeadline(new AbortController().signal);
     return this.retry('MetService.listObjects', ctx, ownDeadline, async (attempt) => {
       const url = this.buildObjectsUrl(filters);
-      ctx.log.debug('Met object list request', { url: url.toString() });
-      const response = await this.request(url, ctx, attempt);
+      ctx.log.debug('Met object list request', { endpoint: 'objects', ...filters });
+      const response = await this.request(url, 'objects', ctx, attempt);
       const raw = (await response.json()) as RawObjectsResponse;
       return Int32Array.from(raw.objectIDs ?? []).sort();
     });
@@ -719,7 +791,7 @@ export class MetService {
     ctx: Context,
     attempt: RetryAttempt,
   ): Promise<RawSearchResponse> {
-    const response = await this.request(url, ctx, attempt);
+    const response = await this.request(url, 'search', ctx, attempt);
     return (await response.json()) as RawSearchResponse;
   }
 
@@ -733,7 +805,7 @@ export class MetService {
       ctx.log.debug('Met object fetch', { objectID });
       let response: Response;
       try {
-        response = await this.request(url, ctx, attempt, { expectedStatuses: [404] });
+        response = await this.request(url, 'object', ctx, attempt, { expectedStatuses: [404] });
       } catch (error) {
         if (error instanceof McpError && error.code === JsonRpcErrorCode.NotFound) return null;
         throw error;
@@ -765,10 +837,12 @@ export class MetService {
       return { ok: false, detail: "The call's time budget had run out, so it was not requested." };
     }
     try {
-      const response = await fetchWithTimeout(target, Math.min(this.timeoutMs, remainingMs), ctx, {
-        redirect: 'error',
-        signal: deadline.signal,
-      });
+      const response = await fetchWithTimeout(
+        target,
+        Math.min(this.timeoutMs, remainingMs),
+        withExtra(ctx, { endpoint: 'image' }),
+        { redirect: 'error', signal: deadline.signal },
+      );
       const mimeType =
         response.headers.get('content-type')?.split(';')[0]?.trim().toLowerCase() ?? '';
       if (!mimeType.startsWith('image/')) {
@@ -787,7 +861,7 @@ export class MetService {
     return this.retry('MetService.getDepartments', ctx, deadline, async (attempt) => {
       const url = `${this.collectionRoot}/v1/departments`;
       ctx.log.debug('Met departments fetch');
-      const response = await this.request(url, ctx, attempt);
+      const response = await this.request(url, 'departments', ctx, attempt);
       const raw = (await response.json()) as RawDepartmentsResponse;
       return raw.departments.map((d) => ({
         departmentId: d.departmentId,
@@ -821,16 +895,22 @@ export class MetService {
    * A ladder that ends on an HTTP 500, 502, 503, or 504 — every attempt spent,
    * or an upstream `Retry-After` too long to wait — is the Met failing on its
    * side, and is rethrown as `upstream_unavailable` (`ServiceUnavailable`, so a
-   * persistent 504 leaves `Timeout` behind). Its `data` is the reason, the
-   * status, and the upstream's `Retry-After` value when it sent one; the
-   * exhausted error, error page included, rides only as the `cause`, which
-   * reaches the log and never the caller. The ladder itself is unchanged: a 504
-   * is still retried, and a deadline that cuts a ladder short still ends it as
-   * `retry_deadline_exceeded`.
+   * persistent 504 leaves `Timeout` behind). A ladder that ends the same way on
+   * an HTTP 429 — a `Retry-After` too long for the backoff cap or for what is
+   * left of the call's budget included — is the Met throttling this server's
+   * address, and is rethrown as `upstream_rate_limited` (`RateLimited`), its
+   * message naming the wait the `Retry-After` asked for when it parses. Either
+   * way, `data` is the reason, the status, and the upstream's raw `Retry-After`
+   * value when it sent one; the exhausted error, error page included, rides
+   * only as the `cause`, which reaches the log and never the caller. The ladder
+   * itself is unchanged: a 504 or a 429 is still retried, a `Retry-After` that
+   * fits is still waited out, and a deadline that cuts a ladder short still
+   * ends it as `retry_deadline_exceeded`.
    *
    * Any other HTTP failure — a 501, a 505, a 4xx other than the 403 that
-   * `request()` classifies — keeps its code, message, and `data`, minus the
-   * upstream page (`withoutErrorPage`), so no error leaving the service carries it.
+   * `request()` classifies and the 429 — keeps its code, message, and `data`,
+   * minus the upstream page (`withoutErrorPage`), so no error leaving the
+   * service carries it.
    */
   private async retry<T>(
     operation: string,
@@ -856,11 +936,19 @@ export class MetService {
     } catch (error) {
       const data = error instanceof McpError ? error.data : undefined;
       const status = data?.status;
+      const retryAfter = data?.retryAfter;
+      const upstream = { status, ...(retryAfter != null && { retryAfter }) };
+      if (status === 429) {
+        throw rateLimited(
+          rateLimitMessage(retryAfter),
+          { reason: 'upstream_rate_limited', ...upstream },
+          { cause: error },
+        );
+      }
       if (typeof status === 'number' && OUTAGE_STATUSES.has(status)) {
-        const retryAfter = data?.retryAfter;
         throw serviceUnavailable(
           `The Met API answered with a server error (HTTP ${status}).`,
-          { reason: 'upstream_unavailable', status, ...(retryAfter != null && { retryAfter }) },
+          { reason: 'upstream_unavailable', ...upstream },
           { cause: error },
         );
       }
@@ -874,18 +962,24 @@ export class MetService {
    * refusing this server's address — for every endpoint, for minutes at a time —
    * and is classified as `upstream_blocked` with the block page kept out of the
    * error. Non-retryable: an immediate retry cannot succeed and adds traffic.
+   *
+   * `fetchWithTimeout` names a URL by its origin alone in messages and records,
+   * so `endpoint` rides the request's log records to tell the calls apart.
    */
   private async request(
     url: string | URL,
+    endpoint: MetEndpoint,
     ctx: Context,
     { signal, remainingMs }: RetryAttempt,
     options?: Omit<FetchWithTimeoutOptions, 'signal'>,
   ): Promise<Response> {
     try {
-      return await fetchWithTimeout(url, Math.min(this.timeoutMs, remainingMs), ctx, {
-        ...options,
-        signal,
-      });
+      return await fetchWithTimeout(
+        url,
+        Math.min(this.timeoutMs, remainingMs),
+        withExtra(ctx, { endpoint }),
+        { ...options, signal },
+      );
     } catch (error) {
       if (
         error instanceof McpError &&
@@ -990,6 +1084,8 @@ export class MetService {
       culture: text(raw.culture),
       period: text(raw.period),
       dynasty: text(raw.dynasty),
+      reign: text(raw.reign),
+      portfolio: text(raw.portfolio),
       accessionNumber: raw.accessionNumber ?? '',
       accessionYear: raw.accessionYear ?? '',
       creditLine: text(raw.creditLine),

@@ -7,6 +7,7 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import {
   getMetService,
+  PAGE_MAX_IDS,
   SEARCH_RESULT_WINDOW,
   type SearchInput,
   startCallDeadline,
@@ -185,10 +186,10 @@ export const metSearchCollections = tool('met_search_collections', {
       .number()
       .int()
       .min(1)
-      .max(500)
+      .max(SEARCH_RESULT_WINDOW)
       .default(20)
       .describe(
-        'Maximum number of object IDs to return in this page. Paging reaches only the first 10,000 matches, so a page that would cross 10,000 is cut short there.',
+        'Maximum number of object IDs to return in this page. A page holds at most 500 IDs, the Met search maximum: a larger value, up to 10,000, reads a 500-ID page and the notice says so — continue from nextOffset. Paging reaches only the first 10,000 matches, so a page that would cross 10,000 is cut short there.',
       ),
     offset: z
       .number()
@@ -209,7 +210,7 @@ export const metSearchCollections = tool('met_search_collections', {
     objectIDs: z
       .array(z.number().int().describe('A Met object ID.'))
       .describe(
-        "Object IDs for this page, up to `limit` results. For departmentId 7 or 17, only the requested department's matches among the positions this page read, so it can hold fewer than `limit`, or none, while more remain.",
+        "Object IDs for this page, up to `limit` results and never more than 500. For departmentId 7 or 17, only the requested department's matches among the positions this page read, so it can hold fewer than `limit`, or none, while more remain.",
       ),
     returned: z.number().int().describe('Count of object IDs in this page.'),
     truncated: z
@@ -242,7 +243,7 @@ export const metSearchCollections = tool('met_search_collections', {
       .string()
       .optional()
       .describe(
-        'Present when total is 0, when total exceeds 10,000, or when departmentId is 7 or 17; several apply as one string. With total 0 it says whether the keyword matches nothing or the filters removed every match, naming the filters to correct or drop. Above 10,000 it states that only the first 10,000 matches are reachable by paging, and that filters or a more specific keyword bring the rest into reach. For departmentId 7 or 17 it states that total counts both departments and a page can hold fewer than limit IDs, or that the department filter could not be applied to this page.',
+        'Present when total is 0, when total exceeds 10,000, when a limit above 500 was read as a 500-ID page with matches still remaining, or when departmentId is 7 or 17; several apply as one string. For a limit above 500 it says the page was read with limit 500 and to continue from nextOffset. With total 0 it says whether the keyword matches nothing or the filters removed every match, naming the filters to correct or drop. Above 10,000 it states that only the first 10,000 matches are reachable by paging, and that filters or a more specific keyword bring the rest into reach. For departmentId 7 or 17 it states that total counts both departments and a page can hold fewer than limit IDs, or that the department filter could not be applied to this page.',
       ),
     effectiveQuery: z
       .string()
@@ -296,6 +297,14 @@ export const metSearchCollections = tool('met_search_collections', {
       when: 'The Met API answered HTTP 500, 502, 503, or 504 to the department lookup or the search until the retry ladder ran out — an outage on its side.',
       recovery:
         'The Met API is failing on its side, so changing the request will not help. Wait a few minutes before retrying.',
+    },
+    {
+      reason: 'upstream_rate_limited',
+      code: JsonRpcErrorCode.RateLimited,
+      thrownBy: 'service',
+      when: "The Met API answered HTTP 429 to the department lookup or the search until the retry ladder ran out, or asked for a wait longer than the ladder or the call's time budget allows — it throttles this server's address, not one query.",
+      recovery:
+        'Wait the period this error names, or about a minute when it names none, then retry with fewer requests at once.',
     },
     {
       reason: 'retry_deadline_exceeded',
@@ -375,19 +384,23 @@ export const metSearchCollections = tool('met_search_collections', {
       }
     }
 
+    // Upstream reads a larger limit as 500 without saying so: send 500 and disclose the cut.
+    const pageLimit = Math.min(input.limit, PAGE_MAX_IDS);
+
     ctx.log.info('Met search', {
       q: input.q,
       matchField: input.matchField,
       hasImages: input.hasImages,
       departmentId: input.departmentId,
       limit: input.limit,
+      pageLimit,
       offset: input.offset,
     });
 
     const result = await getMetService().search(
       {
         q: input.q,
-        limit: input.limit,
+        limit: pageLimit,
         offset: input.offset,
         matchField: input.matchField,
         hasImages: input.hasImages,
@@ -408,6 +421,16 @@ export const metSearchCollections = tool('met_search_collections', {
      * is last-wins, so a second source writing its own would replace the first.
      */
     const notices: string[] = [];
+
+    /**
+     * Only when matches remain past the page: a page that already ends paging
+     * would have been the same at the caller's `limit`, so the cap withheld nothing.
+     */
+    if (input.limit > PAGE_MAX_IDS && result.truncated) {
+      notices.push(
+        `limit ${input.limit} is above the ${PAGE_MAX_IDS}-ID page maximum, so this page was read with limit ${PAGE_MAX_IDS}; continue from nextOffset.`,
+      );
+    }
 
     /**
      * Keyed on the Met's `total: 0` alone — never on an empty page, which is

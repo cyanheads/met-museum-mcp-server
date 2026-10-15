@@ -962,6 +962,117 @@ describe('metSearchCollections', () => {
     );
   });
 
+  // --- #50: a limit above the 500-ID page reads a 500-ID page and says so ---
+
+  describe('limit above the 500-ID page (#50)', () => {
+    const limitNotice = (limit: number) =>
+      `limit ${limit} is above the 500-ID page maximum, so this page was read with limit 500; continue from nextOffset.`;
+    /** A full 500-ID page of `total` matches read from `offset`, as the service returns it. */
+    const fullPage = (total: number, offset = 0) => ({
+      total,
+      objectIDs: Array.from({ length: 500 }, (_, i) => offset + i + 1),
+      returned: 500,
+      truncated: true,
+      remaining: Math.min(total, 10_000) - offset - 500,
+      nextOffset: offset + 500,
+      offset,
+    });
+    const sentLimit = () => (mockSearch.mock.calls[0]?.[0] as { limit: number } | undefined)?.limit;
+
+    it('sends limit 500 for limit 600 and discloses it on both surfaces', async () => {
+      mockSearch.mockResolvedValue(fullPage(3_000, 40));
+
+      const result = await runToolContract(metSearchCollections, {
+        q: 'horse',
+        offset: 40,
+        limit: 600,
+      });
+
+      expect(sentLimit()).toBe(500);
+      const structured = structuredOf(result);
+      expect(structured.returned).toBe(500);
+      expect(structured.nextOffset).toBe(540);
+      expect(structured.notice).toBe(limitNotice(600));
+      expect(contentText(result)).toContain(`> ${limitNotice(600)}`);
+    });
+
+    it('repairs limit "600" to 600 and reads it the same way', async () => {
+      mockSearch.mockResolvedValue(fullPage(3_000));
+
+      const result = await runToolContract(metSearchCollections, {
+        q: 'horse',
+        limit: '600',
+      } as unknown as z.input<typeof metSearchCollections.input>);
+
+      expect(sentLimit()).toBe(500);
+      expect(structuredOf(result).notice).toBe(limitNotice(600));
+    });
+
+    it('joins the limit and window disclosures in one notice string, limit first', async () => {
+      mockSearch.mockResolvedValue(fullPage(14_398));
+
+      const result = await runToolContract(metSearchCollections, { q: 'horse', limit: 10_000 });
+
+      expect(sentLimit()).toBe(500);
+      expect(structuredOf(result).notice).toBe(
+        `${limitNotice(10_000)} Only the first 10,000 of 14,398 matches are reachable by paging. Narrow the search with filters or a more specific keyword to reach the rest.`,
+      );
+    });
+
+    it('adds no notice when the page served is the last one: the cap withheld nothing', async () => {
+      mockSearch.mockResolvedValue({
+        total: 700,
+        objectIDs: Array.from({ length: 200 }, (_, i) => 501 + i),
+        returned: 200,
+        truncated: false,
+        remaining: 0,
+        nextOffset: null,
+        offset: 500,
+      });
+
+      const result = await runToolContract(metSearchCollections, {
+        q: 'horse',
+        offset: 500,
+        limit: 600,
+      });
+
+      expect(sentLimit()).toBe(500);
+      expect(structuredOf(result).notice).toBeUndefined();
+    });
+
+    it('leaves limit 500 unchanged: sent as is, no notice', async () => {
+      mockSearch.mockResolvedValue(fullPage(3_000));
+
+      const result = await runToolContract(metSearchCollections, { q: 'horse', limit: 500 });
+
+      expect(sentLimit()).toBe(500);
+      expect(structuredOf(result).notice).toBeUndefined();
+    });
+
+    it.each([10_001, 0, -1, 1.5, 'abc', true])(
+      'still rejects limit %j at the schema, before any search',
+      async (limit) => {
+        const result = await runToolContract(metSearchCollections, {
+          q: 'horse',
+          limit,
+        } as unknown as z.input<typeof metSearchCollections.input>);
+
+        expect(result.isError).toBe(true);
+        expect((result.structuredContent as { error: { code: number } }).error.code).toBe(
+          JsonRpcErrorCode.InvalidParams,
+        );
+        expect(mockSearch).not.toHaveBeenCalled();
+      },
+    );
+
+    it('states the 500-ID page and the 10,000 ceiling in the limit and notice descriptions', () => {
+      const { description } = metSearchCollections.input.shape.limit;
+      expect(description).toContain('500');
+      expect(description).toContain('10,000');
+      expect(metSearchCollections.enrichment?.notice?.description).toContain('500-ID page');
+    });
+  });
+
   // --- #44: every success echoes the applied query as effectiveQuery ---
 
   describe('effectiveQuery', () => {
@@ -1101,10 +1212,10 @@ describe('metSearchCollections', () => {
       mockSearch.mockResolvedValue(page);
       const result = await call({ q: 'sunflower', query: 'tulip', limit: 3 });
 
-      // A rewrite applies only when the target is absent, so `query` stays an
-      // unrecognized key and the call is rejected rather than silently choosing.
+      // A rewrite applies only when the target is absent, so the call is rejected
+      // rather than silently choosing, and the hint names `query` as q's alias.
       expect(result.isError).toBe(true);
-      expect(textOf(result)).toContain('query');
+      expect(textOf(result)).toContain('query is an alias of q; send one of them, not both.');
       expect(mockSearch).not.toHaveBeenCalled();
     });
 

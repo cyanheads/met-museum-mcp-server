@@ -1,10 +1,11 @@
 /**
  * @fileoverview No HTTP failure leaving `MetService` carries the upstream page
  * (#45). `fetchWithTimeout` attaches the response page to every non-2xx error as
- * `data.body` and `data.responseBody`; a 403 (`upstream_blocked`) and an
- * exhausted 500/502/503/504 (`upstream_unavailable`) already left it behind, and
- * this pins every other status to the same rule — code, message, retry count,
- * and the rest of `data` unchanged. Runs the real service — `fetchWithTimeout`'s
+ * `data.body` and `data.responseBody`; a 403 (`upstream_blocked`), an exhausted
+ * 500/502/503/504 (`upstream_unavailable`), and a 429-ended ladder
+ * (`upstream_rate_limited`) leave it behind, and this pins every other status to
+ * the same rule — code, message, retry count, and the rest of `data` unchanged.
+ * Runs the real service — `fetchWithTimeout`'s
  * status mapping, the retry ladder, its backoff, and `Retry-After` handling
  * included — over a faked global fetch and fake timers.
  * @module tests/services/met/met-service-error-page.test
@@ -24,7 +25,8 @@ import { metListObjects } from '@/mcp-server/tools/definitions/met-list-objects.
 import { metSearchCollections } from '@/mcp-server/tools/definitions/met-search-collections.tool.js';
 import { getMetService, initMetService } from '@/services/met/met-service.js';
 
-const DEPARTMENTS_URL = 'https://collectionapi.metmuseum.org/public/collection/v1/departments';
+/** How `fetchWithTimeout` names the departments URL in a message: by origin, path elided. */
+const DEPARTMENTS_URL = 'https://collectionapi.metmuseum.org/…';
 
 /** Text that appears only in the upstream error page, never in an envelope. */
 const PAGE_MARKER = 'UPSTREAM-ERROR-PAGE';
@@ -45,21 +47,24 @@ const errorPage =
     );
 
 /**
- * Each status the issue names, with the code `fetchWithTimeout` maps it to and
- * the attempts the ladder spends on it: 501 is permanent and 400 is not
- * transient, so each sends one request; 505 and 429 are transient and run the
- * full four-attempt ladder.
+ * Each unclassified status the issue names, with the code `fetchWithTimeout`
+ * maps it to and the attempts the ladder spends on it: 501 is permanent and 400
+ * is not transient, so each sends one request; 505 is transient and runs the
+ * full four-attempt ladder. A 429 runs the same ladder and is classified as
+ * `upstream_rate_limited` (#49), pinned on its own below.
  */
 const STATUSES = [
   { status: 501, code: JsonRpcErrorCode.ServiceUnavailable, attempts: 1 },
   { status: 505, code: JsonRpcErrorCode.ServiceUnavailable, attempts: 4 },
   { status: 400, code: JsonRpcErrorCode.InvalidParams, attempts: 1 },
-  { status: 429, code: JsonRpcErrorCode.RateLimited, attempts: 4 },
 ] as const;
 
 /** The message `fetchWithTimeout` writes, with the ladder's suffix when it ran out. */
 const fetchFailedMessage = (url: string, status: number, attempts: number) =>
   `Fetch failed for ${url}. Status: ${status}${attempts > 1 ? ` (failed after ${attempts} attempts)` : ''}`;
+
+/** The message an exhausted 429 ladder carries when the Met named no wait. */
+const RATE_LIMITED_MESSAGE = 'The Met API is rate-limiting requests from this server (HTTP 429).';
 
 /** A plain-deadline call bound for service-level cases. */
 function call(ctx = createMockContext()) {
@@ -152,6 +157,24 @@ describe('no HTTP failure leaving MetService carries the upstream page (#45)', (
       },
     );
 
+    it('HTTP 429: four attempts, then upstream_rate_limited with the status and no page', async () => {
+      fetchMock.mockImplementation(errorPage(429));
+
+      const err = (await settle(() =>
+        getMetService()
+          .getDepartments(...call())
+          .catch((e: unknown) => e),
+      )) as ServiceError;
+
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+      expect(err.code).toBe(JsonRpcErrorCode.RateLimited);
+      expect(err.message).toBe(RATE_LIMITED_MESSAGE);
+      expect(err.data).toEqual({ reason: 'upstream_rate_limited', status: 429 });
+      expectPageFree(err);
+      // The exhausted error, page included, rides as the cause for the log.
+      expect(JSON.stringify(err.cause?.data)).toContain(PAGE_MARKER);
+    });
+
     it('keeps data.retryable: false on a 501, and data.retryAttempts on an exhausted ladder', async () => {
       fetchMock.mockImplementation(errorPage(501));
       const permanent = (await settle(() =>
@@ -184,10 +207,10 @@ describe('no HTTP failure leaving MetService carries the upstream page (#45)', (
           .catch((e: unknown) => e),
       )) as ServiceError;
 
-      // A Retry-After past the cap fails fast with the attempt's own error.
+      // A Retry-After past the cap fails fast after one request.
       expect(fetchMock).toHaveBeenCalledTimes(1);
       expect(err.code).toBe(JsonRpcErrorCode.RateLimited);
-      expect(err.data.retryAfter).toBe('120');
+      expect(err.data).toEqual({ reason: 'upstream_rate_limited', status: 429, retryAfter: '120' });
       expectPageFree(err);
     });
 
@@ -288,6 +311,19 @@ describe('no HTTP failure leaving MetService carries the upstream page (#45)', (
       expect(fetchMock).toHaveBeenCalledTimes(attempts);
     });
 
+    it('met_list_departments, HTTP 429', async () => {
+      fetchMock.mockImplementation(errorPage(429));
+
+      const result = await settle(() => runToolContract(metListDepartments, {}));
+
+      const error = errorOf(result);
+      expect(error.code).toBe(JsonRpcErrorCode.RateLimited);
+      expect(error.data).toMatchObject({ reason: 'upstream_rate_limited', status: 429 });
+      expect(JSON.stringify(result)).not.toContain(PAGE_MARKER);
+      expect(textOf(result)).toContain(RATE_LIMITED_MESSAGE);
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+    });
+
     it('met_search_collections, HTTP 400 on the search', async () => {
       fetchMock.mockImplementation(errorPage(400));
 
@@ -318,7 +354,7 @@ describe('no HTTP failure leaving MetService carries the upstream page (#45)', (
 
       const error = errorOf(result);
       expect(error.code).toBe(JsonRpcErrorCode.RateLimited);
-      expect(error.data.status).toBe(429);
+      expect(error.data).toMatchObject({ reason: 'upstream_rate_limited', status: 429 });
       expect(JSON.stringify(result)).not.toContain(PAGE_MARKER);
       expect(fetchMock).toHaveBeenCalledTimes(4);
     });

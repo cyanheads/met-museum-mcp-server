@@ -237,7 +237,7 @@ describe('content[] escaping — every tool, every rendered upstream text field'
 });
 
 describe('met_get_object probe coverage', () => {
-  it('probes the attribution, rights, and acquisition fields as upstream text', () => {
+  it('probes the attribution, rights, acquisition, reign, and portfolio fields as upstream text', () => {
     expect(synthesize(metGetObject.output, 'valid').probes).toEqual(
       expect.arrayContaining([
         'objects[].artistPrefix',
@@ -246,6 +246,8 @@ describe('met_get_object probe coverage', () => {
         'objects[].rightsAndReproduction',
         'objects[].metadataDate',
         'objects[].accessionYear',
+        'objects[].reign',
+        'objects[].portfolio',
       ]),
     );
   });
@@ -304,6 +306,8 @@ describe('structuredContent is untouched by the render-boundary escaping', () =>
       culture: '',
       period: '',
       dynasty: '',
+      reign: '',
+      portfolio: '',
       accessionNumber: '2005.100.1191 (1–122)',
       creditLine: 'Gilman Collection, Purchase, 2005',
       country: '',

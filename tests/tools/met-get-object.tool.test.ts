@@ -4,7 +4,7 @@
  */
 
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, timeout } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import {
   createMockContext,
@@ -91,6 +91,8 @@ const sampleRecord = {
   culture: '',
   period: '',
   dynasty: '',
+  reign: '',
+  portfolio: '',
   accessionNumber: '93.21',
   accessionYear: '1993',
   creditLine: 'Purchase',
@@ -158,6 +160,8 @@ const sparseRecord = {
   culture: '',
   period: '',
   dynasty: '',
+  reign: '',
+  portfolio: '',
   accessionNumber: '',
   accessionYear: '',
   creditLine: '',
@@ -441,6 +445,8 @@ describe('metGetObject', () => {
     expect(text).toContain('**Culture:** —');
     expect(text).toContain('**Period:** —');
     expect(text).toContain('**Dynasty:** —');
+    expect(text).toContain('**Reign:** —');
+    expect(text).toContain('**Portfolio:** —');
     expect(text).toContain('**Geography:** —');
     expect(text).toContain('**Credit:** —');
     expect(text).toContain('**Gallery:** —');
@@ -1071,6 +1077,243 @@ describe('metGetObject', () => {
     });
   });
 
+  describe('IDs past the per-call cap (#50)', () => {
+    /** `n` sequential IDs from `first`, each a sparse record well inside the byte budget. */
+    const ids = (first: number, n: number) => Array.from({ length: n }, (_, i) => first + i);
+    const sparseRecords = (list: number[]) =>
+      list.map((objectID) => ({ ...sparseRecord, objectID }));
+    /** The IDs the service was asked for, in call order. */
+    const fetchedIDs = () => mockGetObject.mock.calls.map((c) => c[0] as number);
+    const overCapNotice =
+      'Requested the first 20 of 25 distinct object IDs, the per-call cap; the other 5 are in remainingIDs and were not requested. Re-call met_get_object with them.';
+
+    type Structured = {
+      objects: { objectID: number }[];
+      failed: { objectID: number }[];
+      deferred?: { objectID: number }[];
+      remainingIDs?: number[];
+      notice?: string;
+    };
+
+    it('fetches the first 20 of 25 distinct IDs and returns the other 5 in remainingIDs, on both surfaces', async () => {
+      const requested = ids(1001, 25);
+      mockRecords(sparseRecords(requested));
+
+      const called = await runToolContract(metGetObject, { objectIDs: requested });
+
+      expect(called.isError).toBeFalsy();
+      expect(fetchedIDs().sort(byNumber)).toEqual(requested.slice(0, 20));
+      const structured = called.structuredContent as Structured;
+      expect(structured.objects.map((o) => o.objectID)).toEqual(requested.slice(0, 20));
+      expect(structured.failed).toEqual([]);
+      expect(structured.deferred).toBeUndefined();
+      expect(structured.remainingIDs).toEqual([1021, 1022, 1023, 1024, 1025]);
+      expect(structured.notice).toBe(overCapNotice);
+
+      const text = contentText(called);
+      expect(text).toContain(
+        '## Over the per-call cap — not requested\n1021, 1022, 1023, 1024, 1025',
+      );
+      expect(text).toContain(overCapNotice);
+    });
+
+    it('collapses 21 copies of one ID to one fetch, with no remainingIDs and no notice', async () => {
+      mockRecords(sparseRecords([437980]));
+
+      const called = await runToolContract(metGetObject, {
+        objectIDs: Array.from({ length: 21 }, () => 437980),
+      });
+
+      expect(called.isError).toBeFalsy();
+      expect(mockGetObject).toHaveBeenCalledTimes(1);
+      const structured = called.structuredContent as Structured;
+      expect(structured.objects.map((o) => o.objectID)).toEqual([437980]);
+      expect(structured.remainingIDs).toBeUndefined();
+      expect(structured.notice).toBeUndefined();
+      expect(contentText(called)).not.toContain('Over the per-call cap');
+    });
+
+    it('fetches all 20 distinct IDs of a 21-entry list, with no remainingIDs and no notice', async () => {
+      const distinct = ids(1001, 20);
+      mockRecords(sparseRecords(distinct));
+
+      const { result, enrichment } = await run(sparseRecords(distinct), [...distinct, 1007]);
+
+      expect(fetchedIDs().sort(byNumber)).toEqual(distinct);
+      expect(result.objects.map((o) => o.objectID)).toEqual(distinct);
+      expect(result.remainingIDs).toBeUndefined();
+      expect(enrichment.notice).toBeUndefined();
+    });
+
+    it('cuts after de-duplication: repeats past position 20 never land in remainingIDs, which keep request order', async () => {
+      const first = ids(1001, 20);
+      const requested = [...first, 1005, 2002, 2001, 2002, 1020, 2003];
+      const { result, enrichment } = await run(
+        sparseRecords([...first, 2001, 2002, 2003]),
+        requested,
+      );
+
+      expect(result.objects.map((o) => o.objectID)).toEqual(first);
+      expect(result.remainingIDs).toEqual([2002, 2001, 2003]);
+      expect(fetchedIDs()).not.toContain(2001);
+      expect(enrichment.notice).toBe(
+        'Requested the first 20 of 23 distinct object IDs, the per-call cap; the other 3 are in remainingIDs and were not requested. Re-call met_get_object with them.',
+      );
+    });
+
+    it('words a single over-cap ID in the singular', async () => {
+      const requested = ids(1001, 21);
+      const { result, enrichment } = await run(sparseRecords(requested));
+
+      expect(result.remainingIDs).toEqual([1021]);
+      expect(enrichment.notice).toBe(
+        'Requested the first 20 of 21 distinct object IDs, the per-call cap; the other 1 is in remainingIDs and was not requested. Re-call met_get_object with it.',
+      );
+    });
+
+    it('joins the over-cap and deferred disclosures in one notice, over-cap first, each section rendered', async () => {
+      const requested = ids(1, 22);
+      mockRecords(requested.map((id) => sizedRecord(id, 5_000)));
+
+      const called = await runToolContract(metGetObject, { objectIDs: requested });
+
+      const structured = called.structuredContent as Structured;
+      expect(structured.objects.map((o) => o.objectID)).toEqual(ids(1, 12));
+      expect(structured.deferred?.map((d) => d.objectID)).toEqual(ids(13, 8));
+      expect(structured.remainingIDs).toEqual([21, 22]);
+      const notice = structured.notice ?? '';
+      expect(
+        notice.startsWith(
+          'Requested the first 20 of 22 distinct object IDs, the per-call cap; the other 2 are in remainingIDs and were not requested. Re-call met_get_object with them. Returned 12 of 20 fetched records',
+        ),
+      ).toBe(true);
+
+      const text = contentText(called);
+      expect(text).toContain('## Deferred — batch byte budget');
+      expect(text).toContain('## Over the per-call cap — not requested\n21, 22');
+      expect(text).toContain(notice);
+    });
+
+    it('gives over-cap IDs no images[] entry and keeps the image slots on the returned records', async () => {
+      const requested = ids(1001, 22);
+      mockRecords(sparseRecords(requested));
+      const ctx = createMockContext({ errors: metGetObject.errors });
+
+      const result = await metGetObject.handler(
+        metGetObject.input.parse({ objectIDs: requested, includeImages: true }),
+        ctx,
+      );
+
+      expect(result.images?.map((i) => i.objectID)).toEqual(requested.slice(0, 20));
+      expect(result.remainingIDs).toEqual([1021, 1022]);
+    });
+
+    describe('a batch that throws', () => {
+      const tail =
+        'The other 5 of 25 distinct object IDs, past the per-call cap of 20, were not requested.';
+
+      it('counts only the 20 requested IDs in all_not_found and names the 5 unrequested', async () => {
+        mockRecords([]);
+        const ctx = createMockContext({ errors: metGetObject.errors });
+
+        await expect(
+          metGetObject.handler(metGetObject.input.parse({ objectIDs: ids(1001, 25) }), ctx),
+        ).rejects.toMatchObject({
+          code: JsonRpcErrorCode.NotFound,
+          data: { reason: 'all_not_found' },
+          message: `All 20 requested object IDs not found. ${tail}`,
+        });
+        expect(mockGetObject).toHaveBeenCalledTimes(20);
+      });
+
+      it('names the unrequested count in all_failed too', async () => {
+        mockGetObject.mockRejectedValue(new Error('network error'));
+        const ctx = createMockContext({ errors: metGetObject.errors });
+
+        await expect(
+          metGetObject.handler(metGetObject.input.parse({ objectIDs: ids(1001, 25) }), ctx),
+        ).rejects.toMatchObject({
+          data: { reason: 'all_failed' },
+          message: `All 20 object fetches failed. ${tail}`,
+        });
+      });
+
+      it('names the unrequested count in retry_deadline_exceeded too', async () => {
+        mockGetObject.mockRejectedValue(
+          timeout('Budget spent.', { reason: 'retry_deadline_exceeded' }),
+        );
+        const ctx = createMockContext({ errors: metGetObject.errors });
+
+        await expect(
+          metGetObject.handler(metGetObject.input.parse({ objectIDs: ids(1001, 25) }), ctx),
+        ).rejects.toMatchObject({
+          data: { reason: 'retry_deadline_exceeded' },
+          message: `All 20 object fetches ran out of the call's time budget. ${tail}`,
+        });
+      });
+
+      it('words a single unrequested ID in the singular', async () => {
+        mockRecords([]);
+        const ctx = createMockContext({ errors: metGetObject.errors });
+
+        await expect(
+          metGetObject.handler(metGetObject.input.parse({ objectIDs: ids(1001, 21) }), ctx),
+        ).rejects.toMatchObject({
+          message:
+            'All 20 requested object IDs not found. The other 1 of 21 distinct object IDs, past the per-call cap of 20, was not requested.',
+        });
+      });
+
+      it('leaves a batch within the cap worded as before', async () => {
+        mockRecords([]);
+        const ctx = createMockContext({ errors: metGetObject.errors });
+
+        await expect(
+          metGetObject.handler(metGetObject.input.parse({ objectIDs: ids(1001, 20) }), ctx),
+        ).rejects.toMatchObject({ message: 'All 20 requested object IDs not found.' });
+      });
+    });
+
+    describe('the objectIDs schema', () => {
+      it('accepts 500 entries and rejects 501', async () => {
+        expect(metGetObject.input.safeParse({ objectIDs: ids(1, 500) }).success).toBe(true);
+
+        const called = await runToolContract(metGetObject, { objectIDs: ids(1, 501) });
+        expect(called.isError).toBe(true);
+        expect((called.structuredContent as { error: { code: number } }).error.code).toBe(
+          JsonRpcErrorCode.InvalidParams,
+        );
+        expect(mockGetObject).not.toHaveBeenCalled();
+      });
+
+      it.each([[[]], [[0]], [[-1]], [[1.5]], [['abc']]])(
+        'still rejects objectIDs %j before any fetch',
+        async (objectIDs) => {
+          const called = await runToolContract(metGetObject, { objectIDs } as unknown as z.input<
+            typeof metGetObject.input
+          >);
+          expect(called.isError).toBe(true);
+          expect((called.structuredContent as { error: { code: number } }).error.code).toBe(
+            JsonRpcErrorCode.InvalidParams,
+          );
+          expect(mockGetObject).not.toHaveBeenCalled();
+        },
+      );
+
+      it('states the 20-ID cut, the 500 ceiling, and remainingIDs in the descriptions', () => {
+        const shape = metGetObject.input.shape;
+        expect(shape.objectIDs.description).toContain('500');
+        expect(shape.objectIDs.description).toContain('remainingIDs');
+        expect(metGetObject.description).toContain('remainingIDs');
+        expect(metGetObject.output.shape.remainingIDs.description).toContain('not requested');
+      });
+    });
+
+    it('format renders no over-cap section when the field is absent', () => {
+      expect(renderText(sampleRecord)).not.toContain('Over the per-call cap');
+    });
+  });
+
   describe('geography and measurements (#16)', () => {
     /** 548211's shape after normalization — seven findspot fields, three axes. */
     const geographyRichRecord = {
@@ -1474,9 +1717,13 @@ describe('metGetObject', () => {
     });
 
     describe('default off — the response before the input existed', () => {
-      /** content[] for a CC0 record, a non-CC0 record, and a 404, captured before the input existed. */
+      /**
+       * content[] for a CC0 record, a non-CC0 record, and a 404, captured before
+       * the input existed; record fields added since (Reign, Portfolio) render
+       * as they would on any call.
+       */
       const DEFAULT_OFF_TEXT =
-        '## (Untitled) — Object 437403\n**isPublicDomain:** Yes (CC0) | **hasCC0Image:** Yes | **isHighlight:** No | **isTimelineWork:** No\n**Artist:** — | **Artist role:** —\n**Nationality:** —\n**Artist dates:** —\n**Department:** — | **departmentId:** — | **Object name:** — | **Classification:** —\n**Date:** — (0–0)\n**Medium:** —\n**Dimensions:** —\n**Culture:** —\n**Period:** —\n**Dynasty:** —\n**Geography:** —\n**Measurements:** —\n**Accession:** — | **Accession year:** —\n**Credit:** —\n**Rights:** —\n**Metadata date:** —\n**Gallery:** —\n**URL:** —\n**Image (full):** https://images.metmuseum.org/CRDImages/ep/original/DP437403.jpg\n**Image (small):** https://images.metmuseum.org/CRDImages/ep/web-large/DP437403.jpg\n**Additional images:** —\n**Wikidata:** —\n**Tags:** —\n**Constituents:** —\n\n## (Untitled) — Object 488978\n**isPublicDomain:** No | **hasCC0Image:** No | **isHighlight:** No | **isTimelineWork:** No\n**Artist:** — | **Artist role:** —\n**Nationality:** —\n**Artist dates:** —\n**Department:** — | **departmentId:** — | **Object name:** — | **Classification:** —\n**Date:** — (0–0)\n**Medium:** —\n**Dimensions:** —\n**Culture:** —\n**Period:** —\n**Dynasty:** —\n**Geography:** —\n**Measurements:** —\n**Accession:** — | **Accession year:** —\n**Credit:** —\n**Rights:** —\n**Metadata date:** —\n**Gallery:** —\n**URL:** —\n**Image (full):** —\n**Image (small):** —\n**Additional images:** —\n**Wikidata:** —\n**Tags:** —\n**Constituents:** —\n\n## Failed Fetches\n- **999:** Object 999 not found in the Met collection — the object endpoint does not serve it, though the search index can still list it. Drop this ID rather than searching for it again.';
+        '## (Untitled) — Object 437403\n**isPublicDomain:** Yes (CC0) | **hasCC0Image:** Yes | **isHighlight:** No | **isTimelineWork:** No\n**Artist:** — | **Artist role:** —\n**Nationality:** —\n**Artist dates:** —\n**Department:** — | **departmentId:** — | **Object name:** — | **Classification:** —\n**Date:** — (0–0)\n**Medium:** —\n**Dimensions:** —\n**Culture:** —\n**Period:** —\n**Dynasty:** —\n**Reign:** —\n**Portfolio:** —\n**Geography:** —\n**Measurements:** —\n**Accession:** — | **Accession year:** —\n**Credit:** —\n**Rights:** —\n**Metadata date:** —\n**Gallery:** —\n**URL:** —\n**Image (full):** https://images.metmuseum.org/CRDImages/ep/original/DP437403.jpg\n**Image (small):** https://images.metmuseum.org/CRDImages/ep/web-large/DP437403.jpg\n**Additional images:** —\n**Wikidata:** —\n**Tags:** —\n**Constituents:** —\n\n## (Untitled) — Object 488978\n**isPublicDomain:** No | **hasCC0Image:** No | **isHighlight:** No | **isTimelineWork:** No\n**Artist:** — | **Artist role:** —\n**Nationality:** —\n**Artist dates:** —\n**Department:** — | **departmentId:** — | **Object name:** — | **Classification:** —\n**Date:** — (0–0)\n**Medium:** —\n**Dimensions:** —\n**Culture:** —\n**Period:** —\n**Dynasty:** —\n**Reign:** —\n**Portfolio:** —\n**Geography:** —\n**Measurements:** —\n**Accession:** — | **Accession year:** —\n**Credit:** —\n**Rights:** —\n**Metadata date:** —\n**Gallery:** —\n**URL:** —\n**Image (full):** —\n**Image (small):** —\n**Additional images:** —\n**Wikidata:** —\n**Tags:** —\n**Constituents:** —\n\n## Failed Fetches\n- **999:** Object 999 not found in the Met collection — the object endpoint does not serve it, though the search index can still list it. Drop this ID rather than searching for it again.';
 
       /** The deferred notice for a 50,000 + 30,000-byte batch, captured before the input existed. */
       const DEFAULT_OFF_NOTICE =

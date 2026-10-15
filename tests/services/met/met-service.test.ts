@@ -25,6 +25,7 @@ import {
   initMetService,
   OBJECT_IDS_CACHE_MAX_BYTES,
 } from '@/services/met/met-service.js';
+import { escapeMarkdown } from '@/utils/markdown.js';
 
 /** JSON response with a real body stream for fetchWithTimeout's deadline wrapper. */
 function jsonResponse(body: unknown): Response {
@@ -47,13 +48,14 @@ const PAGING_PARAMS = new Set(['q', 'offset', 'limit']);
 
 /**
  * One `/v1.1/search` page over `total` sequential matches (IDs 1..total), shaped
- * the way the upstream answers: `offset`/`limit` read off the request, the page
- * clipped at the 10,000 window, and `objectIDs: null` for an empty page while
- * `total` stays the full count.
+ * the way the upstream answers: `offset`/`limit` read off the request, a `limit`
+ * above 500 silently read as 500 (2026-10-15: `q=horse&limit=600` returned the
+ * same 500 IDs as `limit=500`), the page clipped at the 10,000 window, and
+ * `objectIDs: null` for an empty page while `total` stays the full count.
  */
 function searchPage(url: URL, total: number): Response {
   const offset = Number(url.searchParams.get('offset'));
-  const limit = Number(url.searchParams.get('limit'));
+  const limit = Math.min(Number(url.searchParams.get('limit')), 500);
   const end = Math.min(offset + limit, total, 10_000);
   const objectIDs = Array.from({ length: Math.max(0, end - offset) }, (_, i) => offset + i + 1);
   return jsonResponse({ total, objectIDs: objectIDs.length > 0 ? objectIDs : null });
@@ -700,6 +702,43 @@ const rawObjects = {
     creditLine: 'Gift of Daniel M. C. Hopping, 1986',
     rightsAndReproduction: '',
     metadataDate: '2023-02-07T04:46:51.34Z',
+  },
+
+  /**
+   * 544442 — a `reign` beside `period` and `dynasty`, `portfolio` empty.
+   * Trimmed to the text fields those sit beside (live, 2026-10-15).
+   */
+  jointReign: {
+    objectID: 544442,
+    title: 'Sphinx of Hatshepsut',
+    department: 'Egyptian Art',
+    objectName: 'Sphinx, Hatshepsut; Hatshepsut-sculpture',
+    objectDate: 'ca. 1473–1458 BCE',
+    medium: 'Granite, paint',
+    period: 'New Kingdom',
+    dynasty: 'Dynasty 18',
+    reign: 'Joint reign of Hatshepsut and Thutmose III',
+    portfolio: '',
+    accessionNumber: '31.3.166',
+  },
+
+  /**
+   * 383857 — a `portfolio` naming the print series and plate, `reign` empty.
+   * Trimmed to the text fields those sit beside (live, 2026-10-15).
+   */
+  printingPlate: {
+    objectID: 383857,
+    title:
+      'Winter Hawk. Falco hyemalis [current name: Red-shouldered Hawk. Buteo lineatus], printlng plate for "The Birds of America," 1827–38, plate LXXI',
+    department: 'Drawings and Prints',
+    objectName: 'Plate',
+    classification: 'Plates',
+    objectDate: '1829',
+    period: '',
+    dynasty: '',
+    reign: '',
+    portfolio: 'Birds of America, plate LXXI',
+    accessionNumber: '76.1.4',
   },
 } as const;
 
@@ -1397,6 +1436,63 @@ describe('MetService', () => {
         }
       },
     );
+
+    describe('limit above the 500-ID page (#50)', () => {
+      const limitNotice =
+        'limit 600 is above the 500-ID page maximum, so this page was read with limit 500; continue from nextOffset.';
+
+      it('sends limit 500 and continues from offset + IDs served, the window notice joined after', async () => {
+        fetchMock.mockImplementation(searchUpstream(14_398));
+        const result = await runToolContract(metSearchCollections, {
+          q: 'horse',
+          offset: 1_000,
+          limit: 600,
+        });
+
+        expect(searchRequests(fetchMock).map((url) => url.searchParams.get('limit'))).toEqual([
+          '500',
+        ]);
+        const structured = result.structuredContent as Structured;
+        expect(structured).toMatchObject({
+          returned: 500,
+          remaining: 8_500,
+          truncated: true,
+          nextOffset: 1_500,
+        });
+        expect(structured.notice).toBe(
+          `${limitNotice} Only the first 10,000 of 14,398 matches are reachable by paging. Narrow the search with filters or a more specific keyword to reach the rest.`,
+        );
+        expect(textOf(result)).toContain('**Returned IDs:** 500 (truncated)');
+      });
+
+      it('a short last page ends paging at offset + IDs served, with no limit notice', async () => {
+        fetchMock.mockImplementation(searchUpstream(700));
+        const result = await runToolContract(metSearchCollections, {
+          q: 'horse',
+          offset: 500,
+          limit: 600,
+        });
+
+        const structured = result.structuredContent as Structured;
+        expect(structured).toMatchObject({ returned: 200, remaining: 0, nextOffset: null });
+        expect(structured.notice).toBeUndefined();
+        expect(textOf(result)).toContain('**Returned IDs:** 200 (complete)');
+      });
+
+      it('a page cut by the 10,000 window carries the window notice alone', async () => {
+        fetchMock.mockImplementation(searchUpstream(14_398));
+        const result = await runToolContract(metSearchCollections, {
+          q: 'horse',
+          offset: 9_800,
+          limit: 600,
+        });
+
+        const structured = result.structuredContent as Structured;
+        expect(structured).toMatchObject({ returned: 200, nextOffset: null });
+        expect(structured.notice).not.toContain('500-ID page');
+        expect(textOf(result)).toContain('**Returned IDs:** 200 (window end)');
+      });
+    });
 
     it('continues from the delivered count when a mid-window page comes back short', async () => {
       // A page shorter than requested inside the window: continuation keys on what
@@ -2357,6 +2453,8 @@ describe('MetService', () => {
           'culture',
           'period',
           'dynasty',
+          'reign',
+          'portfolio',
           'creditLine',
           'rightsAndReproduction',
           'country',
@@ -2625,6 +2723,108 @@ describe('MetService', () => {
         const record = await getMetService().getObject(999, ...call());
 
         expect(record?.departmentId).toBeNull();
+      });
+    });
+
+    describe('reign and portfolio (#51)', () => {
+      it('carries 544442’s reign beside its period and dynasty', async () => {
+        fetchMock.mockResolvedValue(jsonResponse(rawObjects.jointReign));
+        const record = await getMetService().getObject(544442, ...call());
+
+        expect(record).toMatchObject({
+          period: 'New Kingdom',
+          dynasty: 'Dynasty 18',
+          reign: 'Joint reign of Hatshepsut and Thutmose III',
+          portfolio: '',
+        });
+      });
+
+      it('carries 383857’s portfolio', async () => {
+        fetchMock.mockResolvedValue(jsonResponse(rawObjects.printingPlate));
+        const record = await getMetService().getObject(383857, ...call());
+
+        expect(record).toMatchObject({ reign: '', portfolio: 'Birds of America, plate LXXI' });
+      });
+
+      it('defaults both to empty strings when the Met omits them', async () => {
+        fetchMock.mockResolvedValue(jsonResponse({ objectID: 999 }));
+        const record = await getMetService().getObject(999, ...call());
+
+        expect([record?.reign, record?.portfolio]).toEqual(['', '']);
+      });
+
+      it('carries both onto both surfaces, after Period and Dynasty', async () => {
+        fetchMock.mockImplementation(
+          objectsUpstream(rawObjects.jointReign, rawObjects.printingPlate),
+        );
+        const result = await runToolContract(metGetObject, { objectIDs: [544442, 383857] });
+
+        const { objects } = result.structuredContent as GetObjectOutput;
+        expect(objects.map((o) => [o.objectID, o.reign, o.portfolio])).toEqual([
+          [544442, 'Joint reign of Hatshepsut and Thutmose III', ''],
+          [383857, '', 'Birds of America, plate LXXI'],
+        ]);
+        const text = textOf(result);
+        expect(sectionFor(text, 544442)).toContain(
+          [
+            '**Period:** New Kingdom',
+            '**Dynasty:** Dynasty 18',
+            '**Reign:** Joint reign of Hatshepsut and Thutmose III',
+            '**Portfolio:** —',
+          ].join('\n'),
+        );
+        expect(sectionFor(text, 383857)).toContain(
+          ['**Dynasty:** —', '**Reign:** —', '**Portfolio:** Birds of America, plate LXXI'].join(
+            '\n',
+          ),
+        );
+      });
+
+      it('escapes Markdown in both on content[] and keeps them raw on structuredContent', async () => {
+        const reign = 'reign of *Pepi* II [Dynasty 6]';
+        const portfolio = 'Series_1 <plate> `LXXI`';
+        fetchMock.mockResolvedValue(jsonResponse({ objectID: 999, reign, portfolio }));
+        const result = await runToolContract(metGetObject, { objectIDs: [999] });
+
+        const { objects } = result.structuredContent as GetObjectOutput;
+        expect([objects[0]?.reign, objects[0]?.portfolio]).toEqual([reign, portfolio]);
+        const text = textOf(result);
+        expect(text).toContain(`**Reign:** ${escapeMarkdown(reign)}`);
+        expect(text).toContain(`**Portfolio:** ${escapeMarkdown(portfolio)}`);
+        expect(text).not.toContain(reign);
+        expect(text).not.toContain(portfolio);
+      });
+
+      it('counts both keys against the batch byte budget', async () => {
+        /**
+         * Object 1 is padded so that it and 544442 fill the 60,000-byte budget
+         * exactly when 544442's two keys are left out, so 544442 is admitted only
+         * if the keys go uncounted.
+         */
+        const budget = 60_000;
+        const utf8Bytes = (value: unknown) =>
+          new TextEncoder().encode(JSON.stringify(value)).length;
+        const padded = (creditLine: string) => ({ objectID: 1, creditLine });
+        fetchMock.mockImplementation(objectsUpstream(rawObjects.jointReign, padded('')));
+        const sphinx = await getMetService().getObject(544442, ...call());
+        const unpadded = await getMetService().getObject(1, ...call());
+        const { reign: _reign, portfolio: _portfolio, ...sphinxWithoutKeys } = sphinx ?? {};
+        const padding = budget - utf8Bytes(unpadded) - utf8Bytes(sphinxWithoutKeys);
+        fetchMock.mockImplementation(
+          objectsUpstream(rawObjects.jointReign, padded('x'.repeat(padding))),
+        );
+
+        const result = await runToolContract(metGetObject, { objectIDs: [1, 544442] });
+
+        const structured = result.structuredContent as GetObjectOutput & {
+          deferred?: { objectID: number; bytes: number }[];
+        };
+        expect(structured.objects.map((o) => o.objectID)).toEqual([1]);
+        expect(structured.deferred).toEqual([{ objectID: 544442, bytes: utf8Bytes(sphinx) }]);
+        expect(JSON.stringify(sphinx)).toContain(
+          '"reign":"Joint reign of Hatshepsut and Thutmose III"',
+        );
+        expect(JSON.stringify(sphinx)).toContain('"portfolio":""');
       });
     });
 

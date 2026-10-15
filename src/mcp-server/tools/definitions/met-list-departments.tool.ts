@@ -53,6 +53,14 @@ export const metListDepartments = tool('met_list_departments', {
         'The Met API is failing on its side, so changing the request will not help. Wait a few minutes before retrying.',
     },
     {
+      reason: 'upstream_rate_limited',
+      code: JsonRpcErrorCode.RateLimited,
+      thrownBy: 'service',
+      when: "The Met API answered HTTP 429 until the retry ladder ran out, or asked for a wait longer than the ladder or the call's time budget allows — it throttles this server's address, not one endpoint.",
+      recovery:
+        'Wait the period this error names, or about a minute when it names none, then retry with fewer requests at once.',
+    },
+    {
       reason: 'retry_deadline_exceeded',
       code: JsonRpcErrorCode.Timeout,
       thrownBy: 'service',
