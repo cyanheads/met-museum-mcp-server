@@ -293,6 +293,35 @@ describe('an HTTP 429 from the Met API (#49)', () => {
       );
     });
 
+    it.each([
+      ['11', 'an'],
+      ['18', 'an'],
+      ['80', 'an'],
+      ['86', 'an'],
+      ['100', 'a'],
+      ['120', 'a'],
+      ['180', 'a'],
+      ['800', 'an'],
+      ['1800', 'a'],
+      ['8000', 'an'],
+      ['11000', 'an'],
+      ['18000', 'an'],
+      ['86400', 'an'],
+    ])('Retry-After %s takes the article "%s"', async (retryAfter, article) => {
+      fetchMock.mockImplementation(tooMany(retryAfter));
+
+      // Long enough that the 11 s and 18 s waits exhaust the ladder rather than the budget.
+      const err = (await settle(() =>
+        getMetService()
+          .getDepartments(...call(60_000))
+          .catch((e: unknown) => e),
+      )) as ServiceError;
+
+      expect(err.message).toBe(
+        `The Met API is rate-limiting requests from this server (HTTP 429) and asked for ${article} ${retryAfter}-second wait.`,
+      );
+    });
+
     it('waits out a Retry-After inside the cap and budget: a 429 then a 200 returns the result', async () => {
       fetchMock.mockImplementationOnce(tooMany('2')).mockImplementationOnce(() => record(436535));
 
