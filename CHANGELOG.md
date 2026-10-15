@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.9.0](changelog/0.9.x/0.9.0.md) — 2026-10-15 · ⚠️ Breaking
+
+An HTTP 429 from the Met fails as upstream_rate_limited on every tool, with the requested wait in the message; met_get_object accepts up to 500 IDs and met_search_collections and met_list_objects a limit up to 10,000, each disclosing what it did not serve; records gain reign and portfolio; mcp-ts-core ^0.13.15.
+
 ## [0.8.0](changelog/0.8.x/0.8.0.md) — 2026-10-04 · ⚠️ Breaking
 
 met_get_object can attach up to three CC0 images and returns attribution, rights, revision-date, and departmentId fields; met_search_collections answers zero matches as a success; a Met 5xx outage fails as upstream_unavailable on every tool.
