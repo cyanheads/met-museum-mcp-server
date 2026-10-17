@@ -29,7 +29,7 @@
 
 ## Overview
 
-The Metropolitan Museum of Art's public Collection API. Search the collection by keyword and filters, or browse it by department and update date, then fetch full object records — metadata, provenance, and CC0 open-access images — from any MCP client. Runs as a stdio process, a local Streamable HTTP server, or the public hosted endpoint above.
+The Metropolitan Museum of Art's collection of 500,000+ works spanning 5,000 years. Search by keyword and filters, browse by department, and fetch full object records with provenance and CC0 open-access images.
 
 ### Tools
 
@@ -52,32 +52,25 @@ The Metropolitan Museum of Art's public Collection API. Search the collection by
 
 ### `met_search_collections` <sub>tool</sub>
 
-- Keyword `q` (required), matched across all text fields unless `matchField` narrows it to `"title"` or `"tags"`. `"*"` matches every object, for a search by filters alone; an accession number from a label ranks its object first. Plus filters: `departmentId`, `medium` (a case-sensitive classification as the Met spells it — `"Paintings"`, not `"Oil on canvas"`), `dateBegin`/`dateEnd` (integer years, negative = BCE, set together), one `geoLocation`, `hasImages`, `isOnView`, and `isHighlight` (`true` only)
-- `departmentId` 7 (The Cloisters) and 17 (Medieval Art) share one search result set at the Met: each page keeps only the requested department's IDs, while `total` and paging count both, so a page can hold fewer than `limit` IDs; a `notice` says so, and `met_list_objects` gives exact department membership
-- Up to 500 IDs per page (default 20; a `limit` up to 10,000 reads a 500-ID page, with a `notice`), paged by `offset` / `nextOffset` through the first 10,000 matches only; `total` still reports the full count, with a `notice` when it exceeds 10,000
-- Zero matches is a result, not an error: `total: 0` with a `notice` saying whether the keyword matches nothing or the filters removed every match, and which filters to correct or drop. Every result echoes the applied query as `effectiveQuery`
-- Typed errors: `invalid_date_range`, `invalid_filter` (a blank `q`, `medium`, or `geoLocation`), `invalid_department`, `upstream_blocked`, `upstream_unavailable`, `upstream_rate_limited`, `retry_deadline_exceeded`
+- Keyword `q` (required), matched across all text fields unless `matchField` narrows it to `"title"` or `"tags"`; `"*"` matches everything, for a search by filters alone. Filters: `departmentId`, `medium` (case-sensitive, e.g. `"Paintings"`), `dateBegin`/`dateEnd` (integer years, negative = BCE, set together), one `geoLocation`, `hasImages`, `isOnView`, and `isHighlight` (`true` only)
+- Up to 500 IDs per page (default 20), paged by `offset` / `nextOffset` through the first 10,000 matches; `total` reports the full count. `departmentId` 7 (The Cloisters) and 17 (Medieval Art) share one result set at the Met, so a page can hold fewer than `limit` IDs, which a `notice` flags
+- Zero matches is a result with a `notice`, not an error; every result echoes the applied query as `effectiveQuery`. Typed errors: `invalid_date_range`, `invalid_filter` (a blank `q`, `medium`, or `geoLocation`), `invalid_department`, `upstream_blocked`, `upstream_unavailable`, `upstream_rate_limited`, `retry_deadline_exceeded`
 
 ---
 
 ### `met_list_objects` <sub>tool</sub>
 
-- Filters `departmentId` (from `met_list_departments`) and `updatedSince` (`YYYY-MM-DD` — records created or revised on or after that day), alone or together; with neither, the whole collection (over 500,000 IDs). Up to 500 IDs per page (default 20; a `limit` up to 10,000 reads a 500-ID page, with a `notice`), in ascending order, paged by `offset` / `nextOffset` with no depth limit
-- Typed errors: `invalid_department`, `invalid_date` (an impossible date such as `2026-02-30`), `upstream_blocked`, `upstream_unavailable`, `upstream_rate_limited`, `retry_deadline_exceeded`; an empty list is a result, not an error, with a `notice` naming the filters, and every result echoes the applied filters as `effectiveQuery`
-- Each list is cached for up to an hour, so a record revised within the last hour may not appear yet
+- Filters `departmentId` (from `met_list_departments`) and `updatedSince` (`YYYY-MM-DD`, records created or revised on or after that day), alone or together; with neither, the whole collection (over 500,000 IDs). Up to 500 IDs per page (default 20) in ascending order, paged by `offset` / `nextOffset` with no depth limit
+- An empty list is a result with a `notice`, not an error; every result echoes the applied filters as `effectiveQuery`. Typed errors: `invalid_department`, `invalid_date` (an impossible date such as `2026-02-30`), `upstream_blocked`, `upstream_unavailable`, `upstream_rate_limited`, `retry_deadline_exceeded`
+- Lists are cached for up to an hour, so a record revised in the last hour may not appear yet
 
 ---
 
 ### `met_get_object` <sub>tool</sub>
 
-- 20 distinct IDs fetched per call, from `met_search_collections` or `met_list_objects`; a repeated ID is fetched and returned once. A list of up to 500 (a full page) is accepted, and the distinct IDs past the first 20 come back unrequested in `remainingIDs`, with a `notice`
-- Partial success: per-ID errors land in `failed[]`, and the call fails only when every ID does — `all_not_found` when every ID was a 404, `upstream_blocked` when the Met's firewall refused a request, `upstream_rate_limited` when the Met answered 429, `retry_deadline_exceeded` when every fetch ran out of the call's time budget, `upstream_unavailable` when a fetch met a Met API outage, and `all_failed` otherwise; records past a 60,000-byte `structuredContent` budget are listed in `deferred[]` with their sizes, to re-request
-- `isPublicDomain` / `hasCC0Image` gate image URLs — non-public-domain objects return empty `primaryImage`, `primaryImageSmall`, and `additionalImages`; sparse fields are empty or null, never fabricated
-- `includeImages: true` attaches the CC0 web-display image (about 600 px on the long edge) of the first 3 returned records that have one, as image content after a caption naming the object, and `images[]` gives each returned record's outcome (`attached`, `no_cc0_image`, `over_cap`, `unavailable`). The bytes ride `content[]` only, so a client that passes the model only `structuredContent` won't show them
-- The Artist line carries the full attribution and role — `artistPrefix` ("Style of"), the name, `artistSuffix`, and `artistRole` ("Patron") — so a follower's work or a patron never reads as the named artist's own; `rightsAndReproduction` names the rights holder on the copyrighted works that carry one, beside `accessionYear`
-- `reign` ("Joint reign of Hatshepsut and Thutmose III") sits beside `period` and `dynasty`, and `portfolio` ("Birds of America, plate LXXI") names a print's series and plate; both are empty on most records
-- `metadataDate` is the record's last revision, the timestamp `met_list_objects` `updatedSince` compares; `departmentId` resolves the record's department name (five differ from `met_list_departments`) to the ID `met_list_objects` and `met_search_collections` take, or `null` when the name is not recognized
-- The search index can list IDs the object endpoint no longer serves, so a 404's guidance is to drop the ID rather than search for it again
+- Fetches 20 distinct IDs per call, from `met_search_collections` or `met_list_objects`; a list of up to 500 is accepted, and the IDs past the first 20 come back in `remainingIDs`. The index can list IDs the Met no longer serves, so drop an ID that 404s
+- Partial success: per-ID errors land in `failed[]`, and the call fails only when every ID does (`all_not_found`, `upstream_blocked`, `upstream_rate_limited`, `retry_deadline_exceeded`, `upstream_unavailable`, or `all_failed`). Records past a 60,000-byte `structuredContent` budget are listed in `deferred[]` with their sizes, to re-request
+- Non-public-domain objects (`isPublicDomain` / `hasCC0Image`) return empty `primaryImage`, `primaryImageSmall`, and `additionalImages`. `includeImages: true` attaches the CC0 image (about 600 px) of the first 3 records that have one as image content in `content[]` only, with each record's outcome in `images[]`
 
 ## Features
 
@@ -89,17 +82,15 @@ Met Museum-specific:
 - CC0 open-access data from [The Metropolitan Museum of Art](https://www.metmuseum.org/) — free to use without permission or attribution
 - Parallel batch fetching with configurable concurrency for `met_get_object`
 - Linked data on every object — Getty ULAN and AAT URLs, Wikidata entity URLs for artists, tags, and works
-- A 403 from the Met's firewall surfaces on every tool as `upstream_blocked`, non-retryable: the block covers the server's address for minutes, so the recovery is to wait and send fewer requests
-- A 500, 502, 503, or 504 that outlasts the retries surfaces on every tool as `upstream_unavailable`; once every fetch in flight has failed without the Met answering any ID, `met_get_object` stops requesting the rest of the batch, so a 5xx outage costs at most `MET_BATCH_CONCURRENCY` × 4 requests (20 at the default) however many IDs were asked for
-- A 429 that outlasts the retries, or asks for a wait longer than they or the call's time budget allow, surfaces on every tool as `upstream_rate_limited`, its message naming the wait the Met asked for; `met_get_object` then stops requesting the rest of the batch, so a throttled batch costs at most `MET_BATCH_CONCURRENCY` requests (5 at the default) with a long `Retry-After` and `MET_BATCH_CONCURRENCY` × 4 (20) without one
-- No error carries the Met's HTML or JSON error page — an HTTP failure reaches the caller as its code, message, and status, or, inside a `met_get_object` batch, as that ID's `failed[]` message
+- Met API failures surface on every tool as typed errors (`upstream_blocked` for a 403 firewall block, `upstream_unavailable` for 5xx, `upstream_rate_limited` for 429), never as the Met's raw error page
+- `met_get_object` stops requesting the rest of a batch once the Met is blocking, down, or throttling, so a bad batch costs only a few requests
 
 Agent-friendly output:
 
-- Provenance on every record — `isPublicDomain` and `hasCC0Image` flags distinguish CC0 objects from works with inaccessible images, so agents can reason about what they can actually display
-- Partial failure reporting — `met_get_object` returns `objects` and `failed` arrays so callers receive successful records alongside structured per-ID error context
-- Truncation signaling — `met_search_collections` and `met_list_objects` return `total`, `returned`, `truncated`, `remaining`, `nextOffset`, and the resolved `offset`; the text marks each page `(truncated)`, `(complete)`, or `(offset beyond result set)`, and search adds `(window end)` for a page that stops at its 10,000-match window short of `total`
-- Byte-budget disclosure — `met_get_object` reports `deferred[]` records with their sizes when a batch exceeds its serialized-response budget, so callers can size a follow-up call precisely
+- Provenance on every record: `isPublicDomain` and `hasCC0Image` flags show which images can be displayed
+- Partial failure reporting: `met_get_object` returns `objects` and `failed` arrays, so successes arrive alongside per-ID errors
+- Truncation signaling: `met_search_collections` and `met_list_objects` return `total`, `returned`, `truncated`, `remaining`, `nextOffset`, and the resolved `offset`
+- Byte-budget disclosure: `met_get_object` lists `deferred[]` records with their sizes when a batch is too large
 
 ## Getting started
 
@@ -221,15 +212,15 @@ All configuration is validated at startup via Zod schemas in `src/config/server-
 |:---|:---|:---|
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http` | `stdio` |
 | `MCP_HTTP_PORT` | HTTP server port | `3010` |
-| `MCP_SESSION_MODE` | HTTP session mode: `auto`, `stateful`, or `stateless`. This server declares `stateless` in `createApp()`, so it applies whenever the variable is unset; an explicit value overrides it. (`auto`, the framework schema default, resolves to `stateful`.) | `stateless` |
+| `MCP_SESSION_MODE` | HTTP session mode: `auto`, `stateful`, or `stateless` | `stateless` |
 | `MCP_AUTH_MODE` | Authentication: `none`, `jwt`, or `oauth` | `none` |
 | `MCP_LOG_LEVEL` | Log level (`debug`, `info`, `warning`, `error`) | `info` |
 | `LOGS_DIR` | Directory for log files (Node.js only) | `<project-root>/logs` |
 | `LOG_TOOL_FAILURE_PAYLOADS` | Log each failed tool call's arguments and result, redacted by key name and capped at `LOG_TOOL_FAILURE_PAYLOAD_MAX_BYTES` (default `16384`). A secret inside a free-form value is not redacted. | `false` |
 | `OTEL_ENABLED` | Enable OpenTelemetry instrumentation | `false` |
-| `MET_BASE_URL` | Met Collection API root; each endpoint appends its own version (`/v1.1/search`, `/v1/objects`, `/v1/objects/{id}`, `/v1/departments`). A value ending in `/v1` or `/v1.1` is read as its root. Override for local stubs. | `https://collectionapi.metmuseum.org/public/collection` |
+| `MET_BASE_URL` | Met Collection API root; override for local stubs | `https://collectionapi.metmuseum.org/public/collection` |
 | `MET_REQUEST_TIMEOUT_MS` | Per-request HTTP timeout in milliseconds | `10000` |
-| `MET_CALL_DEADLINE_MS` | Wall-clock budget in milliseconds for one tool call, shared by every Met API request it makes, retries and backoff included. A call that runs out fails with `Timeout` (`-32004`), `data.reason: 'retry_deadline_exceeded'`; in `met_get_object` the affected IDs land in `failed[]`, and a batch that fetched nothing because every ID ran out fails with that reason. | `30000` |
+| `MET_CALL_DEADLINE_MS` | Time budget in milliseconds for one tool call, retries included; exceeding it fails with `retry_deadline_exceeded` | `30000` |
 | `MET_BATCH_CONCURRENCY` | Max parallel fetches in `met_get_object` | `5` |
 
 See [`.env.example`](./.env.example) for the full list of optional overrides.
