@@ -1328,7 +1328,7 @@ describe('metSearchCollections', () => {
         });
       });
 
-      it('counts a call served at a clamped limit on met.limit.clamped for met_search_collections, and none at 500', async () => {
+      it('counts a call made with a clamped limit on met.limit.clamped for met_search_collections, and none at 500', async () => {
         mockSearch.mockResolvedValue(fullPage(3_000));
         const { added, call } = await loadTool();
 
@@ -1337,6 +1337,20 @@ describe('metSearchCollections', () => {
 
         await call(10_001);
         expect(sentLimit()).toBe(500);
+        expect(added).toEqual([
+          {
+            name: 'met.limit.clamped',
+            value: 1,
+            attributes: { 'mcp.tool.name': 'met_search_collections' },
+          },
+        ]);
+      });
+
+      it('counts a clamped call when its page limit is set, before the search, so a failed search still counts', async () => {
+        mockSearch.mockRejectedValue(new Error('Met search failed'));
+        const { added, call } = await loadTool();
+
+        expect((await call(10_001)).isError).toBe(true);
         expect(added).toEqual([
           {
             name: 'met.limit.clamped',

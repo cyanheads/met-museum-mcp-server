@@ -421,7 +421,7 @@ describe('met_list_objects (#26)', () => {
       });
     });
 
-    it('counts a call served at a clamped limit on met.limit.clamped for met_list_objects, and none at 500', async () => {
+    it('counts a call made with a clamped limit on met.limit.clamped for met_list_objects, and none at 500', async () => {
       const { added, call } = await loadTool();
 
       expect(pageOf(await call({ limit: 500 })).returned).toBe(500);
