@@ -26,6 +26,7 @@ import {
   OBJECT_IDS_CACHE_MAX_BYTES,
 } from '@/services/met/met-service.js';
 import { escapeMarkdown } from '@/utils/markdown.js';
+import { readMarkdownText } from '../../helpers/read-markdown-text.js';
 
 /** JSON response with a real body stream for fetchWithTimeout's deadline wrapper. */
 function jsonResponse(body: unknown): Response {
@@ -1167,7 +1168,7 @@ describe('MetService', () => {
    * With both it answers the title set and drops `tags`, and it ignores a
    * `false` value, so the service sends exactly one flag, set to `true`.
    */
-  describe('search — matchField restricts the keyword match (#35)', () => {
+  describe('search — matchField restricts the keyword match (#35, #53)', () => {
     /** The query parameters of the one search request the test issued. */
     const sentParams = () => [
       ...new URL(String(fetchMock.mock.calls[0]?.[0])).searchParams.entries(),
@@ -1176,8 +1177,9 @@ describe('MetService', () => {
     it.each([
       ['title', 'title'],
       ['tags', 'tags'],
+      ['artistOrCulture', 'artistOrCulture'],
     ] as const)(
-      'matchField %s sends %s=true after the paging parameters',
+      'matchField %s sends %s=true after the paging parameters, and no other flag',
       async (matchField, flag) => {
         fetchMock.mockImplementation(searchUpstream(36));
         await getMetService().search({ q: 'sunflower', limit: 20, matchField }, ...call());
@@ -1191,13 +1193,14 @@ describe('MetService', () => {
       },
     );
 
-    it('sends neither flag, and no false value, when matchField is unset', async () => {
+    it('sends no flag, and no false value, when matchField is unset', async () => {
       fetchMock.mockImplementation(searchUpstream(178));
       await getMetService().search({ q: 'sunflower', limit: 20 }, ...call());
 
       const keys = sentParams().map(([key]) => key);
       expect(keys).not.toContain('title');
       expect(keys).not.toContain('tags');
+      expect(keys).not.toContain('artistOrCulture');
       expect(sentParams().some(([, value]) => value === 'false')).toBe(false);
     });
 
@@ -1307,7 +1310,7 @@ describe('MetService', () => {
         offset: 0,
         effectiveQuery: 'q="sunflower"',
       });
-      expect(textOf(result)).toContain('Query: q="sunflower"');
+      expect(readMarkdownText(textOf(result))).toContain('Query: q="sunflower"');
     });
 
     it('discloses the window when total exceeds 10,000, on a truncated page', async () => {
@@ -1426,7 +1429,7 @@ describe('MetService', () => {
         expect(structured.effectiveQuery).toBe('q="horse"');
         const text = textOf(result);
         expect(text).toContain(`**Returned IDs:** ${returned} ${marker}`);
-        expect(text).toContain('Query: q="horse"');
+        expect(readMarkdownText(text)).toContain('Query: q="horse"');
         if (notice) {
           expect(structured.notice).toContain('first 10,000 of');
           expect(text).toContain('first 10,000 of');
@@ -1562,7 +1565,7 @@ describe('MetService', () => {
     });
 
     it.each([
-      ['"artistOrCulture"', 'artistOrCulture'],
+      ['"artist"', 'artist'],
       ['true', true],
       ['"Title"', 'Title'],
     ])('rejects matchField %s at the schema, before any request (#35)', async (_label, value) => {
@@ -1595,6 +1598,38 @@ describe('MetService', () => {
       expect(searchRequests(fetchMock).map((url) => url.search)).toEqual([
         '?q=sunflower&offset=0&limit=20&title=true',
         '?q=sunflower&offset=0&limit=20&tags=true',
+      ]);
+    });
+
+    it('accepts matchField artistOrCulture: one request with that flag alone, a page on both surfaces (#53)', async () => {
+      // `q=Rembrandt&artistOrCulture=true`, 2026-11-04: 372 of the keyword's 646 matches.
+      const firstPage = [
+        437403, 437404, 437406, 437407, 437408, 437409, 437410, 437411, 437413, 437414, 437416,
+        437418, 437419, 437420, 437421, 438379, 334627, 334628, 334647, 337063,
+      ];
+      fetchMock.mockImplementation(
+        routes({ [SEARCH_PATH]: () => jsonResponse({ total: 372, objectIDs: firstPage }) }),
+      );
+      const result = await runToolContract(metSearchCollections, {
+        q: 'Rembrandt',
+        matchField: 'artistOrCulture',
+      });
+
+      expect(result.isError).toBeFalsy();
+      const structured = result.structuredContent as {
+        total: number;
+        objectIDs: number[];
+        effectiveQuery: string;
+      };
+      expect(structured.total).toBe(372);
+      expect(structured.objectIDs).toEqual(firstPage);
+      expect(structured.effectiveQuery).toBe('q="Rembrandt", matchField="artistOrCulture"');
+      expect(readMarkdownText(textOf(result))).toContain(
+        'Query: q="Rembrandt", matchField="artistOrCulture"',
+      );
+      expect(textOf(result)).toContain('**Total matches:** 372');
+      expect(searchRequests(fetchMock).map((url) => url.search)).toEqual([
+        '?q=Rembrandt&offset=0&limit=20&artistOrCulture=true',
       ]);
     });
 
@@ -1656,6 +1691,14 @@ describe('MetService', () => {
 
     const OTHER_FILTERS = ['hasImages', 'isHighlight', 'isOnView', 'geoLocation', 'dateBegin'];
 
+    /** The correction each named filter adds after `Correct or drop it, then retry.` (#54, #55). */
+    const MEDIUM_SENTENCE =
+      ' medium takes one object classification, case-sensitive and spelled as the Met spells it ("Paintings", "Prints", "Sculpture"), not a material description or a "|"-joined list; met_get_object returns an object’s classification.';
+    const GEO_LOCATION_SENTENCE =
+      ' geoLocation takes one place, whole and case-sensitive as the Met spells it ("Greece", "Japan"), so "greece" or a fragment such as "Gree" matches nothing.';
+    const DATES_SENTENCE =
+      ' dateBegin/dateEnd keep only objects whose whole date span (objectBeginDate to objectEndDate on met_get_object) lies inside the window, and a "ca." date can be stored as a 20-year span, so widen the window.';
+
     it('an unfiltered miss gets the keyword notice and issues no extra request', async () => {
       fetchMock.mockImplementation(routes({ [SEARCH_PATH]: searchByShape(0, 0) }));
       const result = await runToolContract(metSearchCollections, { q: 'zzzqqqxyz' });
@@ -1670,7 +1713,7 @@ describe('MetService', () => {
       const text = textOf(result);
       expect(text).toContain('> The keyword "zzzqqqxyz" matches no object');
       expect(text).toContain('**Returned IDs:** 0 (complete)');
-      expect(text).toContain('Query: q="zzzqqqxyz"');
+      expect(readMarkdownText(text)).toContain('Query: q="zzzqqqxyz"');
       expect(text).not.toContain('no_results');
     });
 
@@ -1714,11 +1757,9 @@ describe('MetService', () => {
       });
 
       const { notice: hint, effectiveQuery } = zeroOf(result);
-      expect(hint).toContain('matches 178 objects on its own');
-      expect(hint).toContain('so the filter removed every match: medium. Correct or drop it,');
-      expect(hint).toContain('case-sensitive');
-      expect(hint).toContain('classification');
-      expect(hint).toContain('not a material');
+      expect(hint).toBe(
+        `The keyword "sunflower" matches 178 objects on its own, so the filter removed every match: medium. Correct or drop it, then retry.${MEDIUM_SENTENCE}`,
+      );
       for (const other of [...OTHER_FILTERS, 'departmentId']) expect(hint).not.toContain(other);
       expect(effectiveQuery).toBe('q="sunflower", medium="Painting"');
       // Exactly one extra request: q alone, limit 1.
@@ -1731,7 +1772,8 @@ describe('MetService', () => {
       ]);
       const text = textOf(result);
       expect(text).toContain('removed every match: medium.');
-      expect(text).toContain(`> ${hint}`);
+      // The sentence's "|" is escaped in content[], so the line is read back, not matched as bytes.
+      expect(readMarkdownText(text).split('\n')).toContain(hint);
     });
 
     it('names every filter the call set in one hint', async () => {
@@ -1791,6 +1833,95 @@ describe('MetService', () => {
       );
       expect(notice).toContain('case-sensitive');
       expect(effectiveQuery).toBe('q="sunflower", matchField="tags", medium="Painting"');
+    });
+
+    it('names matchField artistOrCulture as a filter, and sends the keyword-only count without it (#53)', async () => {
+      // `q=sunflower&artistOrCulture=true` → 0, 2026-11-04: no artist or culture carries the word.
+      fetchMock.mockImplementation(routes({ [SEARCH_PATH]: searchByShape(0, 178) }));
+      const result = await runToolContract(metSearchCollections, {
+        q: 'sunflower',
+        matchField: 'artistOrCulture',
+      });
+
+      const { notice, effectiveQuery } = zeroOf(result);
+      expect(notice).toBe(
+        'The keyword "sunflower" matches 178 objects on its own, so the filter removed every match: matchField. Correct or drop it, then retry.',
+      );
+      expect(effectiveQuery).toBe('q="sunflower", matchField="artistOrCulture"');
+      const requests = searchRequests(fetchMock);
+      expect(requests.map((url) => url.search)).toEqual([
+        '?q=sunflower&offset=0&limit=20&artistOrCulture=true',
+        '?q=sunflower&offset=0&limit=1',
+      ]);
+    });
+
+    it.each([
+      ['geoLocation', { geoLocation: ['greece'] }, 'geoLocation', GEO_LOCATION_SENTENCE],
+      [
+        'dateBegin/dateEnd window',
+        { dateBegin: 1832, dateEnd: 1832 },
+        'dateBegin/dateEnd',
+        DATES_SENTENCE,
+      ],
+    ])(
+      'a %s that zeroed a matching keyword is named with its correction (#54, #55)',
+      async (_label, filter, name, sentence) => {
+        fetchMock.mockImplementation(routes({ [SEARCH_PATH]: searchByShape(0, 1_330) }));
+        const result = await runToolContract(metSearchCollections, { q: 'vase', ...filter });
+
+        const { notice } = zeroOf(result);
+        expect(notice).toBe(
+          `The keyword "vase" matches 1,330 objects on its own, so the filter removed every match: ${name}. Correct or drop it, then retry.${sentence}`,
+        );
+        expect(notice).not.toContain('classification');
+        expect(readMarkdownText(textOf(result)).split('\n')).toContain(notice);
+      },
+    );
+
+    it.each([
+      [
+        'removed every match',
+        1_330,
+        'The keyword "vase" matches 1,330 objects on its own, so the filters removed every match: medium, geoLocation, dateBegin/dateEnd.',
+      ],
+      [
+        'may have removed every match',
+        'fail',
+        'The filters may have removed every match: medium, geoLocation, dateBegin/dateEnd — whether "vase" matches on its own could not be checked.',
+      ],
+    ] as const)(
+      'orders the per-filter sentences medium, geoLocation, dates on the "%s" lead (#54, #55)',
+      async (_label, keywordTotal, lead) => {
+        fetchMock.mockImplementation(routes({ [SEARCH_PATH]: searchByShape(0, keywordTotal) }));
+        const result = await runToolContract(metSearchCollections, {
+          q: 'vase',
+          medium: 'Painting',
+          geoLocation: ['greece'],
+          dateBegin: 1832,
+          dateEnd: 1832,
+        });
+
+        const { notice } = zeroOf(result);
+        expect(notice).toBe(
+          `${lead} Correct or drop them, then retry.${MEDIUM_SENTENCE}${GEO_LOCATION_SENTENCE}${DATES_SENTENCE}`,
+        );
+        expect(readMarkdownText(textOf(result)).split('\n')).toContain(notice);
+      },
+    );
+
+    it('gives no per-filter sentence when the keyword matches nothing on its own (#54, #55)', async () => {
+      fetchMock.mockImplementation(routes({ [SEARCH_PATH]: searchByShape(0, 0) }));
+      const result = await runToolContract(metSearchCollections, {
+        q: 'zzzqqqxyz',
+        medium: 'Painting',
+        geoLocation: ['greece'],
+        dateBegin: 1832,
+        dateEnd: 1832,
+      });
+
+      expect(zeroOf(result).notice).toBe(
+        'The keyword "zzzqqqxyz" matches no object in the collection, even with no filter applied. Try a different, broader, or differently spelled keyword.',
+      );
     });
 
     it('names the filters used when the keyword-only request fails, and still succeeds', async () => {
@@ -1871,6 +2002,57 @@ describe('MetService', () => {
       expect(result.isError).toBeFalsy();
       expect((result.structuredContent as { total: number }).total).toBe(11);
       expect(searchRequests(fetchMock)).toHaveLength(1);
+    });
+
+    /**
+     * The notice quotes the caller's `q`, and the trailer is Markdown: the
+     * notice render escapes it, so the quote line reads back as exactly the raw
+     * notice `structuredContent` carries (#58).
+     */
+    describe('a Markdown-active q reads back unchanged in the content[] notice (#58)', () => {
+      /** The trailer block, and its read-back: the notice line, then the `Query:` line. */
+      const trailerOf = (result: Awaited<ReturnType<typeof runToolContract>>) => {
+        const { text } = (result.content ?? []).at(-1) as { type: 'text'; text: string };
+        return { text, lines: readMarkdownText(text).split('\n') };
+      };
+
+      it.each([
+        [
+          'emphasis, a link, a code span, an entity, and raw HTML',
+          'zz *emphasis* and _under_ [link](https://example.com) `code` &amp; <b>x</b>',
+          'The keyword "zz *emphasis* and _under_ [link](https://example.com) `code` &amp; <b>x</b>" matches no object in the collection. Try a different, broader, or differently spelled keyword.',
+        ],
+        [
+          'JSON-escaped quotes',
+          'zz "a" said "b"',
+          'The keyword "zz \\"a\\" said \\"b\\"" matches no object in the collection. Try a different, broader, or differently spelled keyword.',
+        ],
+      ])('%s, on an unfiltered miss', async (_label, q, notice) => {
+        fetchMock.mockImplementation(routes({ [SEARCH_PATH]: searchByShape(0, 0) }));
+        const result = await runToolContract(metSearchCollections, { q });
+
+        expect(zeroOf(result).notice).toBe(notice);
+        const trailer = trailerOf(result);
+        expect(trailer.lines).toHaveLength(2);
+        expect(trailer.lines[0]).toBe(notice);
+        expect(trailer.lines[1]).toMatch(/^Query: q=/);
+        // A blank line ends the quote, so the echo is its own block, not a lazy continuation.
+        expect(trailer.text).toContain('\n\nQuery: ');
+      });
+
+      it('emphasis markers, on a filtered miss naming geoLocation', async () => {
+        fetchMock.mockImplementation(routes({ [SEARCH_PATH]: searchByShape(0, 1_330) }));
+        const result = await runToolContract(metSearchCollections, {
+          q: '*vase* _x_',
+          geoLocation: ['greece'],
+        });
+
+        const { notice } = zeroOf(result);
+        expect(notice).toMatch(
+          /^The keyword "\*vase\* _x_" matches 1,330 objects on its own, so the filter removed every match: geoLocation\. Correct or drop it, then retry\./,
+        );
+        expect(trailerOf(result).lines[0]).toBe(notice);
+      });
     });
   });
 
@@ -2795,36 +2977,19 @@ describe('MetService', () => {
         expect(text).not.toContain(portfolio);
       });
 
-      it('counts both keys against the batch byte budget', async () => {
-        /**
-         * Object 1 is padded so that it and 544442 fill the 60,000-byte budget
-         * exactly when 544442's two keys are left out, so 544442 is admitted only
-         * if the keys go uncounted.
-         */
-        const budget = 60_000;
-        const utf8Bytes = (value: unknown) =>
-          new TextEncoder().encode(JSON.stringify(value)).length;
-        const padded = (creditLine: string) => ({ objectID: 1, creditLine });
-        fetchMock.mockImplementation(objectsUpstream(rawObjects.jointReign, padded('')));
-        const sphinx = await getMetService().getObject(544442, ...call());
-        const unpadded = await getMetService().getObject(1, ...call());
-        const { reign: _reign, portfolio: _portfolio, ...sphinxWithoutKeys } = sphinx ?? {};
-        const padding = budget - utf8Bytes(unpadded) - utf8Bytes(sphinxWithoutKeys);
-        fetchMock.mockImplementation(
-          objectsUpstream(rawObjects.jointReign, padded('x'.repeat(padding))),
-        );
+      it('returns 544442 with both keys after a record that alone runs past 60,000 bytes', async () => {
+        const heavy = { objectID: 1, creditLine: 'x'.repeat(60_000) };
+        fetchMock.mockImplementation(objectsUpstream(heavy, rawObjects.jointReign));
 
         const result = await runToolContract(metGetObject, { objectIDs: [1, 544442] });
 
-        const structured = result.structuredContent as GetObjectOutput & {
-          deferred?: { objectID: number; bytes: number }[];
-        };
-        expect(structured.objects.map((o) => o.objectID)).toEqual([1]);
-        expect(structured.deferred).toEqual([{ objectID: 544442, bytes: utf8Bytes(sphinx) }]);
-        expect(JSON.stringify(sphinx)).toContain(
-          '"reign":"Joint reign of Hatshepsut and Thutmose III"',
-        );
-        expect(JSON.stringify(sphinx)).toContain('"portfolio":""');
+        const structured = result.structuredContent as GetObjectOutput;
+        expect(Object.keys(structured)).toEqual(['objects', 'failed']);
+        expect(structured.objects.map((o) => o.objectID)).toEqual([1, 544442]);
+        expect(structured.objects[1]).toMatchObject({
+          reign: 'Joint reign of Hatshepsut and Thutmose III',
+          portfolio: '',
+        });
       });
     });
 

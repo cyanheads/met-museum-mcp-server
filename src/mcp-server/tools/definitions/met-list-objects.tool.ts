@@ -5,11 +5,11 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { pageLimitInput, servePageLimit } from '@/mcp-server/tools/page-limit.js';
 import {
   getMetService,
   METADATA_DATE_FLOOR,
   PAGE_MAX_IDS,
-  SEARCH_RESULT_WINDOW,
   startCallDeadline,
 } from '@/services/met/met-service.js';
 
@@ -94,15 +94,11 @@ export const metListObjects = tool('met_list_objects', {
     ).describe(
       'List only objects whose record was created or revised on or after this date, the day itself included, as YYYY-MM-DD (e.g., "2026-09-01") — no time part and no other date format. It compares the UTC date of each record\'s metadataDate, which met_get_object returns. A date later than the newest update returns an empty list, not an error.',
     ),
-    limit: z
-      .number()
-      .int()
-      .min(1)
-      .max(SEARCH_RESULT_WINDOW)
-      .default(20)
-      .describe(
-        'Maximum number of object IDs to return in this page. A page holds at most 500 IDs: a larger value, up to 10,000, reads a 500-ID page and the notice says so — continue from nextOffset.',
-      ),
+    limit: pageLimitInput((clamped) =>
+      clamped
+        ? 'Maximum number of object IDs to return in this page. A page holds at most 500 IDs: a larger value reads a 500-ID page and the notice says so — continue from nextOffset.'
+        : 'Maximum number of object IDs to return in this page, at most 500; continue from nextOffset.',
+    ),
     offset: z
       .number()
       .int()
@@ -252,7 +248,7 @@ export const metListObjects = tool('met_list_objects', {
       }
     }
 
-    const pageLimit = Math.min(input.limit, PAGE_MAX_IDS);
+    const pageLimit = servePageLimit(input.limit, 'met_list_objects');
 
     ctx.log.info('Met object list', {
       departmentId,

@@ -13,6 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { z } from 'zod';
 import { metListObjects } from '@/mcp-server/tools/definitions/met-list-objects.tool.js';
 import { initMetService } from '@/services/met/met-service.js';
+import { readMarkdownText } from '../helpers/read-markdown-text.js';
 
 const COLLECTION_ORIGIN = 'https://collectionapi.metmuseum.org';
 const OBJECTS_PATH = '/public/collection/v1/objects';
@@ -307,12 +308,14 @@ describe('met_list_objects (#26)', () => {
       expect(page.notice).toBe(notice(600));
     });
 
-    it('accepts the 10,000 ceiling as a 500-ID page', async () => {
-      const page = pageOf(await list({ limit: 10_000 }));
+    it.each([10_001, 40_000])(
+      'reads limit %i as the page limit 500 returns, plus the notice: there is no ceiling (#57)',
+      async (limit) => {
+        const atPage = pageOf(await list({ limit: 500 }));
 
-      expect(page.returned).toBe(500);
-      expect(page.notice).toBe(notice(10_000));
-    });
+        expect(pageOf(await list({ limit }))).toEqual({ ...atPage, notice: notice(limit) });
+      },
+    );
 
     it('a last page shorter than 500 ends paging with no notice: the cap withheld nothing', async () => {
       const page = pageOf(await list({ offset: 11_800, limit: 600 }));
@@ -340,7 +343,7 @@ describe('met_list_objects (#26)', () => {
       expect(page.notice).toBeUndefined();
     });
 
-    it.each([10_001, 0, -1, 1.5, 'abc', true])(
+    it.each([0, -1, 1.5, 'abc', true])(
       'still rejects limit %j at the schema, before any /v1/objects request',
       async (limit) => {
         expect(errorOf(await list({ limit })).code).toBe(JsonRpcErrorCode.InvalidParams);
@@ -348,10 +351,110 @@ describe('met_list_objects (#26)', () => {
       },
     );
 
-    it('states the 500-ID page and the 10,000 ceiling in the limit and notice descriptions', () => {
-      expect(metListObjects.input.shape.limit.description).toContain('500');
-      expect(metListObjects.input.shape.limit.description).toContain('10,000');
+    it('states the 500-ID page, and no ceiling, in the limit and notice descriptions', () => {
+      const { description } = metListObjects.input.shape.limit;
+      expect(description).toContain('a larger value reads a 500-ID page');
+      expect(description).not.toContain('10,000');
       expect(metListObjects.enrichment?.notice?.description).toContain('500');
+    });
+  });
+
+  /**
+   * The wiring of the shared `limit` mechanism, whose full table lives in
+   * tests/tools/page-limit.test.ts. Each case loads the tool fresh
+   * and parses the config as `setup()` does, after import.
+   */
+  describe('MET_CLAMP_LIMITS (#57)', () => {
+    interface CounterAdd {
+      attributes: unknown;
+      name: string;
+      value: number;
+    }
+
+    async function loadTool(clampLimits?: string) {
+      vi.resetModules();
+      if (clampLimits !== undefined) vi.stubEnv('MET_CLAMP_LIMITS', clampLimits);
+      const added: CounterAdd[] = [];
+      vi.doMock('@cyanheads/mcp-ts-core/utils', async (importOriginal) => ({
+        ...(await importOriginal<typeof import('@cyanheads/mcp-ts-core/utils')>()),
+        createCounter: (name: string) => ({
+          add: (value: number, attributes: unknown) => added.push({ name, value, attributes }),
+        }),
+      }));
+      const { metListObjects: tool } = await import(
+        '@/mcp-server/tools/definitions/met-list-objects.tool.js'
+      );
+      const service = await import('@/services/met/met-service.js');
+      service.initMetService({} as AppConfig, createInMemoryStorage());
+      return {
+        added,
+        advertisedLimit: () =>
+          (
+            tool.input['~standard'].jsonSchema.input({ target: 'draft-2020-12' })
+              .properties as Record<string, unknown>
+          ).limit,
+        call: (args: Record<string, unknown>) =>
+          runToolContract(tool, args as unknown as z.input<typeof tool.input>),
+      };
+    }
+
+    beforeEach(() => {
+      const ids = Array.from({ length: 12_000 }, (_, i) => 12_000 - i);
+      fetchMock.mockImplementation(() =>
+        Promise.resolve(jsonResponse({ total: ids.length, objectIDs: ids })),
+      );
+    });
+
+    afterEach(() => {
+      vi.doUnmock('@cyanheads/mcp-ts-core/utils');
+      vi.unstubAllEnvs();
+    });
+
+    it('advertises limit with no maximum by default', async () => {
+      const { advertisedLimit } = await loadTool();
+
+      expect(advertisedLimit()).toEqual({
+        type: 'integer',
+        minimum: 1,
+        default: 20,
+        description: expect.stringContaining('a larger value reads a 500-ID page'),
+      });
+    });
+
+    it('counts a call served at a clamped limit on met.limit.clamped for met_list_objects, and none at 500', async () => {
+      const { added, call } = await loadTool();
+
+      expect(pageOf(await call({ limit: 500 })).returned).toBe(500);
+      expect(added).toEqual([]);
+
+      expect(pageOf(await call({ limit: 10_001 })).returned).toBe(500);
+      expect(added).toEqual([
+        {
+          name: 'met.limit.clamped',
+          value: 1,
+          attributes: { 'mcp.tool.name': 'met_list_objects' },
+        },
+      ]);
+    });
+
+    it('with MET_CLAMP_LIMITS=false advertises maximum 500 and rejects limit 501 before any /v1/objects request', async () => {
+      const { added, advertisedLimit, call } = await loadTool('false');
+
+      expect(advertisedLimit()).toEqual({
+        type: 'integer',
+        minimum: 1,
+        maximum: 500,
+        default: 20,
+        description:
+          'Maximum number of object IDs to return in this page, at most 500; continue from nextOffset.',
+      });
+      const rejected = errorOf(await call({ limit: 501 }));
+      expect(rejected.code).toBe(JsonRpcErrorCode.InvalidParams);
+      expect(rejected.message).toContain('limit: Too big: expected number to be <=500');
+      expect(objectsRequests()).toHaveLength(0);
+
+      expect(pageOf(await call({ limit: 500 })).returned).toBe(500);
+      expect(added).toEqual([]);
     });
   });
 
@@ -617,11 +720,11 @@ describe('met_list_objects (#26)', () => {
   });
 
   describe('effectiveQuery (#44)', () => {
-    /** The echo on both surfaces: `structuredContent` and the `content[]` trailer. */
+    /** The echo on both surfaces: `structuredContent` and the `content[]` trailer as a client reads it. */
     async function expectEcho(args: Record<string, unknown>, echo: string) {
       const result = await list(args);
       expect(pageOf(result).effectiveQuery).toBe(echo);
-      expect(textOf(result)).toContain(`Query: ${echo}`);
+      expect(readMarkdownText(textOf(result))).toContain(`Query: ${echo}`);
       return result;
     }
 

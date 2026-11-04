@@ -40,18 +40,45 @@ const ServerConfigSchema = z.object({
     .max(20)
     .default(5)
     .describe('Max parallel fetches in met_get_object.'),
+  clampLimits: z
+    .stringbool()
+    .default(true)
+    .describe(
+      'Reads a limit above the 500-ID page on met_search_collections and met_list_objects as a 500-ID page, with a notice to continue from nextOffset, instead of rejecting it. False advertises and enforces 500 as the schema maximum.',
+    ),
 });
 
 export type ServerConfig = z.infer<typeof ServerConfigSchema>;
 
+/** Every field at its default: the config before `setup()` parses the environment. */
+const SCHEMA_DEFAULTS: ServerConfig = ServerConfigSchema.parse({});
+
 let _config: ServerConfig | undefined;
 
+/**
+ * The server config, parsed from the environment once. `setup()` reaches it
+ * first, through `initMetService()`, after `createApp()` has loaded `.env`, so
+ * an invalid value stops startup with the banner naming the variable. Never
+ * call it at module import: a `ConfigurationError` thrown there exits on a raw
+ * stack trace, and under Node `.env` is not loaded yet.
+ */
 export function getServerConfig(): ServerConfig {
   _config ??= parseEnvConfig(ServerConfigSchema, {
     baseUrl: 'MET_BASE_URL',
     requestTimeoutMs: 'MET_REQUEST_TIMEOUT_MS',
     callDeadlineMs: 'MET_CALL_DEADLINE_MS',
     batchConcurrency: 'MET_BATCH_CONCURRENCY',
+    clampLimits: 'MET_CLAMP_LIMITS',
   });
   return _config;
+}
+
+/**
+ * The config an input schema reads when it validates or is emitted: what
+ * `getServerConfig()` parsed, or the schema defaults before it runs. Never
+ * parses the environment, since `tool()` emits every input schema when its
+ * definition module is imported.
+ */
+export function activeServerConfig(): ServerConfig {
+  return _config ?? SCHEMA_DEFAULTS;
 }

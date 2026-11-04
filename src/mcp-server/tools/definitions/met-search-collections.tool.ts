@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { pageLimitInput, servePageLimit } from '@/mcp-server/tools/page-limit.js';
 import {
   getMetService,
   PAGE_MAX_IDS,
@@ -12,6 +13,7 @@ import {
   type SearchInput,
   startCallDeadline,
 } from '@/services/met/met-service.js';
+import { escapeMarkdownInlineLinear } from '@/utils/markdown.js';
 
 /** Thousands-separated, so the window and a large total read alike in prose. */
 const count = (n: number) => n.toLocaleString('en-US');
@@ -38,9 +40,11 @@ function filtersUsed(input: Omit<SearchInput, 'q' | 'limit' | 'offset'>): string
  * clears it. `keywordMatches` is the keyword's match count with no filter
  * applied: `0` means the keyword is the problem and no filter is named; a
  * positive count means the filters removed every match; `null` means that check
- * failed, so every filter is named because the caller did set them. The keyword
- * is JSON-encoded, as in `effectiveQuery`, so a newline or quote in it cannot end
- * the notice's line — the trailer renders the notice as a block quote.
+ * failed, so every filter is named because the caller did set them, and
+ * `medium`, `geoLocation`, and the date window each add how to correct them.
+ * The keyword is JSON-encoded, as in `effectiveQuery`, so a newline or quote in
+ * it cannot end the notice's line; the notice's trailer render escapes it for
+ * `content[]`, and `structuredContent` carries it raw.
  */
 function zeroMatchNotice(q: string, filters: string[], keywordMatches: number | null): string {
   const keyword = JSON.stringify(q);
@@ -56,9 +60,15 @@ function zeroMatchNotice(q: string, filters: string[], keywordMatches: number | 
       ? `The ${noun} may have removed every match: ${list} — whether ${keyword} matches on its own could not be checked.`
       : `The keyword ${keyword} matches ${count(keywordMatches)} object${keywordMatches === 1 ? '' : 's'} on its own, so the ${noun} removed every match: ${list}.`;
   const medium = filters.includes('medium')
-    ? ' medium takes an object classification, case-sensitive and spelled as the Met spells it ("Paintings", "Prints", "Sculpture"), not a material description; met_get_object returns an object’s classification.'
+    ? ' medium takes one object classification, case-sensitive and spelled as the Met spells it ("Paintings", "Prints", "Sculpture"), not a material description or a "|"-joined list; met_get_object returns an object’s classification.'
     : '';
-  return `${lead} Correct or drop ${one ? 'it' : 'them'}, then retry.${medium}`;
+  const geoLocation = filters.includes('geoLocation')
+    ? ' geoLocation takes one place, whole and case-sensitive as the Met spells it ("Greece", "Japan"), so "greece" or a fragment such as "Gree" matches nothing.'
+    : '';
+  const dates = filters.includes('dateBegin/dateEnd')
+    ? ' dateBegin/dateEnd keep only objects whose whole date span (objectBeginDate to objectEndDate on met_get_object) lies inside the window, and a "ca." date can be stored as a 20-year span, so widen the window.'
+    : '';
+  return `${lead} Correct or drop ${one ? 'it' : 'them'}, then retry.${medium}${geoLocation}${dates}`;
 }
 
 /**
@@ -100,7 +110,7 @@ function describeQuery({ limit: _limit, offset: _offset, ...applied }: SearchInp
 export const metSearchCollections = tool('met_search_collections', {
   title: 'Search Met Collection',
   description:
-    'Search the Metropolitan Museum of Art collection by keyword and optional filters. Returns the total match count and one page of matching object IDs, which met_get_object resolves to full records. Relevance is keyword-based, not semantic; department and geographic filters narrow results more than a longer query. Paging reaches only the first 10,000 matches of any search, so narrow a larger one with filters. The medium parameter takes an object classification as the Met spells it ("Paintings", "Sculpture"), not a material like "Oil on canvas". hasImages also includes copyrighted works; CC0 status is per object, from the isPublicDomain and hasCC0Image fields on met_get_object. isHighlight accepts true only. isOnView restricts results to works currently on display in a Met gallery.',
+    'Search the Metropolitan Museum of Art collection by keyword and optional filters. Returns the total match count and one page of matching object IDs, which met_get_object resolves to full records. Relevance is keyword-based, not semantic; department and geographic filters narrow results more than a longer query. Paging reaches only the first 10,000 matches of any search, so narrow a larger one with filters. The medium parameter takes one object classification as the Met spells it ("Paintings", "Sculpture"), not a material like "Oil on canvas". hasImages also includes copyrighted works; CC0 status is per object, from the isPublicDomain and hasCC0Image fields on met_get_object. isHighlight accepts true only. isOnView restricts results to works currently on display in a Met gallery.',
   annotations: { readOnlyHint: true, idempotentHint: true },
   /**
    * `q` is the Met API's own parameter name, kept so the tool reads like the
@@ -114,13 +124,13 @@ export const metSearchCollections = tool('met_search_collections', {
       .string()
       .min(1)
       .describe(
-        'Keyword query, matched across title, artist name, culture, medium, tags, and other text fields; matchField narrows the match to titles or tags. Broad terms return large ID sets. "*" matches every object, for a search narrowed by filters alone; paging still reaches only the first 10,000 matches. An accession number (e.g., "29.100.5") ranks its object first, with near-numbered objects after it — confirm the match from accessionNumber on met_get_object.',
+        'Keyword query, matched across title, artist name, culture, medium, tags, and other text fields; matchField narrows the match to titles, tags, or artists and cultures. Broad terms return large ID sets. "*" matches every object, for a search narrowed by filters alone; paging still reaches only the first 10,000 matches. An accession number (e.g., "29.100.5") ranks its object first, with near-numbered objects after it — confirm the match from accessionNumber on met_get_object.',
       ),
     matchField: z
-      .enum(['title', 'tags'])
+      .enum(['title', 'tags', 'artistOrCulture'])
       .optional()
       .describe(
-        'Restrict the keyword match to one field: "title" matches object titles only, "tags" matches subject tags only. Omit it to match across all text fields. Combines with every filter. Has no effect when q is "*".',
+        'Restrict the keyword match to one field: "title" matches object titles only, "tags" matches subject tags only, "artistOrCulture" matches the artist an object is attributed to (artistDisplayName on met_get_object) or its culture. A qualified attribution such as "Style of" matches too, so read artistPrefix on met_get_object; another person on the record, such as a sitter, does not. Omit it to match across all text fields. Combines with every filter. Has no effect when q is "*".',
       ),
     hasImages: z
       .boolean()
@@ -146,7 +156,7 @@ export const metSearchCollections = tool('met_search_collections', {
       .string()
       .optional()
       .describe(
-        'Filter by object classification, case-sensitive and spelled as the Met spells it (e.g., "Paintings", "Drawings", "Prints", "Ceramics", "Sculpture", "Photographs", "Textiles") — "paintings" or "Painting" matches nothing. Maps to the classification field on the object, not the materials text, so a material description like "Oil on canvas" matches nothing either; met_get_object returns an object’s classification.',
+        'Filter by one object classification, case-sensitive and spelled as the Met spells it (e.g., "Paintings", "Drawings", "Prints", "Ceramics", "Sculpture", "Photographs", "Textiles") — "paintings" or "Painting" matches nothing. Maps to the classification field on the object, not the materials text, so a material description like "Oil on canvas" matches nothing either, and neither does a "|"-joined list ("Prints|Paintings"); met_get_object returns an object’s classification.',
       ),
     departmentId: z
       .number()
@@ -158,7 +168,9 @@ export const metSearchCollections = tool('met_search_collections', {
       ),
     geoLocation: z
       .array(
-        z.string().describe('A country, region, or city (e.g., "France", "Egypt", "New York").'),
+        z
+          .string()
+          .describe('One place, spelled and capitalized as the Met spells it (e.g., "Greece").'),
       )
       .max(1, {
         error:
@@ -166,31 +178,27 @@ export const metSearchCollections = tool('met_search_collections', {
       })
       .optional()
       .describe(
-        'Filter by geographic origin: one country, region, or city, as a one-element array (e.g., ["France"]). The value is matched broadly against geography fields and artist nationality. Works best with the Egyptian Art, Greek and Roman Art, and similar departments that have well-populated geography fields.',
+        'Filter by geographic origin: one place, whole and case-sensitive as the Met spells it, as a one-element array (e.g., ["Greece"], ["Japan"]). A different case ("greece"), a fragment ("Gree"), or a "|"-joined list matches nothing, and an adjective such as "Japanese" matches nothing either. A matching record may show the place in none of its fields.',
       ),
     dateBegin: z
       .number()
       .int()
       .optional()
       .describe(
-        'Earliest object date (year, inclusive). Negative integers for BCE (e.g., -500 for 500 BCE). Requires dateEnd.',
+        'First year of the date window, inclusive. Negative integers for BCE (e.g., -500 for 500 BCE). Requires dateEnd. The window keeps only objects whose whole date span (objectBeginDate to objectEndDate on met_get_object) lies inside it, so a span crossing either bound is excluded: a "ca." date can be stored as a 20-year span, so widen the window around a displayed year. A window spanning year 0 also matches undated records, whose dates read null on met_get_object.',
       ),
     dateEnd: z
       .number()
       .int()
       .optional()
       .describe(
-        'Latest object date (year, inclusive). Negative integers for BCE. Requires dateBegin.',
+        'Last year of the date window, inclusive. Negative integers for BCE. Requires dateBegin. The window keeps only objects whose whole date span (objectBeginDate to objectEndDate on met_get_object) lies inside it, so a span crossing either bound is excluded: a "ca." date can be stored as a 20-year span. A window spanning year 0 also matches undated records, whose dates read null on met_get_object.',
       ),
-    limit: z
-      .number()
-      .int()
-      .min(1)
-      .max(SEARCH_RESULT_WINDOW)
-      .default(20)
-      .describe(
-        'Maximum number of object IDs to return in this page. A page holds at most 500 IDs, the Met search maximum: a larger value, up to 10,000, reads a 500-ID page and the notice says so — continue from nextOffset. Paging reaches only the first 10,000 matches, so a page that would cross 10,000 is cut short there.',
-      ),
+    limit: pageLimitInput((clamped) =>
+      clamped
+        ? 'Maximum number of object IDs to return in this page. A page holds at most 500 IDs, the Met search maximum: a larger value reads a 500-ID page and the notice says so — continue from nextOffset. Paging reaches only the first 10,000 matches, so a page that would cross 10,000 is cut short there.'
+        : 'Maximum number of object IDs to return in this page, at most 500, the Met search maximum; continue from nextOffset. Paging reaches only the first 10,000 matches, so a page that would cross 10,000 is cut short there.',
+    ),
     offset: z
       .number()
       .int()
@@ -251,6 +259,23 @@ export const metSearchCollections = tool('met_search_collections', {
       .describe(
         'The search as applied: q and each filter set, as name=value pairs with JSON-encoded values in parameter order, without limit or offset.',
       ),
+  },
+  /**
+   * The notice quotes the caller's `q`, and the trailer is Markdown, so the
+   * whole notice is escaped there and reads back exactly as `structuredContent`
+   * carries it, the server's own sentences included. A render replaces the
+   * built-in block quote, so it quotes each line itself; the quote's last line
+   * still keeps the `Query:` echo out of it.
+   */
+  enrichmentTrailer: {
+    notice: {
+      render(notice: string) {
+        return escapeMarkdownInlineLinear(notice)
+          .split('\n')
+          .map((line) => `> ${line}`)
+          .join('\n');
+      },
+    },
   },
   /**
    * Severity separates the modeled outcomes from the incidents. A filter the
@@ -385,7 +410,7 @@ export const metSearchCollections = tool('met_search_collections', {
     }
 
     // Upstream reads a larger limit as 500 without saying so: send 500 and disclose the cut.
-    const pageLimit = Math.min(input.limit, PAGE_MAX_IDS);
+    const pageLimit = servePageLimit(input.limit, 'met_search_collections');
 
     ctx.log.info('Met search', {
       q: input.q,

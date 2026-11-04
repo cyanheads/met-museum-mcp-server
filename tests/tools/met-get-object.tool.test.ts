@@ -13,7 +13,7 @@ import {
   runToolContract,
 } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { z } from 'zod';
+import { z } from 'zod';
 import { metGetObject } from '@/mcp-server/tools/definitions/met-get-object.tool.js';
 import { escapeMarkdown } from '@/utils/markdown.js';
 
@@ -211,8 +211,8 @@ function mockCompletionInReverseOrder(ids: number[], notFound = new Set<number>(
   });
 }
 
-/** The budget the tool applies, mirrored here so the arithmetic is explicit. */
-const BUDGET = 60_000;
+/** `n` sequential IDs from `first`. */
+const ids = (first: number, n: number) => Array.from({ length: n }, (_, i) => first + i);
 
 const utf8Bytes = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).length;
 
@@ -617,6 +617,26 @@ describe('metGetObject', () => {
         false,
       );
     });
+
+    /**
+     * The search's artistOrCulture match reads the lead attribution and the
+     * culture field, not every constituent (#53): 742412 lists Rembrandt as its
+     * Sitter and is not matched, while 240180 — no artist, culture "Greek,
+     * Attic" — is the first match for q "Attic".
+     */
+    it('points artistDisplayName, and no constituent field, at the artistOrCulture search match', () => {
+      const record = metGetObject.output.shape.objects.element.shape;
+      const constituent = record.constituents.unwrap().element.shape;
+
+      expect(record.artistDisplayName.description).toContain(
+        'met_search_collections with matchField "artistOrCulture"',
+      );
+      expect(record.artistDisplayName.description).toContain(
+        'reads the lead attribution and the culture field',
+      );
+      expect(constituent.name.description).not.toContain('artistOrCulture');
+      expect(constituent.constituentID.description).not.toContain('cross-referencing');
+    });
   });
 
   describe('rights, metadata date, and accession year (#41)', () => {
@@ -807,177 +827,128 @@ describe('metGetObject', () => {
     });
   });
 
-  describe('batch byte budget (#15)', () => {
-    it('returns every record and discloses nothing when the batch fits', async () => {
-      const { result, enrichment } = await run([sizedRecord(1, 5_000), sizedRecord(2, 5_000)]);
+  /**
+   * Every record fetched among the first 20 distinct IDs comes back whole. The
+   * 20-ID cap is what bounds the response; nothing withholds a record that was
+   * already fetched.
+   */
+  describe('every fetched record is returned (#56)', () => {
+    /**
+     * The normalized size of each record on the page met_search_collections
+     * returns for `{ q: "Group of Stereograph Views", matchField: "title",
+     * departmentId: 19 }` (2026-11-04), in request order — 66,518 bytes together.
+     */
+    const stereographPage: [objectID: number, bytes: number][] = [
+      [288117, 2_644],
+      [288118, 6_980],
+      [288134, 3_075],
+      [288137, 2_826],
+      [288139, 3_533],
+      [288152, 3_168],
+      [288269, 2_595],
+      [288294, 1_999],
+      [288296, 4_016],
+      [288302, 4_138],
+      [288308, 2_735],
+      [288325, 3_655],
+      [288151, 5_515],
+      [288143, 3_636],
+      [288146, 2_649],
+      [288226, 2_494],
+      [288243, 2_376],
+      [288248, 2_468],
+      [288249, 2_602],
+      [288264, 3_414],
+    ];
 
-      expect(result.objects).toHaveLength(2);
-      // A fitting batch is what it was before the budget existed: no disclosure
-      // field appears at all on either surface — absent, not empty.
-      expect(result.deferred).toBeUndefined();
-      expect(enrichment.notice).toBeUndefined();
-      expect((metGetObject.format!(result)[0] as { text: string }).text).not.toContain('Deferred');
-    });
-
-    it('defers whole records once the cumulative budget is spent', async () => {
-      // 3 × 20,000 lands exactly on the budget; the fourth cannot fit.
-      const { result } = await run([
-        sizedRecord(1, 20_000),
-        sizedRecord(2, 20_000),
-        sizedRecord(3, 20_000),
-        sizedRecord(4, 20_000),
-      ]);
-
-      expect(result.objects.map((o) => o.objectID)).toEqual([1, 2, 3]);
-      expect(result.deferred?.map((d) => d.objectID)).toEqual([4]);
-      // Every returned record is whole — a deferral never splits one.
-      expect(result.objects.every((o) => o.title === sampleRecord.title)).toBe(true);
-    });
-
-    it('delivers a response larger than the budget, since content[] repeats the records', async () => {
-      mockRecords([sizedRecord(1, 50_000), sizedRecord(2, 30_000)]);
-      const called = await runToolContract(metGetObject, { objectIDs: [1, 2] });
-
-      const structuredBytes = utf8Bytes(called.structuredContent);
-      const contentBytes = utf8Bytes(called.content);
-      const admittedBytes = (
-        called.structuredContent as { objects: unknown[] }
-      ).objects.reduce<number>((sum, o) => sum + utf8Bytes(o), 0);
-
-      // What the budget actually bounds: the admitted records, serialized.
-      expect(admittedBytes).toBeLessThanOrEqual(BUDGET);
-      // content[] renders those same records again, on the same order of
-      // magnitude, so what reaches the wire is roughly twice the budget — which
-      // is why the notice must not present the budget as a response-size cap.
-      expect(contentBytes).toBeGreaterThan(admittedBytes / 2);
-      expect(structuredBytes + contentBytes).toBeGreaterThan(BUDGET);
-    });
-
-    it('names the surface the budget measures, and that the response is larger', async () => {
-      const { enrichment } = await run([sizedRecord(1, 50_000), sizedRecord(2, 30_000)]);
-
-      expect(enrichment.notice).toContain('structuredContent');
-      expect(enrichment.notice).toContain('content[]');
-      // An unqualified "60000-byte batch budget" reads as a bound on the response
-      // an agent is about to receive, which is roughly double that.
-      expect(enrichment.notice).not.toMatch(/60000-byte batch budget/);
-    });
-
-    it('reports each deferred record’s size so a follow-up batch can be sized', async () => {
-      const { result, enrichment } = await run([sizedRecord(1, 50_000), sizedRecord(2, 30_000)]);
-
-      expect(result.deferred).toEqual([{ objectID: 2, bytes: 30_000 }]);
-      expect(enrichment.notice).toContain('60000-byte budget measured on that surface alone');
-      expect(enrichment.notice).toContain('Returned 1 of 2 fetched records');
-    });
-
-    it('admits the first record unconditionally even when it alone exceeds the budget', async () => {
-      // Without the unconditional first admission this ID is unreachable: every
-      // call that requests it would defer it forever.
-      const { result } = await run([sizedRecord(1, BUDGET + 20_000), sizedRecord(2, 1_000)]);
-
-      expect(result.objects.map((o) => o.objectID)).toEqual([1]);
-      expect(result.deferred?.map((d) => d.objectID)).toEqual([2]);
-    });
-
-    it('partitions every requested ID across objects, failed, and deferred exactly once', async () => {
-      // Real multi-digit Met IDs: a single-digit fixture makes the union comparison
-      // below pass under a lexicographic sort, which would not hold for real input.
-      // 11207 and 45734 are interleaved 404s; 548211 overflows and 544683 follows
-      // it into deferred.
-      const requested = [437980, 11207, 548211, 544683, 45734];
-      const { result: mixed } = await run(
-        [sizedRecord(437980, 30_000), sizedRecord(548211, 40_000), sizedRecord(544683, 2_000)],
-        requested,
+    it('returns the 20-record stereograph page whole and in request order, with no deferred key or notice on either surface', async () => {
+      const ids = stereographPage.map(([objectID]) => objectID);
+      const byId = new Map(
+        stereographPage.map(([objectID, bytes]) => [objectID, sizedRecord(objectID, bytes)]),
       );
-
-      const returned = mixed.objects.map((o) => o.objectID);
-      const failed = mixed.failed.map((f) => f.objectID);
-      const deferred = mixed.deferred?.map((d) => d.objectID) ?? [];
-
-      expect(returned).toEqual([437980]);
-      expect(failed).toEqual([11207, 45734]);
-      expect(deferred).toEqual([548211, 544683]);
-
-      const union = [...returned, ...failed, ...deferred];
-      expect([...union].sort(byNumber)).toEqual([...requested].sort(byNumber));
-      // Exactly once, not merely all-present: a duplicated ID would still satisfy
-      // a membership check while breaking the partition.
-      expect(new Set(union).size).toBe(union.length);
-    });
-
-    it('spends the budget in request order when fetches complete out of order', async () => {
-      // The budget cases above mock a synchronous service, so they resolve in input
-      // order no matter how the handler assembles its results — a completion-ordered
-      // handler would pass them and still return a scattered set. Here the first
-      // input ID resolves last, which is what makes "objects[] is a prefix of the
-      // successes in request order" a real assertion rather than a restatement.
-      const ids = [104, 100, 106, 102, 108];
-      const byId = new Map(ids.map((id) => [id, sizedRecord(id, 25_000)]));
+      // The first ID resolves last, so request order is the handler's doing:
+      // a synchronous mock would resolve in input order whatever it assembled.
       mockGetObject.mockImplementation(
         (objectID: number) =>
           new Promise((resolve) =>
             setTimeout(() => resolve(byId.get(objectID)), (ids.length - ids.indexOf(objectID)) * 5),
           ),
       );
+      const called = await runToolContract(metGetObject, { objectIDs: ids });
 
-      const ctx = createMockContext({ errors: metGetObject.errors });
-      const result = await metGetObject.handler(metGetObject.input.parse({ objectIDs: ids }), ctx);
+      const structured = called.structuredContent as { objects: RecordOutput[] };
+      expect(Object.keys(structured)).toEqual(['objects', 'failed']);
+      expect(structured.objects.map((o) => o.objectID)).toEqual(ids);
+      // Whole records: each arrives at the size it was fetched at.
+      expect(structured.objects.map((o) => utf8Bytes(o))).toEqual(
+        stereographPage.map(([, bytes]) => bytes),
+      );
 
-      // 2 × 25,000 fits; a third would not. Completion order was [108, 102, 106, 100, 104].
-      expect(result.objects.map((o) => o.objectID)).toEqual([104, 100]);
-      expect(result.deferred?.map((d) => d.objectID)).toEqual([106, 102, 108]);
+      // content[] is the record text alone — no notice trailer, no deferred section.
+      expect(called.content).toHaveLength(1);
+      const text = contentText(called);
+      expect(text).not.toContain('Deferred');
+      expect([...text.matchAll(/— Object (\d+)$/gm)].map((m) => Number(m[1]))).toEqual(ids);
     });
 
-    it('bounds a heavy 20-ID batch, in request order, under the budget', async () => {
-      // The reported defect's shape: twenty records each far heavier than typical.
-      const records = Array.from({ length: 20 }, (_, i) => sizedRecord(i + 1, 5_000));
-      const { result } = await run(records);
+    it('returns two 50,000-byte records whole', async () => {
+      const { result, enrichment } = await run([sizedRecord(1, 50_000), sizedRecord(2, 50_000)]);
 
-      expect(result.objects.map((o) => o.objectID)).toEqual([
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+      expect(result).not.toHaveProperty('deferred');
+      expect(enrichment.notice).toBeUndefined();
+      const { objects } = metGetObject.output.parse(result);
+      expect(objects.map((o) => o.objectID)).toEqual([1, 2]);
+      expect(objects.map((o) => utf8Bytes(o))).toEqual([50_000, 50_000]);
+    });
+
+    it('returns a record larger than 60,000 bytes along with the records after it', async () => {
+      const { result } = await run([sizedRecord(1, 80_000), sizedRecord(2, 5_000)]);
+
+      expect(result.objects.map((o) => o.objectID)).toEqual([1, 2]);
+      expect(result).not.toHaveProperty('deferred');
+    });
+
+    it('partitions every distinct requested ID across objects, failed, and remainingIDs exactly once', async () => {
+      // Four-digit IDs: a single-digit fixture makes the union comparison below
+      // pass under a lexicographic sort, which would not hold for real input.
+      // 1003 and 1010 are unmocked 404s inside the first 20; 1001 and 1002 are
+      // heavy enough to total well past 60,000 bytes; 1005 repeats; 1021 and
+      // 1022 sit past the cap.
+      const requested = [...ids(1001, 22), 1005];
+      const { result } = await run(
+        [
+          sizedRecord(1001, 30_000),
+          sizedRecord(1002, 40_000),
+          ...ids(1004, 6).map((id) => sizedRecord(id, 5_000)),
+          ...ids(1011, 12).map((id) => sizedRecord(id, 5_000)),
+        ],
+        requested,
+      );
+
+      const returned = result.objects.map((o) => o.objectID);
+      const failed = result.failed.map((f) => f.objectID);
+      const remaining = result.remainingIDs ?? [];
+
+      expect(returned).toEqual(ids(1001, 20).filter((id) => id !== 1003 && id !== 1010));
+      expect(failed).toEqual([1003, 1010]);
+      expect(remaining).toEqual([1021, 1022]);
+
+      const union = [...returned, ...failed, ...remaining];
+      expect([...union].sort(byNumber)).toEqual([...new Set(requested)].sort(byNumber));
+      // Exactly once, not merely all-present: a duplicated ID would still satisfy
+      // a membership check while breaking the partition.
+      expect(new Set(union).size).toBe(union.length);
+    });
+
+    it('declares no deferred field on the output schema tools/list advertises', () => {
+      expect(Object.keys(z.toJSONSchema(metGetObject.output).properties ?? {})).toEqual([
+        'objects',
+        'failed',
+        'remainingIDs',
+        'images',
       ]);
-      expect(result.deferred?.map((d) => d.objectID)).toEqual([13, 14, 15, 16, 17, 18, 19, 20]);
-      // The invariant the handler enforces: the sum of the admitted records fits,
-      // and one more would have broken it.
-      const admitted = result.objects.reduce((sum, o) => sum + utf8Bytes(o), 0);
-      expect(admitted).toBeLessThanOrEqual(BUDGET);
-      expect(admitted + (result.deferred?.[0]?.bytes ?? 0)).toBeGreaterThan(BUDGET);
-    });
-
-    it('leaves a sparse batch of many records entirely untouched', async () => {
-      const records = Array.from({ length: 20 }, (_, i) => ({ ...sparseRecord, objectID: i + 1 }));
-      const { result } = await run(records);
-
-      expect(result.objects).toHaveLength(20);
-      expect(result.deferred).toBeUndefined();
-    });
-
-    it('discloses the same budget outcome on both client surfaces', async () => {
-      // Driven through the real contract boundary so structuredContent and
-      // content[] are the ones a client would actually receive — enrichment
-      // included, which format() never renders itself.
-      mockRecords([sizedRecord(1, 50_000), sizedRecord(2, 30_000)]);
-      const called = await runToolContract(metGetObject, { objectIDs: [1, 2] });
-
-      const structured = called.structuredContent as {
-        objects: { objectID: number }[];
-        deferred?: { objectID: number; bytes: number }[];
-        notice?: string;
-      };
-      const text = called.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
-
-      expect(structured.objects.map((o) => o.objectID)).toEqual([1]);
-      expect(structured.deferred).toEqual([{ objectID: 2, bytes: 30_000 }]);
-      expect(structured.notice).toContain('Returned 1 of 2 fetched records');
-
-      // The same outcome, in the markdown twin — including the caveat that the
-      // budget bounds structuredContent, not the response the caller receives.
-      expect(text).toContain('## Deferred — batch byte budget');
-      expect(text).toContain('- **2:** 30000 bytes');
-      expect(text).toContain('Returned 1 of 2 fetched records');
-      expect(text).toContain('the delivered response is roughly twice that');
-      expect(structured.notice).toContain('the delivered response is roughly twice that');
+      // tools/list advertises the output schema merged with the enrichment fields.
+      expect(Object.keys(metGetObject.enrichment ?? {})).toEqual(['notice']);
     });
   });
 
@@ -986,29 +957,34 @@ describe('metGetObject', () => {
       const { result } = await run([sizedRecord(437980, 5_000)], [437980, 437980]);
 
       expect(result.objects.map((o) => o.objectID)).toEqual([437980]);
-      expect(result.deferred).toBeUndefined();
+      expect(result.failed).toEqual([]);
       expect(mockGetObject).toHaveBeenCalledTimes(1);
     });
 
-    it('never lists a repeated ID in both objects[] and deferred[]', async () => {
-      // One ID heavy enough to spend the budget, requested twice: the second
-      // occurrence overflows and the caller is told to re-request a record it
-      // already received, breaking the returned/failed/deferred partition.
-      const { result } = await run([sizedRecord(437980, 50_000)], [437980, 437980]);
+    it('never lists a repeated ID in both objects[] and failed[]', async () => {
+      // Fetched twice, a repeat whose second request fails would land in both
+      // arrays, breaking the objects/failed/remainingIDs partition.
+      mockGetObject
+        .mockResolvedValueOnce(sizedRecord(437980, 50_000))
+        .mockRejectedValue(new Error('network error'));
+      const ctx = createMockContext({ errors: metGetObject.errors });
+      const result = await metGetObject.handler(
+        metGetObject.input.parse({ objectIDs: [437980, 437980] }),
+        ctx,
+      );
 
       expect(result.objects.map((o) => o.objectID)).toEqual([437980]);
-      expect(result.deferred).toBeUndefined();
+      expect(result.failed).toEqual([]);
     });
 
-    it('does not let a repeat spend the budget twice and displace a distinct record', async () => {
+    it('fetches a heavy repeated ID once beside a distinct record', async () => {
       const { result } = await run(
         [sizedRecord(437980, 50_000), sizedRecord(548211, 5_000)],
         [437980, 437980, 548211],
       );
 
-      // 50,000 + 5,000 fits the budget; charging 437980 twice would defer 548211.
       expect(result.objects.map((o) => o.objectID)).toEqual([437980, 548211]);
-      expect(result.deferred).toBeUndefined();
+      expect(mockGetObject).toHaveBeenCalledTimes(2);
     });
 
     it('collapses an all-duplicate call to one fetch and one record', async () => {
@@ -1056,7 +1032,7 @@ describe('metGetObject', () => {
 
       expect(result.objects.map((o) => o.objectID)).toEqual([437980, 548211]);
       expect(result.failed).toEqual([]);
-      expect(result.deferred).toBeUndefined();
+      expect(Object.keys(result)).toEqual(['objects', 'failed']);
       expect(enrichment.notice).toBeUndefined();
       expect(mockGetObject).toHaveBeenCalledTimes(2);
     });
@@ -1065,21 +1041,17 @@ describe('metGetObject', () => {
       mockRecords([sizedRecord(437980, 5_000)]);
       const called = await runToolContract(metGetObject, { objectIDs: [437980, 437980] });
 
-      const structured = called.structuredContent as {
-        objects: { objectID: number }[];
-        deferred?: { objectID: number }[];
-      };
+      const structured = called.structuredContent as { objects: { objectID: number }[] };
       const text = called.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
 
       expect(structured.objects.map((o) => o.objectID)).toEqual([437980]);
-      expect(structured.deferred).toBeUndefined();
+      expect(Object.keys(structured)).toEqual(['objects', 'failed']);
       expect(text.match(/— Object 437980/g)).toHaveLength(1);
     });
   });
 
   describe('IDs past the per-call cap (#50)', () => {
-    /** `n` sequential IDs from `first`, each a sparse record well inside the byte budget. */
-    const ids = (first: number, n: number) => Array.from({ length: n }, (_, i) => first + i);
+    /** A sparse record for each ID. */
     const sparseRecords = (list: number[]) =>
       list.map((objectID) => ({ ...sparseRecord, objectID }));
     /** The IDs the service was asked for, in call order. */
@@ -1090,7 +1062,6 @@ describe('metGetObject', () => {
     type Structured = {
       objects: { objectID: number }[];
       failed: { objectID: number }[];
-      deferred?: { objectID: number }[];
       remainingIDs?: number[];
       notice?: string;
     };
@@ -1106,7 +1077,7 @@ describe('metGetObject', () => {
       const structured = called.structuredContent as Structured;
       expect(structured.objects.map((o) => o.objectID)).toEqual(requested.slice(0, 20));
       expect(structured.failed).toEqual([]);
-      expect(structured.deferred).toBeUndefined();
+      expect(Object.keys(structured)).toEqual(['objects', 'failed', 'remainingIDs', 'notice']);
       expect(structured.remainingIDs).toEqual([1021, 1022, 1023, 1024, 1025]);
       expect(structured.notice).toBe(overCapNotice);
 
@@ -1171,25 +1142,22 @@ describe('metGetObject', () => {
       );
     });
 
-    it('joins the over-cap and deferred disclosures in one notice, over-cap first, each section rendered', async () => {
+    it('makes the over-cap sentence the whole notice on a heavy batch, rendering no deferred section', async () => {
+      // 20 × 5,000 bytes: 100,000 bytes of records, every one returned.
       const requested = ids(1, 22);
       mockRecords(requested.map((id) => sizedRecord(id, 5_000)));
 
       const called = await runToolContract(metGetObject, { objectIDs: requested });
 
       const structured = called.structuredContent as Structured;
-      expect(structured.objects.map((o) => o.objectID)).toEqual(ids(1, 12));
-      expect(structured.deferred?.map((d) => d.objectID)).toEqual(ids(13, 8));
+      expect(structured.objects.map((o) => o.objectID)).toEqual(ids(1, 20));
       expect(structured.remainingIDs).toEqual([21, 22]);
-      const notice = structured.notice ?? '';
-      expect(
-        notice.startsWith(
-          'Requested the first 20 of 22 distinct object IDs, the per-call cap; the other 2 are in remainingIDs and were not requested. Re-call met_get_object with them. Returned 12 of 20 fetched records',
-        ),
-      ).toBe(true);
+      const notice =
+        'Requested the first 20 of 22 distinct object IDs, the per-call cap; the other 2 are in remainingIDs and were not requested. Re-call met_get_object with them.';
+      expect(structured.notice).toBe(notice);
 
       const text = contentText(called);
-      expect(text).toContain('## Deferred — batch byte budget');
+      expect(text).not.toContain('Deferred');
       expect(text).toContain('## Over the per-call cap — not requested\n21, 22');
       expect(text).toContain(notice);
     });
@@ -1725,10 +1693,6 @@ describe('metGetObject', () => {
       const DEFAULT_OFF_TEXT =
         '## (Untitled) — Object 437403\n**isPublicDomain:** Yes (CC0) | **hasCC0Image:** Yes | **isHighlight:** No | **isTimelineWork:** No\n**Artist:** — | **Artist role:** —\n**Nationality:** —\n**Artist dates:** —\n**Department:** — | **departmentId:** — | **Object name:** — | **Classification:** —\n**Date:** — (0–0)\n**Medium:** —\n**Dimensions:** —\n**Culture:** —\n**Period:** —\n**Dynasty:** —\n**Reign:** —\n**Portfolio:** —\n**Geography:** —\n**Measurements:** —\n**Accession:** — | **Accession year:** —\n**Credit:** —\n**Rights:** —\n**Metadata date:** —\n**Gallery:** —\n**URL:** —\n**Image (full):** https://images.metmuseum.org/CRDImages/ep/original/DP437403.jpg\n**Image (small):** https://images.metmuseum.org/CRDImages/ep/web-large/DP437403.jpg\n**Additional images:** —\n**Wikidata:** —\n**Tags:** —\n**Constituents:** —\n\n## (Untitled) — Object 488978\n**isPublicDomain:** No | **hasCC0Image:** No | **isHighlight:** No | **isTimelineWork:** No\n**Artist:** — | **Artist role:** —\n**Nationality:** —\n**Artist dates:** —\n**Department:** — | **departmentId:** — | **Object name:** — | **Classification:** —\n**Date:** — (0–0)\n**Medium:** —\n**Dimensions:** —\n**Culture:** —\n**Period:** —\n**Dynasty:** —\n**Reign:** —\n**Portfolio:** —\n**Geography:** —\n**Measurements:** —\n**Accession:** — | **Accession year:** —\n**Credit:** —\n**Rights:** —\n**Metadata date:** —\n**Gallery:** —\n**URL:** —\n**Image (full):** —\n**Image (small):** —\n**Additional images:** —\n**Wikidata:** —\n**Tags:** —\n**Constituents:** —\n\n## Failed Fetches\n- **999:** Object 999 not found in the Met collection — the object endpoint does not serve it, though the search index can still list it. Drop this ID rather than searching for it again.';
 
-      /** The deferred notice for a 50,000 + 30,000-byte batch, captured before the input existed. */
-      const DEFAULT_OFF_NOTICE =
-        "Returned 1 of 2 fetched records — 50000 bytes of serialized structuredContent against a 60000-byte budget measured on that surface alone; content[] renders the same records again, so the delivered response is roughly twice that. The remaining 1 would exceed the budget. Re-call met_get_object with the deferred objectIDs to retrieve them; each record's listed size is on the same structuredContent scale, so sum them against the budget before requesting several.";
-
       it('fetches nothing and adds no field or block, on either surface', async () => {
         mockRecords([cc0Record(437403), { ...sparseRecord, objectID: 488978 }]);
         const called = await runToolContract(metGetObject, { objectIDs: [437403, 488978, 999] });
@@ -1751,18 +1715,16 @@ describe('metGetObject', () => {
         expect('images' in metGetObject.output.parse(result)).toBe(false);
       });
 
-      it('keeps the deferred notice and the keys of a deferring batch as they were', async () => {
+      it('returns a heavy batch as objects and failed alone, with one text block', async () => {
         mockRecords([sizedRecord(1, 50_000), sizedRecord(2, 30_000)]);
         const called = await runToolContract(metGetObject, { objectIDs: [1, 2] });
-        const structured = called.structuredContent as { notice?: string };
+        const structured = called.structuredContent as { objects: { objectID: number }[] };
 
         expect(fetchMock).not.toHaveBeenCalled();
-        expect(Object.keys(structured)).toEqual(['objects', 'failed', 'deferred', 'notice']);
-        expect(structured.notice).toBe(DEFAULT_OFF_NOTICE);
-        // The record text, then the notice as the enrichment trailer — no caption
-        // or image block ahead of either.
-        expect(called.content.map((block) => block.type)).toEqual(['text', 'text']);
-        expect(called.content[1]).toEqual({ type: 'text', text: `\n\n> ${DEFAULT_OFF_NOTICE}` });
+        expect(Object.keys(structured)).toEqual(['objects', 'failed']);
+        expect(structured.objects.map((o) => o.objectID)).toEqual([1, 2]);
+        // The record text alone — no caption, image block, or notice trailer.
+        expect(called.content.map((block) => block.type)).toEqual(['text']);
       });
     });
 
@@ -1923,9 +1885,8 @@ describe('metGetObject', () => {
         expect(called.content.slice(0, 6)).toEqual(pairs(437403, 467642, 286850));
       });
 
-      it('gives a non-CC0 record no_cc0_image, a deferred record and a failed ID no entry, and fetches only the returned CC0 image', async () => {
-        // 437403 (40 KB) and 488978 fit; 999 is a 404; 467642 (30 KB) would cross
-        // the 60,000-byte budget, so it is deferred.
+      it('gives a non-CC0 record no_cc0_image and a failed ID no entry, and a CC0 record past 60,000 bytes of batch its slot', async () => {
+        // 437403 (40 KB) and 467642 (30 KB) together run past 60,000 bytes; 999 is a 404.
         mockRecords([
           heavyCc0(437403, 40_000),
           { ...sparseRecord, objectID: 488978 },
@@ -1936,26 +1897,26 @@ describe('metGetObject', () => {
         const structured = called.structuredContent as {
           objects: { objectID: number }[];
           failed: { objectID: number }[];
-          deferred: { objectID: number }[];
           images: ImageEntry[];
-          notice: string;
         };
 
-        expect(structured.objects.map((o) => o.objectID)).toEqual([437403, 488978]);
+        expect(Object.keys(structured)).toEqual(['objects', 'failed', 'images']);
+        expect(structured.objects.map((o) => o.objectID)).toEqual([437403, 488978, 467642]);
         expect(structured.failed.map((f) => f.objectID)).toEqual([999]);
-        expect(structured.deferred.map((d) => d.objectID)).toEqual([467642]);
         expect(structured.images).toEqual([
           { objectID: 437403, status: 'attached' },
           { objectID: 488978, status: 'no_cc0_image' },
+          { objectID: 467642, status: 'attached' },
         ]);
-        expect(imageRequests()).toEqual([webLarge(437403)]);
-        expect(called.content.slice(0, 2)).toEqual(pairs(437403));
+        expect(imageRequests()).toEqual([webLarge(437403), webLarge(467642)]);
+        expect(called.content.slice(0, 4)).toEqual(pairs(437403, 467642));
 
         const text = contentText(called);
-        expect(text).toContain('## Images\n- **437403:** attached\n- **488978:** no_cc0_image');
-        expect(text).not.toContain('- **467642:** attached');
-        expect(text.indexOf('## Failed Fetches')).toBeLessThan(text.indexOf('## Deferred'));
-        expect(text.indexOf('## Deferred')).toBeLessThan(text.indexOf('## Images'));
+        expect(text).toContain(
+          '## Images\n- **437403:** attached\n- **488978:** no_cc0_image\n- **467642:** attached',
+        );
+        expect(text).not.toContain('Deferred');
+        expect(text.indexOf('## Failed Fetches')).toBeLessThan(text.indexOf('## Images'));
       });
 
       it('fetches nothing and returns the declared error when no record comes back', async () => {
@@ -2084,49 +2045,41 @@ describe('metGetObject', () => {
       expect(called.content.some((block) => block.type === 'image')).toBe(false);
     });
 
-    describe('the deferred notice', () => {
-      it('adds the attached image blocks to the delivered size it states', async () => {
-        mockRecords([heavyCc0(1, 50_000), heavyCc0(2, 30_000)]);
-        fetchMock.mockImplementation(imageHost());
-        const called = await imagesCall([1, 2]);
-        const structured = called.structuredContent as { notice: string; images: ImageEntry[] };
+    it('attaches images to a heavy batch with no notice on either surface', async () => {
+      mockRecords([heavyCc0(1, 50_000), heavyCc0(2, 30_000)]);
+      fetchMock.mockImplementation(imageHost());
+      const called = await imagesCall([1, 2]);
+      const structured = called.structuredContent as { images: ImageEntry[] };
 
-        expect(structured.images).toEqual([{ objectID: 1, status: 'attached' }]);
-        expect(structured.notice).toContain(
-          `so the delivered response is roughly twice that, plus 1 attached image block (${base64Of(1).length} bytes of base64). The remaining 1 would exceed the budget.`,
-        );
-        expect(contentText(called)).toContain(
-          `plus 1 attached image block (${base64Of(1).length} bytes of base64)`,
-        );
-      });
-
-      it('keeps its wording when no image block was attached', async () => {
-        mockRecords([{ ...heavyCc0(1, 50_000), hasCC0Image: false }, heavyCc0(2, 30_000)]);
-        const called = await imagesCall([1, 2]);
-        const notice = (called.structuredContent as { notice: string }).notice;
-
-        expect(fetchMock).not.toHaveBeenCalled();
-        expect(notice).toContain(
-          'so the delivered response is roughly twice that. The remaining 1',
-        );
-        expect(notice).not.toContain('image block');
-      });
+      expect(Object.keys(structured)).toEqual(['objects', 'failed', 'images']);
+      expect(structured.images).toEqual([
+        { objectID: 1, status: 'attached' },
+        { objectID: 2, status: 'attached' },
+      ]);
+      // Two caption/image pairs, then the record text, and no notice trailer after it.
+      expect(called.content.map((block) => block.type)).toEqual([
+        'text',
+        'image',
+        'text',
+        'image',
+        'text',
+      ]);
     });
 
     describe('format and descriptions', () => {
-      it('renders ## Images after the failed and deferred sections, one line per entry', () => {
+      it('renders ## Images after the failed and over-cap sections, one line per entry', () => {
         const text = (
           metGetObject.format!({
             objects: [sampleRecord],
             failed: [{ objectID: 99, error: 'Not found.' }],
-            deferred: [{ objectID: 7, bytes: 30_000 }],
+            remainingIDs: [7],
             images: [{ objectID: 437980, status: 'unavailable' }],
           })[0] as { text: string }
         ).text;
 
         expect(
           text.endsWith(
-            '## Deferred — batch byte budget\n- **7:** 30000 bytes\n\n## Images\n- **437980:** unavailable',
+            '## Failed Fetches\n- **99:** Not found.\n\n## Over the per-call cap — not requested\n7\n\n## Images\n- **437980:** unavailable',
           ),
         ).toBe(true);
       });

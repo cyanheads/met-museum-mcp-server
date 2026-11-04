@@ -16,6 +16,7 @@ import { createInMemoryStorage, runToolContract } from '@cyanheads/mcp-ts-core/t
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { metSearchCollections } from '@/mcp-server/tools/definitions/met-search-collections.tool.js';
 import { initMetService } from '@/services/met/met-service.js';
+import { readMarkdownText } from '../../helpers/read-markdown-text.js';
 
 const COLLECTION = 'https://collectionapi.metmuseum.org/public/collection';
 const SEARCH_PATH = '/public/collection/v1.1/search';
@@ -254,7 +255,7 @@ describe('met_search_collections — departments 7 and 17 share one search resul
             '**Object IDs:**',
             '436100, 436101, 436102, 436103, 436104',
           ],
-          'Query: q="tapestry", departmentId=11',
+          'Query: `q="tapestry", departmentId=11`',
         ),
       );
     });
@@ -293,7 +294,7 @@ describe('met_search_collections — departments 7 and 17 share one search resul
             '**Object IDs:**',
             '436110, 436111, 436112',
           ],
-          'Query: q="tapestry", departmentId=11',
+          'Query: `q="tapestry", departmentId=11`',
         ),
       );
     });
@@ -324,7 +325,7 @@ describe('met_search_collections — departments 7 and 17 share one search resul
             '**Object IDs:**',
             '436100, 436101, 436102, 436103, 436104',
           ],
-          'Query: q="tapestry"',
+          'Query: `q="tapestry"`',
         ),
       );
     });
@@ -393,7 +394,7 @@ describe('met_search_collections — departments 7 and 17 share one search resul
       });
       const text = textOf(result);
       expect(text).toContain(`> ${filteredNotice(7)}`);
-      expect(text).toContain('Query: q="tapestry", departmentId=7');
+      expect(readMarkdownText(text)).toContain('Query: q="tapestry", departmentId=7');
     });
 
     it('departmentId 17: department 17 IDs only from the same combined page, the index-only ID dropped', async () => {

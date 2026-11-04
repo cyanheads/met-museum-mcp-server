@@ -5,9 +5,10 @@
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { z } from 'zod';
 import { metSearchCollections } from '@/mcp-server/tools/definitions/met-search-collections.tool.js';
+import { readMarkdownText } from '../helpers/read-markdown-text.js';
 
 const mockSearch = vi.fn();
 const mockGetValidDepartmentIds = vi.fn();
@@ -125,7 +126,7 @@ describe('metSearchCollections', () => {
     expect(text).toContain('**Total matches:** 0');
     expect(text).toContain('**Returned IDs:** 0 (complete)');
     expect(text).toContain(`> ${notice}`);
-    expect(text).toContain('Query: q="zzznomatch"');
+    expect(readMarkdownText(text)).toContain('Query: q="zzznomatch"');
     expect(text).not.toContain('no_results');
     expect(mockCountKeywordMatches).not.toHaveBeenCalled();
   });
@@ -147,9 +148,134 @@ describe('metSearchCollections', () => {
     const notice =
       'The keyword "a \\"b\\"\\n\\n# heading" matches no object in the collection. Try a different, broader, or differently spelled keyword.';
     expect(structuredOf(result).notice).toBe(notice);
+    // content[] escapes the backslash before each quote (#58), so the line reads back as the notice.
+    const quoted =
+      'The keyword "a \\\\"b\\\\"\\n\\n# heading" matches no object in the collection. Try a different, broader, or differently spelled keyword.';
     expect(result.content?.[1]).toEqual({
       type: 'text',
-      text: `\n\n> ${notice}\n\nQuery: q=${JSON.stringify(q)}`,
+      text: `\n\n> ${quoted}\n\nQuery: \`q=${JSON.stringify(q)}\``,
+    });
+    expect(readMarkdownText(`> ${quoted}`)).toBe(notice);
+  });
+
+  /**
+   * The notice render escapes the whole joined notice, so the server's own
+   * sentences pass through it too: each must read back exactly as written (#58).
+   */
+  describe('every notice reads back in content[] as structuredContent carries it (#58)', () => {
+    /** The trailer's read-back, one entry per block: the notice line first. */
+    const trailerLines = (result: ToolResult) => {
+      const trailer = (result.content ?? []).at(-1) as { type: 'text'; text: string };
+      return readMarkdownText(trailer.text).split('\n');
+    };
+    /** The 500 sequential IDs of a full page. */
+    const fullPageIDs = Array.from({ length: 500 }, (_, i) => i + 1);
+    const page = (total: number, objectIDs: number[]) => ({
+      total,
+      objectIDs,
+      returned: objectIDs.length,
+      truncated: total > objectIDs.length,
+      remaining: Math.max(0, Math.min(total, 10_000) - objectIDs.length),
+      nextOffset: total > objectIDs.length ? objectIDs.length : null,
+      offset: 0,
+    });
+    const everySentence = {
+      q: 'vase',
+      medium: 'Painting',
+      geoLocation: ['greece'],
+      dateBegin: 1832,
+      dateEnd: 1832,
+    };
+
+    it.each([
+      [
+        'the over-500 limit notice',
+        () => mockSearch.mockResolvedValue(page(3_000, fullPageIDs)),
+        { q: 'horse', limit: 600 },
+      ],
+      [
+        'the 10,000-window notice',
+        () => mockSearch.mockResolvedValue(page(14_398, [1, 2])),
+        { q: 'horse', limit: 2 },
+      ],
+      [
+        'the department notice for a filtered 7/17 page',
+        () => {
+          mockSearch.mockResolvedValue(page(165, [467638, 467639, 1]));
+          mockKeepDepartmentMembers.mockResolvedValue([467638, 467639]);
+        },
+        { q: 'tapestry', departmentId: 7, limit: 3 },
+      ],
+      [
+        'the department notice for an unfiltered 7/17 page',
+        () => {
+          mockSearch.mockResolvedValue(page(165, [467638, 1]));
+          mockKeepDepartmentMembers.mockResolvedValue(null);
+        },
+        { q: 'tapestry', departmentId: 17, limit: 2 },
+      ],
+      [
+        'every per-filter sentence, on the "removed every match" lead',
+        () => {
+          mockSearch.mockResolvedValue(page(0, []));
+          mockCountKeywordMatches.mockResolvedValue(1_330);
+        },
+        everySentence,
+      ],
+      [
+        'every per-filter sentence, on the "may have removed every match" lead',
+        () => {
+          mockSearch.mockResolvedValue(page(0, []));
+          mockCountKeywordMatches.mockResolvedValue(null);
+        },
+        everySentence,
+      ],
+      [
+        'the keyword notice behind filters',
+        () => {
+          mockSearch.mockResolvedValue(page(0, []));
+          mockCountKeywordMatches.mockResolvedValue(0);
+        },
+        everySentence,
+      ],
+    ])('%s', async (_label, stage, args) => {
+      stage();
+      const result = await runToolContract(
+        metSearchCollections,
+        args as z.input<typeof metSearchCollections.input>,
+      );
+
+      const { notice } = structuredOf(result);
+      expect(notice).toEqual(expect.any(String));
+      expect(trailerLines(result)[0]).toBe(notice);
+    });
+
+    /**
+     * `q` has no length bound, so the tool's own render, not only the escaper it
+     * calls, must stay linear in the notice's length. Thread CPU, never wall
+     * clock; the least of three runs, stopping once a run passes the bound.
+     */
+    it('renders a long notice in linear time', () => {
+      const render = (
+        metSearchCollections.enrichmentTrailer?.notice as
+          | { render?: (notice: string) => string }
+          | undefined
+      )?.render;
+      expect(render).toEqual(expect.any(Function));
+      const cpuMs = () => {
+        const { user, system } = process.threadCpuUsage();
+        return (user + system) / 1000;
+      };
+      const notice = `The keyword "zz${' '.repeat(64_000)}x" matches no object in the collection.`;
+      const BOUND_MS = 100;
+      let least = Number.POSITIVE_INFINITY;
+      for (let round = 0; round < 3; round++) {
+        const start = cpuMs();
+        render?.(notice);
+        least = Math.min(least, cpuMs() - start);
+        if (least >= BOUND_MS) break;
+      }
+      expect(least).toBeLessThan(BOUND_MS);
     });
   });
 
@@ -341,7 +467,7 @@ describe('metSearchCollections', () => {
       expect(structured.effectiveQuery).toBe('q="tapestry", departmentId=17');
       const text = contentText(result);
       expect(text).toContain("> The Met's search returns departments 7 (The Cloisters) and 17");
-      expect(text).toContain('Query: q="tapestry", departmentId=17');
+      expect(readMarkdownText(text)).toContain('Query: q="tapestry", departmentId=17');
     });
 
     it('never narrows another department', async () => {
@@ -459,9 +585,9 @@ describe('metSearchCollections', () => {
     expect(result.total).toBe(12);
   });
 
-  // --- #35: matchField restricts the keyword match to titles or tags ---
+  // --- #35, #53: matchField restricts the keyword match to titles, tags, or artists and cultures ---
 
-  it.each(['title', 'tags'] as const)(
+  it.each(['title', 'tags', 'artistOrCulture'] as const)(
     'passes matchField %s through to the service',
     async (matchField) => {
       mockSearch.mockResolvedValue({
@@ -485,8 +611,13 @@ describe('metSearchCollections', () => {
     },
   );
 
-  it('accepts only title and tags for matchField at the input schema', () => {
-    for (const value of ['artistOrCulture', true, false, 'TITLE', '']) {
+  it('accepts only title, tags, and artistOrCulture for matchField at the input schema', () => {
+    for (const value of ['title', 'tags', 'artistOrCulture'] as const) {
+      expect(
+        metSearchCollections.input.parse({ q: 'Rembrandt', matchField: value }).matchField,
+      ).toBe(value);
+    }
+    for (const value of [true, false, 'TITLE', 'Title', 'artist', 'ArtistOrCulture', '']) {
       expect(() =>
         metSearchCollections.input.parse({ q: 'sunflower', matchField: value }),
       ).toThrow();
@@ -494,18 +625,27 @@ describe('metSearchCollections', () => {
     expect(metSearchCollections.input.parse({ q: 'sunflower' }).matchField).toBeUndefined();
   });
 
-  it('says in the matchField description that it has no effect when q is "*"', () => {
+  it('says in the matchField description what each value matches, and that none affects q "*"', () => {
     const { description } = metSearchCollections.input.shape.matchField;
     expect(description).not.toContain('upstream');
     expect(description).toContain('"title" matches object titles only');
     expect(description).toContain('"tags" matches subject tags only');
+    expect(description).toContain(
+      '"artistOrCulture" matches the artist an object is attributed to',
+    );
+    expect(description).toContain('or its culture');
+    expect(description).toContain('"Style of"');
+    expect(description).toContain('artistPrefix on met_get_object');
+    expect(description).toContain('a sitter');
     expect(description).toContain('no effect when q is "*"');
   });
 
   it('names matchField in the q description as the way to narrow the match', () => {
     const { description } = metSearchCollections.input.shape.q;
     expect(description).toContain('matched across title, artist name');
-    expect(description).toContain('matchField');
+    expect(description).toContain(
+      'matchField narrows the match to titles, tags, or artists and cultures',
+    );
   });
 
   // --- #43: the q description carries the "*" match-all and accession-number notes ---
@@ -536,6 +676,55 @@ describe('metSearchCollections', () => {
     expect(() =>
       metSearchCollections.input.parse({ q: 'painting', geoLocation: ['France', 'Spain'] }),
     ).toThrow(/geoLocation takes one location/);
+  });
+
+  // --- #54: the date window is containment; #55: geoLocation and medium take one exact value ---
+
+  it.each(['dateBegin', 'dateEnd'] as const)(
+    'states in the %s description that the whole date span must lie inside the window',
+    (field) => {
+      const { description } = metSearchCollections.input.shape[field];
+      expect(description).toContain('whole date span');
+      expect(description).toContain('objectBeginDate to objectEndDate on met_get_object');
+      expect(description).toContain('a span crossing either bound is excluded');
+      expect(description).toContain('a "ca." date can be stored as a 20-year span');
+      expect(description).toContain('A window spanning year 0 also matches undated records');
+      expect(description).toContain('null on met_get_object');
+      expect(description).not.toContain('Earliest object date');
+      expect(description).not.toContain('Latest object date');
+    },
+  );
+
+  it('states in the geoLocation description that it takes one place, whole and case-sensitive', () => {
+    const { description } = metSearchCollections.input.shape.geoLocation;
+    expect(description).toContain('one place, whole and case-sensitive as the Met spells it');
+    expect(description).toContain('"greece"');
+    expect(description).toContain('"Gree"');
+    expect(description).toContain('"|"-joined list');
+    expect(description).toContain('an adjective such as "Japanese" matches nothing');
+    expect(description).toContain('may show the place in none of its fields');
+    expect(description).not.toContain('matched broadly');
+    expect(description).not.toContain('artist nationality');
+    expect(description).not.toContain('geography fields');
+  });
+
+  it('states in the medium description and the tool description that medium takes one classification', () => {
+    const { description } = metSearchCollections.input.shape.medium;
+    expect(description).toContain('one object classification');
+    expect(description).toContain('"|"-joined list ("Prints|Paintings")');
+    expect(metSearchCollections.description).toContain(
+      'The medium parameter takes one object classification',
+    );
+  });
+
+  it('keeps geoLocation a one-element array and medium a string: every call accepted before still is', () => {
+    const parsed = metSearchCollections.input.parse({
+      q: 'vase',
+      geoLocation: ['greece'],
+      medium: 'Prints|Paintings',
+    });
+    expect(parsed.geoLocation).toEqual(['greece']);
+    expect(parsed.medium).toBe('Prints|Paintings');
   });
 
   it('passes isOnView to service', async () => {
@@ -1049,7 +1238,20 @@ describe('metSearchCollections', () => {
       expect(structuredOf(result).notice).toBeUndefined();
     });
 
-    it.each([10_001, 0, -1, 1.5, 'abc', true])(
+    it.each([10_001, 40_000])(
+      'sends limit 500 for limit %i and discloses it: there is no ceiling (#57)',
+      async (limit) => {
+        mockSearch.mockResolvedValue(fullPage(3_000));
+
+        const result = await runToolContract(metSearchCollections, { q: 'horse', limit });
+
+        expect(sentLimit()).toBe(500);
+        expect(structuredOf(result).returned).toBe(500);
+        expect(structuredOf(result).notice).toBe(limitNotice(limit));
+      },
+    );
+
+    it.each([0, -1, 1.5, 'abc', true])(
       'still rejects limit %j at the schema, before any search',
       async (limit) => {
         const result = await runToolContract(metSearchCollections, {
@@ -1065,11 +1267,108 @@ describe('metSearchCollections', () => {
       },
     );
 
-    it('states the 500-ID page and the 10,000 ceiling in the limit and notice descriptions', () => {
+    it('states the 500-ID page, and no ceiling, in the limit and notice descriptions', () => {
       const { description } = metSearchCollections.input.shape.limit;
-      expect(description).toContain('500');
-      expect(description).toContain('10,000');
+      expect(description).toContain('a larger value reads a 500-ID page');
+      expect(description).not.toContain('up to 10,000');
       expect(metSearchCollections.enrichment?.notice?.description).toContain('500-ID page');
+    });
+
+    /**
+     * The wiring of the shared `limit` mechanism, whose full table lives in
+     * tests/tools/page-limit.test.ts. Each case loads the tool fresh
+     * and parses the config as `setup()` does, after import.
+     */
+    describe('MET_CLAMP_LIMITS (#57)', () => {
+      interface CounterAdd {
+        attributes: unknown;
+        name: string;
+        value: number;
+      }
+
+      async function loadTool(clampLimits?: string) {
+        vi.resetModules();
+        if (clampLimits !== undefined) vi.stubEnv('MET_CLAMP_LIMITS', clampLimits);
+        const added: CounterAdd[] = [];
+        vi.doMock('@cyanheads/mcp-ts-core/utils', async (importOriginal) => ({
+          ...(await importOriginal<typeof import('@cyanheads/mcp-ts-core/utils')>()),
+          createCounter: (name: string) => ({
+            add: (value: number, attributes: unknown) => added.push({ name, value, attributes }),
+          }),
+        }));
+        const { metSearchCollections: tool } = await import(
+          '@/mcp-server/tools/definitions/met-search-collections.tool.js'
+        );
+        const { getServerConfig } = await import('@/config/server-config.js');
+        getServerConfig();
+        return {
+          added,
+          advertisedLimit: () =>
+            (
+              tool.input['~standard'].jsonSchema.input({ target: 'draft-2020-12' })
+                .properties as Record<string, unknown>
+            ).limit,
+          call: (limit: number) => runToolContract(tool, { q: 'horse', limit }),
+        };
+      }
+
+      afterEach(() => {
+        vi.doUnmock('@cyanheads/mcp-ts-core/utils');
+        vi.unstubAllEnvs();
+      });
+
+      it('advertises limit with no maximum by default', async () => {
+        const { advertisedLimit } = await loadTool();
+
+        expect(advertisedLimit()).toEqual({
+          type: 'integer',
+          minimum: 1,
+          default: 20,
+          description: expect.stringContaining('a larger value reads a 500-ID page'),
+        });
+      });
+
+      it('counts a call served at a clamped limit on met.limit.clamped for met_search_collections, and none at 500', async () => {
+        mockSearch.mockResolvedValue(fullPage(3_000));
+        const { added, call } = await loadTool();
+
+        await call(500);
+        expect(added).toEqual([]);
+
+        await call(10_001);
+        expect(sentLimit()).toBe(500);
+        expect(added).toEqual([
+          {
+            name: 'met.limit.clamped',
+            value: 1,
+            attributes: { 'mcp.tool.name': 'met_search_collections' },
+          },
+        ]);
+      });
+
+      it('with MET_CLAMP_LIMITS=false advertises maximum 500 and rejects limit 501 before any search', async () => {
+        mockSearch.mockResolvedValue(fullPage(3_000));
+        const { added, advertisedLimit, call } = await loadTool('false');
+
+        expect(advertisedLimit()).toEqual({
+          type: 'integer',
+          minimum: 1,
+          maximum: 500,
+          default: 20,
+          description:
+            'Maximum number of object IDs to return in this page, at most 500, the Met search maximum; continue from nextOffset. Paging reaches only the first 10,000 matches, so a page that would cross 10,000 is cut short there.',
+        });
+        const rejected = await call(501);
+        expect(rejected.isError).toBe(true);
+        expect((rejected.structuredContent as { error: { code: number } }).error.code).toBe(
+          JsonRpcErrorCode.InvalidParams,
+        );
+        expect(mockSearch).not.toHaveBeenCalled();
+
+        await call(500);
+        expect(sentLimit()).toBe(500);
+        expect(added).toEqual([]);
+      });
     });
   });
 
@@ -1096,7 +1395,7 @@ describe('metSearchCollections', () => {
 
       const echo = 'q="sunflower", medium="Paintings", departmentId=11';
       expect(structuredOf(result).effectiveQuery).toBe(echo);
-      expect(contentText(result)).toContain(`Query: ${echo}`);
+      expect(readMarkdownText(contentText(result))).toContain(`Query: ${echo}`);
     });
 
     it('echoes every filter, JSON-encoded, and never limit or offset', async () => {
@@ -1119,7 +1418,7 @@ describe('metSearchCollections', () => {
       const echo =
         'q="vase", matchField="title", hasImages=true, isHighlight=true, isOnView=false, medium="Ceramics", departmentId=11, geoLocation=["France"], dateBegin=-500, dateEnd=1800';
       expect(structuredOf(result).effectiveQuery).toBe(echo);
-      expect(contentText(result)).toContain(`Query: ${echo}`);
+      expect(readMarkdownText(contentText(result))).toContain(`Query: ${echo}`);
       expect(contentText(result)).not.toContain('limit=');
       expect(contentText(result)).not.toContain('offset=');
     });
@@ -1130,7 +1429,7 @@ describe('metSearchCollections', () => {
 
       const echo = 'q=" Van \\"Gogh\\"\\nletters "';
       expect(structuredOf(result).effectiveQuery).toBe(echo);
-      expect(contentText(result)).toContain(`Query: ${echo}`);
+      expect(readMarkdownText(contentText(result))).toContain(`Query: ${echo}`);
     });
 
     it('echoes on the zero, window, and offset-beyond paths alike', async () => {
@@ -1146,7 +1445,7 @@ describe('metSearchCollections', () => {
       for (const args of [{ q: 'zzznomatch' }, { q: 'horse' }, { q: 'sunflower', offset: 97 }]) {
         const result = await runToolContract(metSearchCollections, args);
         expect(structuredOf(result).effectiveQuery).toBe(`q="${args.q}"`);
-        expect(contentText(result)).toContain(`Query: q="${args.q}"`);
+        expect(readMarkdownText(contentText(result))).toContain(`Query: q="${args.q}"`);
       }
     });
 

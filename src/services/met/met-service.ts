@@ -164,11 +164,13 @@ export interface SearchInput {
   isOnView?: boolean | undefined;
   limit: number;
   /**
-   * Restricts the keyword match to titles or to tags, sent as `title=true` or
-   * `tags=true`. One field because upstream honors only one flag: with both it
-   * answers the title set and drops `tags`; it ignores a `false` value.
+   * Restricts the keyword match to titles, tags, or the artist and culture,
+   * sent as `title=true`, `tags=true`, or `artistOrCulture=true`. One field
+   * because upstream honors only one flag per request: with `title` and `tags`
+   * it answers the title set and drops `tags`, and `artistOrCulture` wins over
+   * `title`; it ignores a `false` value.
    */
-  matchField?: 'title' | 'tags' | undefined;
+  matchField?: 'title' | 'tags' | 'artistOrCulture' | undefined;
   medium?: string | undefined;
   offset?: number | undefined;
   q: string;

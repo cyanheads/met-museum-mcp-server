@@ -2,12 +2,82 @@
  * @fileoverview Markdown escaping and link-destination validation for the
  * `content[]` render boundary.
  *
- * Dependency-free leaf module by design: the tool test suites replace
- * `@/services/met/met-service.js` wholesale, so a helper co-located there would
- * be `undefined` inside every `format()` under test.
+ * Leaf module by design, importing nothing of the server's: the tool test
+ * suites replace `@/services/met/met-service.js` wholesale, so a helper
+ * co-located there would be `undefined` inside every `format()` under test.
  *
  * @module utils/markdown
  */
+
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
+
+/**
+ * Whitespace a CommonMark paragraph or GFM table cell trims from a line's
+ * edges, which `escapeMarkdownInline` writes as numeric references: every
+ * whitespace character but U+000B, which it leaves literal.
+ */
+const isEdgeWhitespace = (ch: string) => ch !== '\v' && /\s/.test(ch);
+
+/**
+ * One line (no line break) escaped as `escapeMarkdownInline` escapes it, one
+ * whitespace-free run at a time. Each run is escaped beside the whitespace
+ * character that touches it on either side, so its neighbour, line-end, and
+ * closing-`#` rules see what they see in the whole line: a run past the
+ * line's first is framed by a letter and that character, which keeps it off
+ * the line start, and a neighbour at the line's edge is the reference the
+ * whole line writes. Interior whitespace stays as written, as it does there.
+ */
+function escapeLine(line: string): string {
+  let start = 0;
+  while (start < line.length && isEdgeWhitespace(line.charAt(start))) start++;
+  if (start === line.length) return escapeMarkdownInline(line);
+  let end = line.length;
+  while (isEdgeWhitespace(line.charAt(end - 1))) end--;
+  const lead = line.slice(0, start);
+  const trail = line.slice(end);
+  const core = line.slice(start, end);
+  let escaped = '';
+  let space = ''; // the whitespace before the current run
+  let at = 0; // the current run's offset in `core`
+  // Even indices: whitespace-free runs (only the first and last can be empty); odd: whitespace.
+  for (const [i, run] of core.split(/(\s+)/).entries()) {
+    if (i % 2 === 1) space = run;
+    if (i % 2 === 1 || run === '') {
+      escaped += run;
+      at += run.length;
+      continue;
+    }
+    const before = i > 0 ? `x${space.slice(-1)}` : lead.slice(-1);
+    const after = core.charAt(at + run.length) || trail.charAt(0);
+    const framed = escapeMarkdownInline(before + run + after);
+    const head = i > 0 ? before.length : escapeMarkdownInline(before).length;
+    escaped += framed.slice(head, framed.length - escapeMarkdownInline(after).length);
+    at += run.length;
+  }
+  return escapeMarkdownInline(lead) + escaped + escapeMarkdownInline(trail);
+}
+
+/**
+ * `escapeMarkdownInline` in linear time on any input, for caller text that
+ * has no length bound: the same escapes, and the same guarantee that a
+ * CommonMark parse reads the result back as `text` in the slots that function
+ * names. One difference in bytes, none in what reads back: a run that opens a
+ * line is tested for a block marker on its own, so `--- x` gains a backslash
+ * the whole line would not need. Exists until cyanheads/mcp-ts-core#809 ships.
+ */
+export function escapeMarkdownInlineLinear(text: string): string {
+  const lines = text.replace(/\r\n?/g, '\n').split('\n');
+  // A line break is a hard break, so the value stays one paragraph; a final one, where none can stand, is `&#10;`.
+  return lines
+    .map((line, i) =>
+      i === 0
+        ? escapeLine(line)
+        : i === lines.length - 1 && line === ''
+          ? '&#10;'
+          : `\\\n${escapeLine(line)}`,
+    )
+    .join('');
+}
 
 /**
  * Every character that can open a Markdown construct in the positions this

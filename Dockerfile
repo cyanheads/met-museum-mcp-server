@@ -10,7 +10,7 @@
 # build runs under QEMU, where bun >= 1.4 aborts with a JavaScriptCore allocator
 # assertion and fails the multi-arch push.
 # ==============================================================================
-FROM --platform=$BUILDPLATFORM oven/bun:1.4.3 AS build
+FROM --platform=$BUILDPLATFORM oven/bun:1.4.4 AS build
 
 WORKDIR /usr/src/app
 
@@ -24,6 +24,11 @@ RUN --mount=type=cache,target=/root/.bun/install/cache \
 
 # Copy the rest of the source code
 COPY . .
+
+# The skills a server publishes (`createApp({ skills: 'skills' })`) are read at
+# runtime from the application root. Created when the project has none, so the
+# production stage's copy below holds with or without one.
+RUN mkdir -p skills
 
 # Build the application
 RUN bun run build
@@ -42,7 +47,7 @@ RUN bun run build
 # A clean image rather than `FROM build`: the build stage's node_modules holds
 # devDependencies.
 # ==============================================================================
-FROM --platform=$BUILDPLATFORM oven/bun:1.4.3 AS deps
+FROM --platform=$BUILDPLATFORM oven/bun:1.4.4 AS deps
 
 WORKDIR /usr/src/app
 
@@ -107,7 +112,7 @@ RUN rm -rf node_modules/@socketsecurity/bun-security-scanner
 # dependencies and build artifacts. Its only Bun invocations are HEALTHCHECK
 # and CMD, which run on the real target at container start.
 # ==============================================================================
-FROM oven/bun:1.4.3-slim AS production
+FROM oven/bun:1.4.4-slim AS production
 
 WORKDIR /usr/src/app
 
@@ -129,6 +134,7 @@ COPY --from=deps /usr/src/app/node_modules ./node_modules
 
 # Copy the compiled application code from the build stage
 COPY --from=build /usr/src/app/dist ./dist
+COPY --from=build /usr/src/app/skills ./skills
 
 # The 'oven/bun' image already provides a non-root user named 'bun'.
 # We will use this existing user for enhanced security.

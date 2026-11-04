@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.9.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/met-museum-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.3.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/met-museum-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/met-museum-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.3%2B-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.9.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/met-museum-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.4.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/met-museum-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/met-museum-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4%2B-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -36,7 +36,7 @@ The Metropolitan Museum of Art's collection of 500,000+ works spanning 5,000 yea
 | Tool | Description |
 |:---|:---|
 | `met_list_departments` | Return all 19 curatorial departments with their numeric IDs and display names |
-| `met_search_collections` | Search the collection by keyword, optionally matched in titles or tags only, with filters for department, date range, medium, geography, image availability, on-view status, and highlight designation |
+| `met_search_collections` | Search the collection by keyword, optionally matched in titles, tags, or artists and cultures only, with filters for department, date range, medium, geography, image availability, on-view status, and highlight designation |
 | `met_list_objects` | List every object ID in a department, every object created or revised since a date, or both, without a keyword |
 | `met_get_object` | Fetch full records for one or more object IDs — metadata, provenance, artist info, CC0 image URLs, tags, and Wikidata links — optionally with up to 3 CC0 images as image content |
 
@@ -52,7 +52,7 @@ The Metropolitan Museum of Art's collection of 500,000+ works spanning 5,000 yea
 
 ### `met_search_collections` <sub>tool</sub>
 
-- Keyword `q` (required), matched across all text fields unless `matchField` narrows it to `"title"` or `"tags"`; `"*"` matches everything, for a search by filters alone. Filters: `departmentId`, `medium` (case-sensitive, e.g. `"Paintings"`), `dateBegin`/`dateEnd` (integer years, negative = BCE, set together), one `geoLocation`, `hasImages`, `isOnView`, and `isHighlight` (`true` only)
+- Keyword `q` (required), matched across all text fields unless `matchField` narrows it to `"title"`, `"tags"`, or `"artistOrCulture"` (the attributed artist or the culture); `"*"` matches everything, for a search by filters alone. Filters: `departmentId`, `medium` (one classification, case-sensitive, e.g. `"Paintings"`), `dateBegin`/`dateEnd` (integer years, negative = BCE, set together; an object matches only when its whole date span lies inside the window), one `geoLocation` (a whole place, case-sensitive, e.g. `"Greece"`), `hasImages`, `isOnView`, and `isHighlight` (`true` only)
 - Up to 500 IDs per page (default 20), paged by `offset` / `nextOffset` through the first 10,000 matches; `total` reports the full count. `departmentId` 7 (The Cloisters) and 17 (Medieval Art) share one result set at the Met, so a page can hold fewer than `limit` IDs, which a `notice` flags
 - Zero matches is a result with a `notice`, not an error; every result echoes the applied query as `effectiveQuery`. Typed errors: `invalid_date_range`, `invalid_filter` (a blank `q`, `medium`, or `geoLocation`), `invalid_department`, `upstream_blocked`, `upstream_unavailable`, `upstream_rate_limited`, `retry_deadline_exceeded`
 
@@ -69,7 +69,7 @@ The Metropolitan Museum of Art's collection of 500,000+ works spanning 5,000 yea
 ### `met_get_object` <sub>tool</sub>
 
 - Fetches 20 distinct IDs per call, from `met_search_collections` or `met_list_objects`; a list of up to 500 is accepted, and the IDs past the first 20 come back in `remainingIDs`. The index can list IDs the Met no longer serves, so drop an ID that 404s
-- Partial success: per-ID errors land in `failed[]`, and the call fails only when every ID does (`all_not_found`, `upstream_blocked`, `upstream_rate_limited`, `retry_deadline_exceeded`, `upstream_unavailable`, or `all_failed`). Records past a 60,000-byte `structuredContent` budget are listed in `deferred[]` with their sizes, to re-request
+- Partial success: per-ID errors land in `failed[]`, and the call fails only when every ID does (`all_not_found`, `upstream_blocked`, `upstream_rate_limited`, `retry_deadline_exceeded`, `upstream_unavailable`, or `all_failed`)
 - Non-public-domain objects (`isPublicDomain` / `hasCC0Image`) return empty `primaryImage`, `primaryImageSmall`, and `additionalImages`. `includeImages: true` attaches the CC0 image (about 600 px) of the first 3 records that have one as image content in `content[]` only, with each record's outcome in `images[]`
 
 ## Features
@@ -90,7 +90,7 @@ Agent-friendly output:
 - Provenance on every record: `isPublicDomain` and `hasCC0Image` flags show which images can be displayed
 - Partial failure reporting: `met_get_object` returns `objects` and `failed` arrays, so successes arrive alongside per-ID errors
 - Truncation signaling: `met_search_collections` and `met_list_objects` return `total`, `returned`, `truncated`, `remaining`, `nextOffset`, and the resolved `offset`
-- Byte-budget disclosure: `met_get_object` lists `deferred[]` records with their sizes when a batch is too large
+- Published agent skill: `met-museum-guide` (`skill://met-museum-guide/SKILL.md`) carries the checks for fetch budgets, attributions, date windows, searches past 10,000 matches, and `geoLocation` matches
 
 ## Getting started
 
@@ -222,6 +222,7 @@ All configuration is validated at startup via Zod schemas in `src/config/server-
 | `MET_REQUEST_TIMEOUT_MS` | Per-request HTTP timeout in milliseconds | `10000` |
 | `MET_CALL_DEADLINE_MS` | Time budget in milliseconds for one tool call, retries included; exceeding it fails with `retry_deadline_exceeded` | `30000` |
 | `MET_BATCH_CONCURRENCY` | Max parallel fetches in `met_get_object` | `5` |
+| `MET_CLAMP_LIMITS` | Read a `limit` above 500 on `met_search_collections` and `met_list_objects` as a 500-ID page, with a notice, instead of rejecting it; `false` makes 500 the schema maximum | `true` |
 
 See [`.env.example`](./.env.example) for the full list of optional overrides.
 

@@ -18,7 +18,7 @@ import { escapeMarkdown, isHttpUrl } from '@/utils/markdown.js';
 
 const ConstituentSchema = z
   .object({
-    constituentID: z.number().int().describe('Constituent identifier for cross-referencing.'),
+    constituentID: z.number().int().describe("The Met's identifier for the constituent."),
     role: z
       .string()
       .describe('Role in relation to the object (e.g., "Artist", "Maker", "Designer").'),
@@ -170,7 +170,7 @@ const ObjectSchema = z
     artistDisplayName: z
       .string()
       .describe(
-        'Name of the person or firm the attribution names (e.g., "Vincent van Gogh"), without the qualifier in artistPrefix or the text in artistSuffix — read those and artistRole with it. Empty for anonymous or unknown works.',
+        'Name of the person or firm the attribution names (e.g., "Vincent van Gogh"), without the qualifier in artistPrefix or the text in artistSuffix — read those and artistRole with it. Pass it as q to met_search_collections with matchField "artistOrCulture" to find other works attributed to this name, qualified attributions such as "Style of" included; that match reads the lead attribution and the culture field, not every name in constituents. Empty for anonymous or unknown works.',
       ),
     artistSuffix: z
       .string()
@@ -294,47 +294,12 @@ const ObjectSchema = z
   .describe('A fully fetched Met Museum object record.');
 
 /**
- * Cumulative serialized-byte ceiling for the records one call returns.
- *
- * Measured on `structuredContent`, the surface that dominates, and only on it.
- * `content[]` renders the same admitted records as markdown, so what reaches the
- * wire is roughly twice this number — the disclosure says so rather than letting
- * a caller read the budget as a response-size cap.
- *
- * The axis is the sum, not the record: no single Met record approaches an
- * overflow (the heaviest measured normalizes to about 5 KB), while twenty of
- * them together are what produces a six-figure response. So this is not the
- * framework's per-document `outlineOnOverflow` budget applied per object —
- * that would never fire here — but the same idea moved to the batch.
- *
- * The number is where the advertised 20-ID cap meets the measured record size:
- * 60,000 / 20 = 3,000 bytes per record, which sits between a typical normalized
- * record and the heaviest sampled one. A full 20-ID batch of ordinary records
- * therefore comes back whole and unchanged, and only a batch whose records run
- * heavy — the case this bound exists for — spends the budget early.
- *
- * A helper constant, deliberately not an env var: a deploy-tunable threshold
- * would drift the tool's response shape between environments.
- */
-const BATCH_BUDGET_BYTES = 60_000;
-
-/**
- * How many distinct IDs one call fetches. The distinct IDs past it are returned
- * unrequested in `remainingIDs`, so a list longer than the cap is served in part
- * and named in full rather than refused.
+ * How many distinct IDs one call fetches, and so how many records one response
+ * can carry: every record fetched is returned whole. The distinct IDs past it
+ * are returned unrequested in `remainingIDs`, so a list longer than the cap is
+ * served in part and named in full rather than refused.
  */
 const OBJECT_CAP = 20;
-
-const utf8 = new TextEncoder();
-
-/**
- * Serialized size of a record in bytes, not UTF-16 code units. Met catalog text
- * is full of multi-byte characters (en dashes in date spans, accented artist
- * names), so a `.length` measurement understates the real payload.
- */
-function serializedBytes(value: unknown): number {
-  return utf8.encode(JSON.stringify(value)).length;
-}
 
 /**
  * How many images one call attaches, to the first CC0 records in request order.
@@ -342,7 +307,8 @@ function serializedBytes(value: unknown): number {
  * The cap counts images, not bytes: the web-large rendition is bounded in
  * pixels (long edge about 600 px), so what one costs a vision model is roughly
  * fixed while its file size varies several-fold. Three is enough to compare
- * works side by side. A constant for the same reason as `BATCH_BUDGET_BYTES`.
+ * works side by side. A constant, not an env var: a deploy-tunable cap would
+ * drift the tool's response shape between environments.
  */
 const IMAGE_CAP = 3;
 
@@ -365,7 +331,7 @@ async function attachImages(
   service: MetService,
   ctx: Context,
   deadline: CallDeadline,
-): Promise<{ images: ImageEntry[]; attached: number; base64Bytes: number }> {
+): Promise<ImageEntry[]> {
   // All at once: the cap bounds it at 3 requests, to the image host rather than
   // the firewalled API, and one after another would stack their latencies
   // inside the call's shared budget.
@@ -381,8 +347,6 @@ async function attachImages(
   // Blocks are emitted only after every fetch settles, so content[] follows
   // request order whatever order the fetches finish in.
   const images: ImageEntry[] = [];
-  let attached = 0;
-  let base64Bytes = 0;
   for (const [index, { objectID, hasCC0Image }] of objects.entries()) {
     const result = fetched[index];
     if (result == null) {
@@ -397,16 +361,14 @@ async function attachImages(
     ctx.content({ type: 'text', text: `Image of object ${objectID} (primaryImageSmall)` });
     ctx.content.image(result.data, result.mimeType);
     images.push({ objectID, status: 'attached' });
-    attached++;
-    base64Bytes += result.data.length;
   }
-  return { images, attached, base64Bytes };
+  return images;
 }
 
 export const metGetObject = tool('met_get_object', {
   title: 'Get Met Objects',
   description:
-    'Fetch full records for one or more Met Museum object IDs. Fetches up to 20 distinct IDs per call; a list of up to 500 (a full search or list page) is accepted, and the distinct IDs past the first 20 come back unrequested in remainingIDs for a follow-up call. Returns partial success — a single 404 does not fail the whole batch; per-ID failures are reported separately. Object IDs come from met_search_collections (keyword search) or met_list_objects (browse by department or update date). Non-public-domain objects return empty image URLs. The constituents array is null for anonymous or unattributed works; tags and measurements are null when the Met records none. Records are returned whole and never truncated, so a batch of unusually large records may return fewer than requested — any that did not fit are listed in deferred[] with their sizes, to be re-requested in a follow-up call. Set includeImages to also receive the CC0 images of up to 3 returned records as image content a vision-capable model can look at.',
+    'Fetch full records for one or more Met Museum object IDs. Fetches up to 20 distinct IDs per call; a list of up to 500 (a full search or list page) is accepted, and the distinct IDs past the first 20 come back unrequested in remainingIDs for a follow-up call. Returns partial success — a single 404 does not fail the whole batch; per-ID failures are reported separately. Object IDs come from met_search_collections (keyword search) or met_list_objects (browse by department or update date). Non-public-domain objects return empty image URLs. The constituents array is null for anonymous or unattributed works; tags and measurements are null when the Met records none. Set includeImages to also receive the CC0 images of up to 3 returned records as image content a vision-capable model can look at.',
   annotations: { readOnlyHint: true, idempotentHint: true },
   /**
    * `ids` can only mean the ID list: the tool's other input is the
@@ -447,33 +409,11 @@ export const metGetObject = tool('met_get_object', {
           .describe('A per-ID fetch failure.'),
       )
       .describe('Object IDs that failed to fetch with per-ID error context.'),
-    deferred: z
-      .array(
-        z
-          .object({
-            objectID: z
-              .number()
-              .int()
-              .describe('Object ID whose record was fetched but withheld from this response.'),
-            bytes: z
-              .number()
-              .int()
-              .nonnegative()
-              .describe(
-                'Serialized structuredContent size of the withheld record — the same scale the budget is measured on — so a follow-up batch can be sized before it is requested.',
-              ),
-          })
-          .describe('A record fetched successfully but withheld to keep the response bounded.'),
-      )
-      .optional()
-      .describe(
-        'Records that were fetched but did not fit the call’s cumulative budget on serialized structuredContent bytes, in request order. Re-call met_get_object with these IDs to retrieve them. Absent when every fetched record fit.',
-      ),
     remainingIDs: z
       .array(z.number().int().describe('A distinct object ID past the per-call cap.'))
       .optional()
       .describe(
-        'The distinct object IDs past the first 20, in request order. These were not requested, unlike deferred[] (fetched, withheld by the byte budget) and the failed[] entries an upstream block, throttle, or outage left unrequested. Re-call met_get_object with them. Absent when the call held 20 or fewer distinct IDs.',
+        'The distinct object IDs past the first 20, in request order. These were not requested; they are separate from the failed[] entries an upstream block, throttle, or outage left unrequested, which fall within the first 20. Re-call met_get_object with them. Absent when the call held 20 or fewer distinct IDs.',
       ),
     images: z
       .array(
@@ -486,7 +426,7 @@ export const metGetObject = tool('met_get_object', {
       )
       .optional()
       .describe(
-        'Image outcome for each record in objects[], in request order; deferred, failed, and remainingIDs get no entry. Present only when includeImages is true.',
+        'Image outcome for each record in objects[], in request order; failed[] and remainingIDs get no entry. Present only when includeImages is true.',
       ),
   }),
   enrichment: {
@@ -494,7 +434,7 @@ export const metGetObject = tool('met_get_object', {
       .string()
       .optional()
       .describe(
-        'Present when the call held more than 20 distinct object IDs, or when the batch byte budget deferred a record; both apply as one string, the remainingIDs sentence first. Past the cap it says how many IDs were requested and that the rest are in remainingIDs; for deferred records, how to retrieve them, with the budget applied.',
+        'Present when the call held more than 20 distinct object IDs: it says how many distinct IDs the call held and that the ones past the first 20 are in remainingIDs, not requested.',
       ),
   },
   errors: [
@@ -552,11 +492,10 @@ export const metGetObject = tool('met_get_object', {
     const deadline = startCallDeadline(ctx.signal);
 
     // De-duplicated up front, first occurrence winning its position. A repeated
-    // ID would otherwise be fetched twice, charged to the byte budget twice —
-    // displacing a distinct record that would have fit — and, once the budget
-    // was spent, land in both objects[] and deferred[], telling the caller to
-    // re-request a record it had already received. The cap counts distinct IDs,
-    // so the cut comes after: everything below works on the requested IDs alone.
+    // ID would otherwise be fetched twice, taking a second of the 20 fetch
+    // slots, and could come back twice — or in both objects[] and failed[] when
+    // its two fetches end differently. The cap counts distinct IDs, so the cut
+    // comes after: everything below works on the requested IDs alone.
     const distinctIDs = [...new Set(input.objectIDs)];
     const objectIDs = distinctIDs.slice(0, OBJECT_CAP);
     const remainingIDs = distinctIDs.slice(OBJECT_CAP);
@@ -571,7 +510,6 @@ export const metGetObject = tool('met_get_object', {
 
     type SuccessItem = {
       ok: true;
-      objectID: number;
       record: NonNullable<Awaited<ReturnType<typeof service.getObject>>>;
     };
     /** `deadline`: the call's budget ran out on this ID, or before its fetch started. */
@@ -696,7 +634,7 @@ export const metGetObject = tool('met_get_object', {
               error: `Object ${objectID} not found in the Met collection — the object endpoint does not serve it, though the search index can still list it. Drop this ID rather than searching for it again.`,
             };
           } else {
-            results[index] = { ok: true, objectID, record };
+            results[index] = { ok: true, record };
           }
         } catch (err) {
           // A cancelled call ends as cancelled, never as a partial success whose
@@ -736,27 +674,9 @@ export const metGetObject = tool('met_get_object', {
     );
     await Promise.all(workers);
 
-    const succeeded = results.filter((r): r is SuccessItem => r.ok);
+    const objects = results.filter((r): r is SuccessItem => r.ok).map((r) => r.record);
     const failItems = results.filter((r): r is FailItem => !r.ok);
     const failed = failItems.map((r) => ({ objectID: r.objectID, error: r.error }));
-
-    // Admit whole records in request order while the cumulative budget lasts, and
-    // stop at the first that does not fit — the returned set is a prefix of the
-    // successes, so a re-call with the deferred IDs continues where this left off.
-    const sized = succeeded.map((item) => ({ ...item, bytes: serializedBytes(item.record) }));
-    let admitted = 0;
-    let usedBytes = 0;
-    for (const item of sized) {
-      // The first success is admitted unconditionally: a record larger than the
-      // whole budget must still be reachable, or its ID never comes back at all.
-      if (admitted > 0 && usedBytes + item.bytes > BATCH_BUDGET_BYTES) break;
-      usedBytes += item.bytes;
-      admitted++;
-    }
-    const objects = sized.slice(0, admitted).map((item) => item.record);
-    const deferred = sized
-      .slice(admitted)
-      .map((item) => ({ objectID: item.objectID, bytes: item.bytes }));
 
     if (objects.length === 0) {
       /** The batch-level message for an upstream cause: nothing came back, and why. */
@@ -820,44 +740,23 @@ export const metGetObject = tool('met_get_object', {
       );
     }
 
-    ctx.log.info('Met batch complete', {
-      fetched: succeeded.length,
-      returned: objects.length,
-      failed: failed.length,
-      deferred: deferred.length,
-    });
+    ctx.log.info('Met batch complete', { fetched: objects.length, failed: failed.length });
 
-    // After admission, so only returned records get an image or an entry.
-    const attachment = input.includeImages
+    const images = input.includeImages
       ? await attachImages(objects, service, ctx, deadline)
       : undefined;
 
-    /** Every notice this response carries, sent as one string: `ctx.enrich.notice` is last-wins. */
-    const notices: string[] = [];
     if (overCap > 0) {
       const one = overCap === 1;
-      notices.push(
+      ctx.enrich.notice(
         `Requested the first ${OBJECT_CAP} of ${distinctIDs.length} distinct object IDs, the per-call cap; the other ${overCap} ${one ? 'is' : 'are'} in remainingIDs and ${one ? 'was' : 'were'} not requested. Re-call met_get_object with ${one ? 'it' : 'them'}.`,
       );
     }
-    if (deferred.length > 0) {
-      // The image blocks are outside the budget but inside the response, so
-      // the delivered size stated here has to count them.
-      const imageClause = attachment?.attached
-        ? `, plus ${attachment.attached} attached image block${attachment.attached === 1 ? '' : 's'} (${attachment.base64Bytes} bytes of base64)`
-        : '';
-      notices.push(
-        `Returned ${objects.length} of ${succeeded.length} fetched records — ${usedBytes} bytes of serialized structuredContent against a ${BATCH_BUDGET_BYTES}-byte budget measured on that surface alone; content[] renders the same records again, so the delivered response is roughly twice that${imageClause}. ` +
-          `The remaining ${deferred.length} would exceed the budget. Re-call met_get_object with the deferred objectIDs to retrieve them; each record's listed size is on the same structuredContent scale, so sum them against the budget before requesting several.`,
-      );
-    }
-    if (notices.length > 0) ctx.enrich.notice(notices.join(' '));
     return {
       objects,
       failed,
-      ...(deferred.length > 0 && { deferred }),
       ...(overCap > 0 && { remainingIDs }),
-      ...(attachment && { images: attachment.images }),
+      ...(images && { images }),
     };
   },
 
@@ -1001,18 +900,9 @@ export const metGetObject = tool('met_get_object', {
       lines.push('**Failed fetches:** none');
     }
 
-    // Rendered on field presence: a batch that fit the budget carries no
-    // deferred[] and `content[]` gains nothing, matching `structuredContent`.
-    // The accompanying re-call guidance rides the enrichment trailer, which the
+    // Rendered on field presence: absent unless the call held more than 20
+    // distinct IDs. The re-call guidance rides the enrichment trailer, which the
     // framework mirrors onto both surfaces without a render here.
-    if (result.deferred?.length) {
-      lines.push('', '## Deferred — batch byte budget');
-      for (const d of result.deferred) {
-        lines.push(`- **${d.objectID}:** ${d.bytes} bytes`);
-      }
-    }
-
-    // On field presence too: absent unless the call held more than 20 distinct IDs.
     if (result.remainingIDs?.length) {
       lines.push('', '## Over the per-call cap — not requested', result.remainingIDs.join(', '));
     }
