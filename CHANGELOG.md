@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.10.0](changelog/0.10.x/0.10.0.md) — 2026-11-04 · ⚠️ Breaking
+
+met_search_collections gains matchField artistOrCulture, and met_get_object returns every fetched record and drops its deferred output field. A limit above 500 reads a 500-ID page with no advertised maximum, unless MET_CLAMP_LIMITS=false. The server publishes a met-museum-guide agent skill; mcp-ts-core ^0.13.18.
+
 ## [0.9.0](changelog/0.9.x/0.9.0.md) — 2026-10-15 · ⚠️ Breaking
 
 An HTTP 429 that outlasts the retries fails as upstream_rate_limited on every tool, with the requested wait in the message; met_get_object accepts up to 500 IDs and met_search_collections and met_list_objects a limit up to 10,000, each disclosing what it did not serve; records gain reign and portfolio; mcp-ts-core ^0.13.15.

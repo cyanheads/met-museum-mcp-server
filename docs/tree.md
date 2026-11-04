@@ -1,6 +1,6 @@
 # met-museum-mcp-server - Directory Structure
 
-Generated on: 2026-10-15 11:52:33
+Generated on: 2026-11-04 10:39:42
 
 ```text
 met-museum-mcp-server/
@@ -25,6 +25,7 @@ met-museum-mcp-server/
 │   └── settings.json
 ├── changelog/
 │   ├── 0.1.x/
+│   ├── 0.10.x/
 │   ├── 0.2.x/
 │   ├── 0.3.x/
 │   ├── 0.4.x/
@@ -45,6 +46,8 @@ met-museum-mcp-server/
 │   ├── add-resource/
 │   │   └── SKILL.md
 │   ├── add-service/
+│   │   └── SKILL.md
+│   ├── add-skill/
 │   │   └── SKILL.md
 │   ├── add-test/
 │   │   └── SKILL.md
@@ -142,6 +145,9 @@ met-museum-mcp-server/
 │   ├── prune-musl-packages.ts
 │   ├── release-github.ts
 │   └── tree.ts
+├── skills/
+│   └── met-museum-guide/
+│       └── SKILL.md
 ├── src/
 │   ├── config/
 │   │   └── server-config.ts
@@ -151,11 +157,12 @@ met-museum-mcp-server/
 │   │   ├── resources/
 │   │   │   └── definitions/
 │   │   └── tools/
-│   │       └── definitions/
-│   │           ├── met-get-object.tool.ts
-│   │           ├── met-list-departments.tool.ts
-│   │           ├── met-list-objects.tool.ts
-│   │           └── met-search-collections.tool.ts
+│   │       ├── definitions/
+│   │       │   ├── met-get-object.tool.ts
+│   │       │   ├── met-list-departments.tool.ts
+│   │       │   ├── met-list-objects.tool.ts
+│   │       │   └── met-search-collections.tool.ts
+│   │       └── page-limit.ts
 │   ├── services/
 │   │   └── met/
 │   │       ├── met-service.ts
@@ -165,8 +172,14 @@ met-museum-mcp-server/
 │   │   └── markdown.ts
 │   └── index.ts
 ├── tests/
+│   ├── config/
+│   │   └── server-config.test.ts
+│   ├── helpers/
+│   │   └── read-markdown-text.ts
 │   ├── prompts/
 │   ├── resources/
+│   ├── scripts/
+│   │   └── bundle-agent-docs.test.ts
 │   ├── services/
 │   │   └── met/
 │   │       ├── met-service-base-url.test.ts
@@ -181,7 +194,8 @@ met-museum-mcp-server/
 │   │   ├── met-get-object.tool.test.ts
 │   │   ├── met-list-departments.tool.test.ts
 │   │   ├── met-list-objects.tool.test.ts
-│   │   └── met-search-collections.tool.test.ts
+│   │   ├── met-search-collections.tool.test.ts
+│   │   └── page-limit.test.ts
 │   ├── utils/
 │   │   ├── html-entities.test.ts
 │   │   └── markdown.test.ts
@@ -202,7 +216,9 @@ met-museum-mcp-server/
 ├── Dockerfile
 ├── LICENSE
 ├── manifest.json
+├── mcp.json
 ├── package.json
+├── plugin.json
 ├── README.md
 ├── server.json
 ├── tsconfig.build.json
