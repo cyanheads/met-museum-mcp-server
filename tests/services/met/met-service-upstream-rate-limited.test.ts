@@ -151,7 +151,12 @@ function expectRateLimited(
   const text = textOf(result);
   expect(text).toContain(`Error: ${message}`);
   expect(text).toContain(`Recovery: ${RATE_LIMIT_RECOVERY}`);
-  expect(text).toContain('(reason upstream_rate_limited)');
+  // The trailer names the raw `Retry-After` value, as a code span, when the Met sent one.
+  expect(text).toContain(
+    retryAfter === undefined
+      ? '(reason upstream_rate_limited)'
+      : `(reason upstream_rate_limited · retry after \`${retryAfter}\`)`,
+  );
   expect(text).not.toContain('brief delay');
   return error;
 }
