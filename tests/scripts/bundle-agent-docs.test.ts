@@ -27,6 +27,7 @@ describe('bundle agent-doc boundary', () => {
     'node_modules/outer/node_modules/@modelcontextprotocol/server/dist/ext/skills/index.mjs',
     'node_modules/runtime/dist/skills/index.js',
     'node_modules/@scope/skills/index.js',
+    'node_modules/package/docs/AGENTS.md',
     'skills/example-guide/SKILL.md',
   ])('keeps the runtime or published entry %s', (entry) => {
     expect(filterAgentDocEntries([entry])).toEqual([]);
@@ -41,6 +42,9 @@ describe('bundle agent-doc boundary', () => {
     'node_modules/outer/node_modules/package/.claude/settings.json',
     'node_modules/package/.agents/guide.md',
     'node_modules/package/docs/SKILL.md',
+    'node_modules/package/AGENTS.md',
+    'node_modules/@scope/package/CLAUDE.md',
+    'node_modules/@cyanheads/mcp-ts-core/CLAUDE.md',
   ])('strips the dependency agent doc %s', (entry) => {
     expect(filterAgentDocEntries([entry])).toEqual([entry]);
     expect(checkBundleEntries([entry], 'fixture.mcpb')).toHaveLength(1);
