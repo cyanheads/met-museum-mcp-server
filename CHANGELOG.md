@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.10.1](changelog/0.10.x/0.10.1.md) — 2026-11-14
+
+met_get_object keeps a multi-line dimensions value's line breaks in content[], and every field value there reads back as written. medium is described as the Met's object-type grouping, not the classification field. mcp-ts-core ^0.13.22.
+
 ## [0.10.0](changelog/0.10.x/0.10.0.md) — 2026-11-04 · ⚠️ Breaking
 
 met_search_collections gains matchField artistOrCulture, and met_get_object returns every fetched record and drops its deferred output field. A limit above 500 reads a 500-ID page with no advertised maximum, unless MET_CLAMP_LIMITS=false. The server publishes a met-museum-guide agent skill; mcp-ts-core ^0.13.18.
