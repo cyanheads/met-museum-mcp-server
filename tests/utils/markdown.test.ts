@@ -40,8 +40,11 @@ describe('escapeMarkdown', () => {
 
   describe('edge whitespace and entity-shaped ampersands', () => {
     it('writes edge spaces as references, so a trailing run never ends the line in a hard break', () => {
-      // `Oil on canvas\r\n\r\n` collapses to two trailing spaces, which a raw
-      // CommonMark reader takes as a hard break that pulls the next field in.
+      /**
+       * `Oil on canvas\r\n\r\n` collapses to two trailing spaces. Written raw, a
+       * CommonMark reader drops them and reads a hard break, which starts the
+       * next field on a new line where every other field boundary is a soft break.
+       */
       const medium = escapeMarkdown('Oil on canvas\r\n\r\n');
       expect(medium).toBe('Oil on canvas&#32;&#32;');
       expect(readMarkdownText(`**Medium:** ${medium}\n**Dimensions:** D`)).toBe(
