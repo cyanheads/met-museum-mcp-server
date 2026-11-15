@@ -18,6 +18,7 @@ function inlineText(token: Token): string {
     case 'code_inline':
       return token.content;
     case 'softbreak':
+      return ' ';
     case 'hardbreak':
       return '\n';
     default:
@@ -27,7 +28,9 @@ function inlineText(token: Token): string {
 
 /**
  * The text a CommonMark reader sees in `markdown`: each block's inline text,
- * code-span content verbatim, line breaks as `\n`, blocks joined by `\n`.
+ * code-span content verbatim, a soft break as a space, a hard break as `\n`,
+ * blocks joined by `\n`. So a value written across lines with a bare LF reads
+ * back as one line, and only a hard break keeps it on two.
  * Emphasis, links, and other inline markup contribute only the text inside
  * them, so a value that rendered as live syntax reads back changed and fails a
  * plain-text expectation.
