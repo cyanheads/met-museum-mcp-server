@@ -1,68 +1,68 @@
 /**
- * @fileoverview Tests for the `content[]` render-boundary helpers — the escape
- * set, the characters deliberately left alone, the newline collapse, the
- * single-pass property, the linear-time inline escaper's equivalence,
- * read-back, and CPU bound, and the link-destination predicate.
+ * @fileoverview Tests for the `content[]` render-boundary helpers — the
+ * read-back of the one-line escaper every field but `dimensions` renders
+ * through, its edge whitespace and entity-shaped `&`, the characters it leaves
+ * alone, the newline collapse, the link-destination predicate — and for the
+ * read-back and CPU bound of the framework's line-keeping escaper, which
+ * renders caller text of any length.
  * @module tests/utils/markdown.test
  */
 
 import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { describe, expect, it } from 'vitest';
-import { escapeMarkdown, escapeMarkdownInlineLinear, isHttpUrl } from '@/utils/markdown.js';
+import { escapeMarkdown, isHttpUrl } from '@/utils/markdown.js';
 import { readMarkdownText } from '../helpers/read-markdown-text.js';
 
 describe('escapeMarkdown', () => {
-  describe('escape set', () => {
+  describe('read-back', () => {
     it.each([
-      ['backslash', '\\', '\\\\'],
-      ['backtick', '`', '\\`'],
-      ['asterisk', '*', '\\*'],
-      ['underscore', '_', '\\_'],
-      ['open bracket', '[', '\\['],
-      ['close bracket', ']', '\\]'],
-      ['less-than', '<', '\\<'],
+      ['every inline metacharacter', '\\ ` * _ [ ] < > & ! | ~ # - + .'],
+      ['a complete link label, the pattern real Met titles carry', '[29 Glass Stereographs]'],
+      ['a raw HTML tag', '<script>alert(1)</script>'],
+      ['an image', '![img](x)'],
+      ['an already-backslashed metacharacter', '\\* \\['],
+      ['a line-leading block marker', '# 1. > - quoted'],
+      ['entity references', 'Gift &amp; bequest &copy; &#38; &#x26;'],
+      ['leading and trailing spaces', '  lead and trail  '],
+    ])('reads %s back exactly', (_label, input) => {
+      expect(readMarkdownText(`**Field:** ${escapeMarkdown(input)}`)).toBe(`Field: ${input}`);
+    });
+
+    it.each([
+      ['a complete link label', '[29 Glass Stereographs]', '\\[29 Glass Stereographs\\]'],
+      ['a raw HTML tag', '<script>alert(1)</script>', '\\<script>alert(1)\\</script>'],
+      ['an already-backslashed asterisk, each character once', '\\*', '\\\\\\*'],
+      ['an already-backslashed bracket, each character once', '\\[', '\\\\\\['],
     ])('escapes %s', (_label, input, expected) => {
       expect(escapeMarkdown(input)).toBe(expected);
     });
+  });
 
-    it('escapes every occurrence, not just the first', () => {
-      expect(escapeMarkdown('a*b*c')).toBe('a\\*b\\*c');
+  describe('edge whitespace and entity-shaped ampersands', () => {
+    it('writes edge spaces as references, so a trailing run never ends the line in a hard break', () => {
+      // `Oil on canvas\r\n\r\n` collapses to two trailing spaces, which a raw
+      // CommonMark reader takes as a hard break that pulls the next field in.
+      const medium = escapeMarkdown('Oil on canvas\r\n\r\n');
+      expect(medium).toBe('Oil on canvas&#32;&#32;');
+      expect(readMarkdownText(`**Medium:** ${medium}\n**Dimensions:** D`)).toBe(
+        'Medium: Oil on canvas   Dimensions: D',
+      );
     });
 
-    it('neutralizes a complete link label — the pattern real Met titles carry', () => {
-      expect(escapeMarkdown('[29 Glass Stereographs]')).toBe('\\[29 Glass Stereographs\\]');
-    });
-
-    it('neutralizes a raw HTML tag', () => {
-      expect(escapeMarkdown('<script>alert(1)</script>')).toBe('\\<script>alert(1)\\</script>');
+    it('escapes an entity-shaped ampersand, so the reference reads back as typed', () => {
+      expect(escapeMarkdown('Gift &amp; bequest &copy;')).toBe('Gift \\&amp; bequest \\&copy;');
     });
   });
 
-  describe('single left-to-right pass', () => {
-    it('escapes an already-backslashed metacharacter exactly once each', () => {
-      // A chained per-character replace would re-match the backslash it just
-      // inserted and emit `\\\\*` — one pass over a character class cannot.
-      expect(escapeMarkdown('\\*')).toBe('\\\\\\*');
-    });
-
-    it('does not re-escape the backslash it inserts before a bracket', () => {
-      expect(escapeMarkdown('[')).toBe('\\[');
-      expect(escapeMarkdown('\\[')).toBe('\\\\\\[');
-    });
-  });
-
-  describe('characters deliberately left alone', () => {
+  describe('characters left alone', () => {
     it.each([
       ['parenthesized metric conversion', '38.1 x 24.1 cm)'],
       ['balanced parentheses', 'Bodhisattvas of the Four Directions(?)'],
-      ['ampersand', 'S & H'],
-      ['hash', '# not a heading here'],
-      ['blockquote marker', '> quoted'],
-      ['list markers', '- item + item'],
+      ['a bare ampersand', 'S & H'],
+      ['an intraword underscore', 'Unknown_Maker'],
+      ['a lone less-than', 'a < b'],
+      ['a mid-line greater-than', 'a > b'],
       ['bang', '!important'],
-      ['pipe', 'a | b'],
-      ['tilde', '~approx'],
-      ['greater-than', 'a > b'],
       ['em dash and slashes', '28 7/8 × 36 3/4 in. — framed'],
     ])('leaves %s verbatim', (_label, input) => {
       expect(escapeMarkdown(input)).toBe(input);
@@ -101,55 +101,13 @@ describe('escapeMarkdown', () => {
   });
 });
 
-describe('escapeMarkdownInlineLinear', () => {
-  it.each([
-    ['an inequality', '<=50'],
-    ['an ampersand inside a name', 'AT&T'],
-    ['a trailing hash', 'C#'],
-    ['a hash before a number', 'C# 12'],
-    ['a lone mid-line hash', 'a # b'],
-    ['an intraword underscore', 'snake_case'],
-    ['a Windows path', 'C:\\Users\\x'],
-    ['a hash run closing the line', 'abc #'],
-    ['a two-hash run closing the line', 'abc ##'],
-    ['a seven-hash run closing the line', 'abc #######'],
-    ['a hash after a tab, mid-line and at the end', 'a #\tb #'],
-    ['emphasis, raw HTML, and a list across a line break', 'A*p* <b>x</b>\n- y'],
-    ['block markers mid-line', '5 > 3, a - b + c, step 1. then 2)'],
-    ['edge and doubled whitespace', '  lead and  trail  '],
-    ['a leading tab', '\tindented'],
-    ['an indented second line', 'a\n  b'],
-    ['a final line break', 'a\n'],
-    ['CRLF and CR', 'a\r\nb\rc'],
-    ['an entity and two autolinks', '&amp; <a@b.c> <https://x.io>'],
-    ['backslashes before space, punctuation, and the end', 'x \\ y\\* z\\'],
-    ['Unicode whitespace and an astral neighbour', 'a\u00a0b\u3000c 😀_x_😀'],
-    ['a vertical tab at the edges', '\v a \v'],
-    [
-      'a zero-match notice quoting a Markdown-active keyword',
-      'The keyword "zz \\"a\\" *b* [c](https://x.io) `d`" matches no object in the collection. Try a different, broader, or differently spelled keyword.',
-    ],
-    [
-      'the department-filter notice',
-      "The Met's search returns departments 7 (The Cloisters) and 17 (Medieval Art) as one combined result set: total counts matches in both. For exact department membership, use met_list_objects with departmentId 7.",
-    ],
-  ])('writes what escapeMarkdownInline writes for %s', (_label, text) => {
-    expect(escapeMarkdownInlineLinear(text)).toBe(escapeMarkdownInline(text));
-  });
-
-  it.each([
-    ['a dash run', '--- x'],
-    ['an equals run', '=== x'],
-    ['a hash before a no-break space', '#\u00a0x'],
-  ])(
-    'may escape %s opening a line that is no block marker, which reads back the same',
-    (_label, text) => {
-      expect(escapeMarkdownInline(text)).toBe(text);
-      expect(escapeMarkdownInlineLinear(text)).toBe(`\\${text}`);
-      expect(readMarkdownText(escapeMarkdownInlineLinear(text))).toBe(text);
-    },
-  );
-
+/**
+ * The framework escaper that `met_search_collections`' notice trailer and
+ * `met_get_object`'s `dimensions` render through. The notice quotes `q`, which
+ * has no length bound, so the read-back and the linear running time are this
+ * server's guarantees too.
+ */
+describe('escapeMarkdownInline', () => {
   it('reads back every string of a seeded sweep over the escape triggers as written', () => {
     // Every character an escape rule tests, the whitespace kinds, and entity-shaped fragments.
     const alphabet = [
@@ -174,7 +132,7 @@ describe('escapeMarkdownInlineLinear', () => {
       let text = '';
       for (let length = 1 + next(16); length > 0; length--) text += alphabet[next(alphabet.length)];
       // A CommonMark parse reads CR and CRLF as LF.
-      if (readMarkdownText(escapeMarkdownInlineLinear(text)) !== text.replace(/\r\n?/g, '\n')) {
+      if (readMarkdownText(escapeMarkdownInline(text)) !== text.replace(/\r\n?/g, '\n')) {
         mismatches.push(text);
       }
     }
@@ -199,7 +157,7 @@ describe('escapeMarkdownInlineLinear', () => {
         let calls = 0;
         let elapsed = 0;
         do {
-          escapeMarkdownInlineLinear(text);
+          escapeMarkdownInline(text);
           calls++;
           elapsed = cpuMs() - start;
         } while (elapsed < 2);
@@ -210,22 +168,29 @@ describe('escapeMarkdownInlineLinear', () => {
     /** CPU allowed per call for each 1,000 characters, several times what one costs. */
     const MS_PER_THOUSAND_CHARS = 2;
     const SMALLEST = 5_000;
+    /** 64 times SMALLEST: a linear escaper's cost grows 64-fold across it, a quadratic one's 4,096-fold. */
+    const LARGEST = 320_000;
 
     it.each([
-      ['one long line ending in a break', (n: number) => `${'§1 x'.repeat(n / 4)}\ny`, 80_000],
-      ['breaks throughout', (n: number) => '  \r\n'.repeat(n / 4), 320_000],
-      ['two words', (n: number) => `a${' '.repeat(n)}b`, 320_000],
-    ])('runs in linear time on %s', (_label, make, largest) => {
-      let first = 0;
-      let last = 0;
-      for (let chars = SMALLEST; chars <= largest; chars *= 2) {
-        last = perCallMs(make(chars));
-        if (chars === SMALLEST) first = last;
-        // Checked before the next doubling, so a super-linear escaper fails at the first size it outgrows.
-        expect(last, `${chars} characters`).toBeLessThan(MS_PER_THOUSAND_CHARS * (chars / 1_000));
-      }
-      expect(last / first).toBeLessThan(4 * (largest / SMALLEST));
-    });
+      ['one long line ending in a break', (n: number) => `${'§1 x'.repeat(n / 4)}\ny`],
+      ['breaks throughout', (n: number) => '  \r\n'.repeat(n / 4)],
+      ['two words', (n: number) => `a${' '.repeat(n)}b`],
+    ])(
+      'runs in linear time on %s',
+      (_label, make) => {
+        let ratio = 0;
+        for (let chars = SMALLEST; chars <= LARGEST; chars *= 2) {
+          // The baseline is timed again beside each size, so a drift in CPU speed moves both.
+          const baseline = perCallMs(make(SMALLEST));
+          const cost = perCallMs(make(chars));
+          // Checked before the next doubling, so a super-linear escaper fails at the first size it outgrows.
+          expect(cost, `${chars} characters`).toBeLessThan(MS_PER_THOUSAND_CHARS * (chars / 1_000));
+          ratio = cost / baseline;
+        }
+        expect(ratio).toBeLessThan(4 * (LARGEST / SMALLEST));
+      },
+      0,
+    );
   });
 });
 

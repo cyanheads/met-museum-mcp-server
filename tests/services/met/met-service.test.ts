@@ -1693,7 +1693,7 @@ describe('MetService', () => {
 
     /** The correction each named filter adds after `Correct or drop it, then retry.` (#54, #55). */
     const MEDIUM_SENTENCE =
-      ' medium takes one object classification, case-sensitive and spelled as the Met spells it ("Paintings", "Prints", "Sculpture"), not a material description or a "|"-joined list; met_get_object returns an object’s classification.';
+      ' medium takes one object type, case-sensitive and spelled as the Met spells it ("Paintings", "Prints", "Sculpture"), not a material description or a "|"-joined list.';
     const GEO_LOCATION_SENTENCE =
       ' geoLocation takes one place, whole and case-sensitive as the Met spells it ("Greece", "Japan"), so "greece" or a fragment such as "Gree" matches nothing.';
     const DATES_SENTENCE =
@@ -1737,7 +1737,7 @@ describe('MetService', () => {
       const { notice: hint } = zeroOf(result);
       expect(hint).toContain('even with no filter applied');
       expect(hint).not.toContain('medium');
-      expect(hint).not.toContain('classification');
+      expect(hint).not.toContain('one object type');
 
       // Exactly one extra request: q alone, limit 1.
       const requests = searchRequests(fetchMock);
@@ -1760,6 +1760,8 @@ describe('MetService', () => {
       expect(hint).toBe(
         `The keyword "sunflower" matches 178 objects on its own, so the filter removed every match: medium. Correct or drop it, then retry.${MEDIUM_SENTENCE}`,
       );
+      // medium is an object-type grouping, not the record's classification field (#61).
+      expect(hint).not.toContain('classification');
       for (const other of [...OTHER_FILTERS, 'departmentId']) expect(hint).not.toContain(other);
       expect(effectiveQuery).toBe('q="sunflower", medium="Painting"');
       // Exactly one extra request: q alone, limit 1.
@@ -1873,7 +1875,7 @@ describe('MetService', () => {
         expect(notice).toBe(
           `The keyword "vase" matches 1,330 objects on its own, so the filter removed every match: ${name}. Correct or drop it, then retry.${sentence}`,
         );
-        expect(notice).not.toContain('classification');
+        expect(notice).not.toContain('one object type');
         expect(readMarkdownText(textOf(result)).split('\n')).toContain(notice);
       },
     );
@@ -2142,6 +2144,16 @@ describe('MetService', () => {
       expect(record?.hasCC0Image).toBe(false);
       expect(record?.tags).toBeNull();
       expect(record?.constituents).toBeNull();
+    });
+
+    it('keeps a multi-part dimensions value with its CRLF breaks, as the Met sends it (#62)', async () => {
+      // 285835: content[] renders each break as a hard break; structuredContent keeps the raw value.
+      const dimensions =
+        'Image: 7 5/16 × 9 1/4 in. (18.6 × 23.5 cm)\r\nMount: 10 5/8 × 13 5/8 in. (27 × 34.6 cm)';
+      fetchMock.mockResolvedValue(jsonResponse({ objectID: 285835, dimensions }));
+      const record = await getMetService().getObject(285835, ...call());
+
+      expect(record?.dimensions).toBe(dimensions);
     });
 
     describe('geography and measurements (#16)', () => {

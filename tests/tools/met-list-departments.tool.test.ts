@@ -50,7 +50,7 @@ describe('metListDepartments', () => {
       departments: [{ departmentId: 11, displayName: '[Arms] *and* Armor_1' }],
     });
     const text = (blocks[0] as { text: string }).text;
-    expect(text).toContain('\\[Arms\\] \\*and\\* Armor\\_1');
+    expect(text).toContain('\\[Arms\\] \\*and\\* Armor_1');
     expect(text).not.toContain('[Arms]');
     // The server's own bold syntax around departmentId is untouched.
     expect(text).toContain('**11**');

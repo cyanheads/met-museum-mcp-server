@@ -708,13 +708,46 @@ describe('metSearchCollections', () => {
     expect(description).not.toContain('geography fields');
   });
 
-  it('states in the medium description and the tool description that medium takes one classification', () => {
+  it('states in the medium description and the tool description that medium takes one object type (#61)', () => {
     const { description } = metSearchCollections.input.shape.medium;
-    expect(description).toContain('one object classification');
-    expect(description).toContain('"|"-joined list ("Prints|Paintings")');
-    expect(metSearchCollections.description).toContain(
-      'The medium parameter takes one object classification',
+    expect(description).toContain(
+      'one object type, case-sensitive and spelled as the Met spells it',
     );
+    expect(description).toContain('"paintings" matches nothing');
+    expect(description).toContain('"Oil on canvas" matches nothing');
+    expect(description).toContain('"|"-joined list ("Prints|Paintings")');
+    expect(description).toContain('The filter is the evidence for a match');
+    expect(description).toContain(
+      'classification on met_get_object can be empty or name another type',
+    );
+    expect(description).toContain('counts split by medium can double-count');
+    expect(description).not.toContain('Maps to the classification field');
+    expect(description).not.toContain('returns an object’s classification');
+    expect(metSearchCollections.description).toContain(
+      'The medium parameter takes one object type',
+    );
+    expect(metSearchCollections.description).not.toContain('classification');
+  });
+
+  it('names only medium examples that match objects for q "*" (#61)', () => {
+    /** Values `q=*` matched on 2026-11-14 (Paintings 15,266 … Watercolors 15,496; `paintings` 0). */
+    const matching = new Set([
+      'Paintings',
+      'Drawings',
+      'Prints',
+      'Ceramics',
+      'Sculpture',
+      'Photographs',
+      'Textiles',
+      'Watercolors',
+    ]);
+    const description = String(metSearchCollections.input.shape.medium.description);
+    const group = /\(e\.g\., ([^)]*)\)/.exec(description)?.[1] ?? '';
+    const examples = [...group.matchAll(/"([^"]+)"/g)].map((match) => match[1]);
+    const joined = /\("([^"]*\|[^"]*)"\)/.exec(description)?.[1]?.split('|') ?? [];
+    expect(examples.length).toBeGreaterThan(0);
+    expect(joined.length).toBeGreaterThan(1);
+    for (const value of [...examples, ...joined]) expect(matching).toContain(value);
   });
 
   it('keeps geoLocation a one-element array and medium a string: every call accepted before still is', () => {
@@ -888,6 +921,23 @@ describe('metSearchCollections', () => {
 
   it('rejects a whitespace-only medium with invalid_filter', async () => {
     await expectInvalidFilter({ q: 'sunflower', medium: '   ', limit: 3 }, 'medium');
+  });
+
+  it.each([
+    ['blank', ''],
+    ['whitespace-only', '   '],
+  ])('asks a %s medium for an object type, not a classification (#61)', async (_label, medium) => {
+    const message =
+      'medium is blank — supply an object type such as "Paintings", or omit the filter.';
+    const result = await runToolContract(metSearchCollections, { q: 'sunflower', medium });
+
+    expect(result.isError).toBe(true);
+    expect((result.structuredContent as { error: { message: string } }).error.message).toBe(
+      message,
+    );
+    const text = contentText(result);
+    expect(text).toContain(message);
+    expect(text).not.toContain('classification');
   });
 
   it('rejects an empty geoLocation array with invalid_filter', async () => {
@@ -1105,7 +1155,7 @@ describe('metSearchCollections', () => {
     expect(notice).toContain('matches 1 object on its own');
     expect(notice).toContain('removed every match: hasImages.');
     // No medium correction when medium was not set.
-    expect(notice).not.toContain('classification');
+    expect(notice).not.toContain('one object type');
   });
 
   it('keys the zero-match notice on total 0 alone: an empty page of a nonzero total gets none', async () => {

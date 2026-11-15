@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { pageLimitInput, servePageLimit } from '@/mcp-server/tools/page-limit.js';
 import {
   getMetService,
@@ -13,7 +14,6 @@ import {
   type SearchInput,
   startCallDeadline,
 } from '@/services/met/met-service.js';
-import { escapeMarkdownInlineLinear } from '@/utils/markdown.js';
 
 /** Thousands-separated, so the window and a large total read alike in prose. */
 const count = (n: number) => n.toLocaleString('en-US');
@@ -60,7 +60,7 @@ function zeroMatchNotice(q: string, filters: string[], keywordMatches: number | 
       ? `The ${noun} may have removed every match: ${list} — whether ${keyword} matches on its own could not be checked.`
       : `The keyword ${keyword} matches ${count(keywordMatches)} object${keywordMatches === 1 ? '' : 's'} on its own, so the ${noun} removed every match: ${list}.`;
   const medium = filters.includes('medium')
-    ? ' medium takes one object classification, case-sensitive and spelled as the Met spells it ("Paintings", "Prints", "Sculpture"), not a material description or a "|"-joined list; met_get_object returns an object’s classification.'
+    ? ' medium takes one object type, case-sensitive and spelled as the Met spells it ("Paintings", "Prints", "Sculpture"), not a material description or a "|"-joined list.'
     : '';
   const geoLocation = filters.includes('geoLocation')
     ? ' geoLocation takes one place, whole and case-sensitive as the Met spells it ("Greece", "Japan"), so "greece" or a fragment such as "Gree" matches nothing.'
@@ -110,7 +110,7 @@ function describeQuery({ limit: _limit, offset: _offset, ...applied }: SearchInp
 export const metSearchCollections = tool('met_search_collections', {
   title: 'Search Met Collection',
   description:
-    'Search the Metropolitan Museum of Art collection by keyword and optional filters. Returns the total match count and one page of matching object IDs, which met_get_object resolves to full records. Relevance is keyword-based, not semantic; department and geographic filters narrow results more than a longer query. Paging reaches only the first 10,000 matches of any search, so narrow a larger one with filters. The medium parameter takes one object classification as the Met spells it ("Paintings", "Sculpture"), not a material like "Oil on canvas". hasImages also includes copyrighted works; CC0 status is per object, from the isPublicDomain and hasCC0Image fields on met_get_object. isHighlight accepts true only. isOnView restricts results to works currently on display in a Met gallery.',
+    'Search the Metropolitan Museum of Art collection by keyword and optional filters. Returns the total match count and one page of matching object IDs, which met_get_object resolves to full records. Relevance is keyword-based, not semantic; department and geographic filters narrow results more than a longer query. Paging reaches only the first 10,000 matches of any search, so narrow a larger one with filters. The medium parameter takes one object type as the Met spells it ("Paintings", "Sculpture"), not a material like "Oil on canvas". hasImages also includes copyrighted works; CC0 status is per object, from the isPublicDomain and hasCC0Image fields on met_get_object. isHighlight accepts true only. isOnView restricts results to works currently on display in a Met gallery.',
   annotations: { readOnlyHint: true, idempotentHint: true },
   /**
    * `q` is the Met API's own parameter name, kept so the tool reads like the
@@ -156,7 +156,7 @@ export const metSearchCollections = tool('met_search_collections', {
       .string()
       .optional()
       .describe(
-        'Filter by one object classification, case-sensitive and spelled as the Met spells it (e.g., "Paintings", "Drawings", "Prints", "Ceramics", "Sculpture", "Photographs", "Textiles") — "paintings" or "Painting" matches nothing. Maps to the classification field on the object, not the materials text, so a material description like "Oil on canvas" matches nothing either, and neither does a "|"-joined list ("Prints|Paintings"); met_get_object returns an object’s classification.',
+        'Filter by one object type, case-sensitive and spelled as the Met spells it (e.g., "Paintings", "Drawings", "Prints", "Ceramics", "Sculpture", "Photographs", "Textiles", "Watercolors") — "paintings" matches nothing. A material description like "Oil on canvas" matches nothing either, and neither does a "|"-joined list ("Prints|Paintings"). The filter is the evidence for a match: a matching object\'s classification on met_get_object can be empty or name another type, and one object can match several values, so counts split by medium can double-count.',
       ),
     departmentId: z
       .number()
@@ -270,7 +270,7 @@ export const metSearchCollections = tool('met_search_collections', {
   enrichmentTrailer: {
     notice: {
       render(notice: string) {
-        return escapeMarkdownInlineLinear(notice)
+        return escapeMarkdownInline(notice)
           .split('\n')
           .map((line) => `> ${line}`)
           .join('\n');
@@ -375,7 +375,7 @@ export const metSearchCollections = tool('met_search_collections', {
     if (input.medium?.trim() === '') {
       throw ctx.fail(
         'invalid_filter',
-        'medium is blank — supply a classification name such as "Paintings", or omit the filter.',
+        'medium is blank — supply an object type such as "Paintings", or omit the filter.',
       );
     }
     if (input.geoLocation?.length === 0) {

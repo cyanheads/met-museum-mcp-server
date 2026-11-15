@@ -11,6 +11,7 @@
 
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import { createInMemoryStorage, createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { metGetObject } from '@/mcp-server/tools/definitions/met-get-object.tool.js';
 import { metListDepartments } from '@/mcp-server/tools/definitions/met-list-departments.tool.js';
@@ -46,6 +47,13 @@ const URL_SHAPED_PATHS = new Set([
 /** Composed by the handler, not carried from upstream — nothing to escape. */
 const SERVER_COMPOSED_PATHS = new Set(['failed[].error']);
 
+/**
+ * Upstream text that keeps its line breaks in `content[]`, rendered through the
+ * framework's `escapeMarkdownInline` rather than the collapsing `escapeMarkdown`.
+ * Its probe adds a CRLF and a later line that opens with a heading marker.
+ */
+const LINE_KEEPING_PATHS = new Set(['objects[].dimensions']);
+
 /** Path-derived tag so a mis-rendered field names itself in the failure. */
 function tagFor(path: string): string {
   return path.replace(/[^A-Za-z0-9]+/g, 'Q');
@@ -57,7 +65,8 @@ function urlFor(path: string): string {
 }
 
 function probeFor(path: string): string {
-  return `PROBE${tagFor(path)}${PROBE_METACHARACTERS}`;
+  const probe = `PROBE${tagFor(path)}${PROBE_METACHARACTERS}`;
+  return LINE_KEEPING_PATHS.has(path) ? `${probe}\r\n# ${probe}` : probe;
 }
 
 /**
@@ -74,6 +83,12 @@ function hostileFor(path: string): string {
  */
 function proseValueFor(path: string): string {
   return URL_SHAPED_PATHS.has(path) ? hostileFor(path) : probeFor(path);
+}
+
+/** The prose value as `format()` must render it, by the escaper its path takes. */
+function escapedFor(path: string): string {
+  const value = proseValueFor(path);
+  return LINE_KEEPING_PATHS.has(path) ? escapeMarkdownInline(value) : escapeMarkdown(value);
 }
 
 type ZodDef = {
@@ -203,9 +218,7 @@ describe('content[] escaping — every tool, every rendered upstream text field'
         const unescaped = valid.probes.filter((path) => validText.includes(proseValueFor(path)));
         expect(unescaped, 'these output paths reach content[] unescaped').toEqual([]);
 
-        const missing = valid.probes.filter(
-          (path) => !validText.includes(escapeMarkdown(proseValueFor(path))),
-        );
+        const missing = valid.probes.filter((path) => !validText.includes(escapedFor(path)));
         expect(missing, 'these output paths render neither raw nor escaped').toEqual([]);
       });
 
@@ -220,9 +233,7 @@ describe('content[] escaping — every tool, every rendered upstream text field'
         const injected = hostile.probes.filter((path) => hostileText.includes(proseValueFor(path)));
         expect(injected, 'these paths render a non-URL value as a live destination').toEqual([]);
 
-        const missing = hostile.probes.filter(
-          (path) => !hostileText.includes(escapeMarkdown(proseValueFor(path))),
-        );
+        const missing = hostile.probes.filter((path) => !hostileText.includes(escapedFor(path)));
         expect(missing, 'these paths render neither raw nor escaped').toEqual([]);
       });
 

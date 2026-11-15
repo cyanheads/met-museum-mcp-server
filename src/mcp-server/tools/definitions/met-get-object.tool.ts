@@ -5,6 +5,7 @@
 
 import { type Context, tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 import {
   type CallDeadline,
@@ -156,10 +157,14 @@ const ObjectSchema = z
       ),
     objectName: z
       .string()
-      .describe('Object type or classification name (e.g., "Painting", "Statuette").'),
+      .describe(
+        'The kind of object, as the Met names it (e.g., "Painting", "Statuette"). It need not echo the medium value met_search_collections matched: a "Watercolors" match can be a "Drawing".',
+      ),
     classification: z
       .string()
-      .describe('Broad classification category (e.g., "Paintings", "Ceramics").'),
+      .describe(
+        'The Met\'s classification category (e.g., "Paintings", "Ceramics"), empty on some records. Not what the medium filter of met_search_collections matches: a "Watercolors" match can be classified "Drawings", and a "Paintings" match can carry no classification.',
+      ),
     isHighlight: z.boolean().describe('True when the Met designates this a collection highlight.'),
     isTimelineWork: z.boolean().describe("True when the work appears in the Met's art timeline."),
     artistPrefix: z
@@ -823,7 +828,13 @@ export const metGetObject = tool('met_get_object', {
           : '';
       lines.push(`**Date:** ${prose(obj.objectDate)}${dateRange}`);
       lines.push(`**Medium:** ${prose(obj.medium)}`);
-      lines.push(`**Dimensions:** ${prose(obj.dimensions)}`);
+      /**
+       * One line per measured part (`Image:` / `Mount:`), each break a hard
+       * break that keeps the value in the record's paragraph, a later line's
+       * block marker escaped. Every other field collapses its breaks: a hard
+       * break would end the heading or split a `|`-joined line.
+       */
+      lines.push(`**Dimensions:** ${orDash(escapeMarkdownInline(obj.dimensions))}`);
       lines.push(`**Culture:** ${prose(obj.culture)}`);
       lines.push(`**Period:** ${prose(obj.period)}`);
       lines.push(`**Dynasty:** ${prose(obj.dynasty)}`);

@@ -12,10 +12,12 @@ import {
   getEnrichment,
   runToolContract,
 } from '@cyanheads/mcp-ts-core/testing';
+import MarkdownIt from 'markdown-it';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 import { metGetObject } from '@/mcp-server/tools/definitions/met-get-object.tool.js';
 import { escapeMarkdown } from '@/utils/markdown.js';
+import { readMarkdownText } from '../helpers/read-markdown-text.js';
 
 const mockGetObject = vi.fn();
 
@@ -258,6 +260,15 @@ const renderText = (...objects: RecordOutput[]) =>
 /** The rendered line that starts with `label`, or undefined when none does. */
 const lineOf = (text: string, label: string) =>
   text.split('\n').find((line) => line.startsWith(label));
+
+const commonmark = new MarkdownIt('commonmark');
+
+/** The top-level blocks a CommonMark parse of `text` opens, in order (`heading`, `paragraph`, …). */
+const blocksOf = (text: string) =>
+  commonmark
+    .parse(text, {})
+    .filter((token) => token.level === 0 && token.nesting === 1)
+    .map((token) => token.type.replace(/_open$/, ''));
 
 /** Every text block of a tool result's `content[]`, joined. */
 const contentText = (result: { content?: { type: string }[] }) =>
@@ -586,7 +597,7 @@ describe('metGetObject', () => {
           artistRole: '<Artist>',
         }),
       ).toBe(
-        '**Artist:** \\*Attributed to\\* Unknown\\_Maker \\[?\\] (Dutch, ca. 1655) | **Artist role:** \\<Artist>',
+        '**Artist:** \\*Attributed to\\* Unknown_Maker \\[?\\] (Dutch, ca. 1655) | **Artist role:** \\<Artist>',
       );
     });
 
@@ -637,6 +648,21 @@ describe('metGetObject', () => {
       expect(constituent.name.description).not.toContain('artistOrCulture');
       expect(constituent.constituentID.description).not.toContain('cross-referencing');
     });
+  });
+
+  /**
+   * met_search_collections' medium matches an object-type grouping that neither
+   * field tracks (#61): 11069 matches "Watercolors" with objectName "Drawing" and
+   * classification "Drawings", and 11004 matches "Paintings" with classification "".
+   */
+  it('keeps objectName and classification apart from the medium filter (#61)', () => {
+    const { objectName, classification } = metGetObject.output.shape.objects.element.shape;
+    expect(objectName.description).not.toContain('classification');
+    expect(objectName.description).toContain('a "Watercolors" match can be a "Drawing"');
+    expect(classification.description).toContain('empty on some records');
+    expect(classification.description).toContain(
+      'Not what the medium filter of met_search_collections matches',
+    );
   });
 
   describe('rights, metadata date, and accession year (#41)', () => {
@@ -1393,7 +1419,7 @@ describe('metGetObject', () => {
         ],
       });
 
-      expect(text).toContain('**Measurements:** \\[Overall\\] (\\*sight\\*): Height\\_max 12');
+      expect(text).toContain('**Measurements:** \\[Overall\\] (\\*sight\\*): Height_max 12');
     });
   });
 
@@ -1528,15 +1554,22 @@ describe('metGetObject', () => {
       expect(text).not.toContain('## [Group of 122 Stereograph Views]');
     });
 
-    it('escapes emphasis and raw-HTML characters in prose fields', () => {
+    it('escapes emphasis in prose fields; HTML-shaped and intraword text reads back as typed', () => {
       const text = renderedText();
-      expect(text).toContain('Gilman Collection \\*Purchase\\* \\<2005>');
-      expect(text).toContain('Unknown\\_Photographer');
+      const read = readMarkdownText(text);
+      expect(text).toContain('Gilman Collection \\*Purchase\\* <2005>');
+      expect(read).toContain('Credit: Gilman Collection *Purchase* <2005>');
+      expect(read).toContain('Artist: Unknown_Photographer (Dutch');
     });
 
-    it('collapses an embedded newline so no upstream text reaches a line start', () => {
+    it('keeps a dimensions line break as a hard break, the next line’s heading marker escaped', () => {
       const text = renderedText();
-      expect(text).toContain('**Dimensions:** Overall # Mount: 5 x 7 in. (12.7 x 17.8 cm)');
+      expect(text).toContain(
+        '**Dimensions:** Overall\\\n\\# Mount: 5 x 7 in. (12.7 x 17.8 cm)\n**Culture:** —',
+      );
+      expect(readMarkdownText(text)).toContain(
+        'Dimensions: Overall\n# Mount: 5 x 7 in. (12.7 x 17.8 cm) Culture: —',
+      );
     });
 
     it('leaves parentheses and periods in a dimensions value unescaped', () => {
@@ -1570,6 +1603,161 @@ describe('metGetObject', () => {
       renderedText();
       expect(metacharacterRecord.title).toBe('[Group of 122 Stereograph Views]');
       expect(renderedText()).toContain(escapeMarkdown('[Group of 122 Stereograph Views]'));
+    });
+  });
+
+  /**
+   * A hard break ends the `##` heading and splits a `|`-, `;`-, or `,`-joined
+   * line, so every field but `dimensions` still collapses its line breaks to
+   * spaces. Each value here puts a block marker after its break.
+   */
+  describe('format — every field but dimensions collapses a line break (#18, #62)', () => {
+    const multiLine = {
+      ...sampleRecord,
+      title: 'Two\r\n# lines',
+      artistRole: 'Artist\r\n+ a',
+      objectName: 'Print\r\n- proof',
+      classification: 'Prints\r\n> b',
+      medium: 'Etching\r\n# c',
+      creditLine: 'Gift\n1. d',
+      country: 'France\r- e',
+      region: 'Europe\r\n# f',
+      geography: { ...sampleRecord.geography, city: 'Paris\r\n# g', locale: 'Left\r\n> Bank' },
+      measurements: [
+        {
+          elementName: 'Sheet\r\n- h',
+          elementDescription: '',
+          elementMeasurements: { Height: 73.2, Width: 93.4 },
+        },
+      ],
+      tags: [
+        { term: 'Men\r\n> i', AAT_URL: '', Wikidata_URL: '' },
+        { term: 'Women', AAT_URL: '', Wikidata_URL: '' },
+      ],
+      constituents: [
+        {
+          constituentID: 161947,
+          role: 'Artist\r\n+ j',
+          name: 'Vincent\r\n# van Gogh',
+          constituentULAN_URL: '',
+          constituentWikidata_URL: 'https://www.wikidata.org/wiki/Q5582',
+          gender: '',
+        },
+      ],
+    };
+    const text = renderText(multiLine);
+
+    it('adds no line to the render', () => {
+      expect(text.split('\n')).toHaveLength(renderText(sampleRecord).split('\n').length);
+    });
+
+    it('keeps the title on its heading line', () => {
+      expect(lineOf(text, '## ')).toBe('## Two # lines — Object 437980');
+    });
+
+    it.each([
+      [
+        '**Artist:**',
+        '**Artist:** Vincent van Gogh (Dutch, Zundert 1853–1890 Auvers-sur-Oise) | **Artist role:** Artist + a',
+      ],
+      [
+        '**Department:**',
+        '**Department:** European Paintings | **departmentId:** 11 | **Object name:** Print - proof | **Classification:** Prints > b',
+      ],
+      ['**Medium:**', '**Medium:** Etching # c'],
+      ['**Credit:**', '**Credit:** Gift 1. d'],
+      [
+        '**Geography:**',
+        '**Geography:** France - e, Europe # f (City: Paris # g; Locale: Left > Bank)',
+      ],
+      ['**Measurements:**', '**Measurements:** Sheet - h: Height 73.2, Width 93.4'],
+      ['**Tags:**', '**Tags:** Men > i, Women'],
+      [
+        '**Constituents:**',
+        '**Constituents:** constituentID:161947 Vincent # van Gogh (Artist + j, [WD](https://www.wikidata.org/wiki/Q5582))',
+      ],
+    ])('keeps the %s line whole', (label, line) => {
+      expect(lineOf(text, label)).toBe(line);
+    });
+
+    it('parses as one heading and one paragraph per record', () => {
+      expect(blocksOf(text)).toEqual(['heading', 'paragraph', 'paragraph']);
+    });
+  });
+
+  /**
+   * `dimensions` holds one line per measured part, CRLF-separated as the Met
+   * sends it (285835: `Image:` / `Mount:`; 742412: `Sheet:` / `Plate:` /
+   * `Image:`). Each line break renders as a hard break (`\` + LF), which keeps
+   * the value inside the record's paragraph and its later lines off a block start.
+   */
+  describe('format — multi-line dimensions keep their line breaks (#62)', () => {
+    const twoLines =
+      'Image: 7 5/16 × 9 1/4 in. (18.6 × 23.5 cm)\r\nMount: 10 5/8 × 13 5/8 in. (27 × 34.6 cm)';
+    const threeLines =
+      'Sheet: 10 11/16 × 7 5/16 in. (27.2 × 18.6 cm)\r\nPlate: 8 1/4 × 6 9/16 in. (21 × 16.6 cm)\r\nImage: 6 9/16 × 5 7/16 in. (16.7 × 13.8 cm)';
+    const renderDimensions = (dimensions: string) => renderText({ ...sampleRecord, dimensions });
+
+    it.each([
+      [
+        "285835's two lines",
+        twoLines,
+        '**Dimensions:** Image: 7 5/16 × 9 1/4 in. (18.6 × 23.5 cm)\\\nMount: 10 5/8 × 13 5/8 in. (27 × 34.6 cm)',
+      ],
+      [
+        "742412's three lines",
+        threeLines,
+        '**Dimensions:** Sheet: 10 11/16 × 7 5/16 in. (27.2 × 18.6 cm)\\\nPlate: 8 1/4 × 6 9/16 in. (21 × 16.6 cm)\\\nImage: 6 9/16 × 5 7/16 in. (16.7 × 13.8 cm)',
+      ],
+      ['a single line', '28 7/8 × 36 3/4 in.', '**Dimensions:** 28 7/8 × 36 3/4 in.'],
+      ['an empty value', '', '**Dimensions:** —'],
+    ])('renders %s, then the Culture line', (_label, dimensions, rendered) => {
+      expect(renderDimensions(dimensions)).toContain(
+        `\n**Medium:** Oil on canvas\n${rendered}\n**Culture:** —\n`,
+      );
+    });
+
+    it.each([
+      ["285835's two lines", twoLines],
+      ["742412's three lines", threeLines],
+      ['a value ending in a line break', 'Overall: 5 in.\r\n'],
+      ['a bare LF and a bare CR', 'Image: 5 in.\nSheet: 6 in.\rMount: 7 in.'],
+    ])('reads %s back with its line breaks, inside the record paragraph', (_label, dimensions) => {
+      const text = renderDimensions(dimensions);
+      expect(readMarkdownText(text)).toContain(
+        `Medium: Oil on canvas Dimensions: ${dimensions.replace(/\r\n?/g, '\n')} Culture: —`,
+      );
+      expect(blocksOf(text)).toEqual(['heading', 'paragraph', 'paragraph']);
+    });
+
+    it.each([
+      ['an ATX heading', '# x'],
+      ['a block quote', '> x'],
+      ['a bullet', '- x'],
+      ['a plus bullet', '+ x'],
+      ['an ordered item', '1. x'],
+      ['a backtick fence', '```'],
+      ['a tilde fence', '~~~'],
+      ['a setext underline', '==='],
+      ['a thematic break', '---'],
+      ['an HTML block', '<div>'],
+      ['a table delimiter row', '|---|---|'],
+      ['an indented line', '    x'],
+      ['a blank line', ''],
+    ])('keeps %s on a later line as text inside the record paragraph', (_label, line) => {
+      const dimensions = `Overall: 5 in.\r\n${line}\r\nMount: 7 in.`;
+      const text = renderDimensions(dimensions);
+      expect(blocksOf(text)).toEqual(['heading', 'paragraph', 'paragraph']);
+      expect(readMarkdownText(text)).toContain(
+        `Dimensions: Overall: 5 in.\n${line}\nMount: 7 in. Culture: —`,
+      );
+    });
+
+    it('leaves structuredContent’s dimensions as the Met sent it', async () => {
+      const record = { ...sampleRecord, dimensions: twoLines };
+      const { result } = await run([record]);
+      renderText(...result.objects);
+      expect(result.objects[0]?.dimensions).toBe(twoLines);
     });
   });
 
