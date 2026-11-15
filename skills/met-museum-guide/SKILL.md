@@ -1,10 +1,10 @@
 ---
 name: met-museum-guide
-description: Gates for the met_* tools, the Metropolitan Museum of Art collection. Budgeting met_get_object fetches under the Met firewall, reading the attributions matchField artistOrCulture returns, padding date windows, splitting a search past its 10,000-match window, and reading geoLocation matches. Use before counting, comparing, or listing Met holdings, attributing works to an artist or culture, or filtering by date or place.
+description: Gates for the met_* tools, the Metropolitan Museum of Art collection. Budgeting met_get_object fetches under the Met firewall, reading the attributions matchField artistOrCulture returns, padding date windows, splitting a search past its 10,000-match window, reading geoLocation matches, and reading and counting medium matches. Use before counting, comparing, or listing Met holdings, attributing works to an artist or culture, or filtering by date, place, or object type.
 license: Apache-2.0
 metadata:
   author: "cyanheads"
-  version: "1.0"
+  version: "1.1"
 ---
 
 ## Scope
@@ -22,6 +22,7 @@ Object records and the CC0 images of public-domain works from The Metropolitan M
 ### Read the attribution before naming a maker
 
 - A matchField artistOrCulture result is not a list of one person's own works. It includes qualified attributions (437403, "Style of" Rembrandt, for q "Rembrandt") and works matched through their culture alone (240180, with no artist and culture "Greek, Attic", for q "Attic"). Before counting a result as someone's work, read artistPrefix and artistRole on each record, and report a prefix with the name.
+- A multi-word artistOrCulture search can match another artist: 12544, by James M. Sommerville, comes back for q "James M. Hart". Read artistDisplayName on each record before naming its maker.
 - It leaves out works where the person is only another constituent (742412, with Rembrandt as sitter; 770799, "After Rembrandt"). For works after, about, or depicting a person, search without matchField and read constituents on the records.
 
 ### Pad date windows, then select by overlap
@@ -38,3 +39,8 @@ Object records and the CC0 images of public-domain works from The Metropolitan M
 ### Take a geoLocation match from the filter
 
 - Cite the filter as the evidence for a record's place, and never re-filter fetched records by country, region, or city to confirm a match: 240180 matches "Greece" with every place field empty.
+
+### Take a medium match from the filter
+
+- Cite the filter as the evidence for a record's type, and never re-check classification or objectName on the fetched record to confirm a match: 11069 matches "Watercolors" with classification "Drawings" and objectName "Drawing".
+- Never add up totals split by medium. One object can match several values, so the sum double-counts: 11004 matches both "Paintings" and "Watercolors". Report each total on its own, or count distinct IDs across searches whose totals each fit the 10,000-match window.

@@ -36,7 +36,7 @@ The Metropolitan Museum of Art's collection of 500,000+ works spanning 5,000 yea
 | Tool | Description |
 |:---|:---|
 | `met_list_departments` | Return all 19 curatorial departments with their numeric IDs and display names |
-| `met_search_collections` | Search the collection by keyword, optionally matched in titles, tags, or artists and cultures only, with filters for department, date range, medium, geography, image availability, on-view status, and highlight designation |
+| `met_search_collections` | Search the collection by keyword, optionally matched in titles, tags, or artists and cultures only, with filters for department, date range, object type, geography, image availability, on-view status, and highlight designation |
 | `met_list_objects` | List every object ID in a department, every object created or revised since a date, or both, without a keyword |
 | `met_get_object` | Fetch full records for one or more object IDs — metadata, provenance, artist info, CC0 image URLs, tags, and Wikidata links — optionally with up to 3 CC0 images as image content |
 
@@ -52,7 +52,7 @@ The Metropolitan Museum of Art's collection of 500,000+ works spanning 5,000 yea
 
 ### `met_search_collections` <sub>tool</sub>
 
-- Keyword `q` (required), matched across all text fields unless `matchField` narrows it to `"title"`, `"tags"`, or `"artistOrCulture"` (the attributed artist or the culture); `"*"` matches everything, for a search by filters alone. Filters: `departmentId`, `medium` (one classification, case-sensitive, e.g. `"Paintings"`), `dateBegin`/`dateEnd` (integer years, negative = BCE, set together; an object matches only when its whole date span lies inside the window), one `geoLocation` (a whole place, case-sensitive, e.g. `"Greece"`), `hasImages`, `isOnView`, and `isHighlight` (`true` only)
+- Keyword `q` (required), matched across all text fields unless `matchField` narrows it to `"title"`, `"tags"`, or `"artistOrCulture"` (the attributed artist or the culture); `"*"` matches everything, for a search by filters alone. Filters: `departmentId`, `medium` (one object type, case-sensitive, e.g. `"Paintings"`; one object can match several, so counts split by `medium` can overlap), `dateBegin`/`dateEnd` (integer years, negative = BCE, set together; an object matches only when its whole date span lies inside the window), one `geoLocation` (a whole place, case-sensitive, e.g. `"Greece"`), `hasImages`, `isOnView`, and `isHighlight` (`true` only)
 - Up to 500 IDs per page (default 20), paged by `offset` / `nextOffset` through the first 10,000 matches; `total` reports the full count. `departmentId` 7 (The Cloisters) and 17 (Medieval Art) share one result set at the Met, so a page can hold fewer than `limit` IDs, which a `notice` flags
 - Zero matches is a result with a `notice`, not an error; every result echoes the applied query as `effectiveQuery`. Typed errors: `invalid_date_range`, `invalid_filter` (a blank `q`, `medium`, or `geoLocation`), `invalid_department`, `upstream_blocked`, `upstream_unavailable`, `upstream_rate_limited`, `retry_deadline_exceeded`
 
@@ -174,7 +174,7 @@ MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=3010 bun run start:http
 
 ### Prerequisites
 
-- [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
+- [Bun v1.4.4](https://bun.sh/) or higher (or Node.js v24+).
 - No API key required — the Met Collection API is public and unauthenticated.
 
 ### Installation

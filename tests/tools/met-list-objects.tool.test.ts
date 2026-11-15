@@ -490,6 +490,15 @@ describe('met_list_objects (#26)', () => {
     );
   });
 
+  describe('description', () => {
+    it('routes object-type filters to met_search_collections without calling them classifications', () => {
+      expect(metListObjects.description).toContain(
+        'For keyword, object-type, place, or object-date filters use met_search_collections instead.',
+      );
+      expect(metListObjects.description).not.toContain('classification');
+    });
+  });
+
   describe('updatedSince', () => {
     it('names the met_get_object field it compares in its description', () => {
       expect(metListObjects.input.shape.updatedSince.description).toContain(
