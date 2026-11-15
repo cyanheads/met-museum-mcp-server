@@ -1,13 +1,15 @@
 /**
- * @fileoverview No HTTP failure leaving `MetService` carries the upstream page
+ * @fileoverview No HTTP failure a Met tool returns carries the upstream page
  * (#45). `fetchWithTimeout` attaches the response page to every non-2xx error as
- * `data.body` and `data.responseBody`; a 403 (`upstream_blocked`), an exhausted
- * 500/502/503/504 (`upstream_unavailable`), and a 429-ended ladder
- * (`upstream_rate_limited`) leave it behind, and this pins every other status to
- * the same rule — code, message, retry count, and the rest of `data` unchanged.
- * Runs the real service — `fetchWithTimeout`'s
- * status mapping, the retry ladder, its backoff, and `Retry-After` handling
- * included — over a faked global fetch and fake timers.
+ * `data.body` and `data.responseBody`, and the framework keeps both keys on the
+ * server: the thrown error holds the page for the failure record, and no client
+ * envelope carries it. A 403 (`upstream_blocked`), an exhausted 500/502/503/504
+ * (`upstream_unavailable`), and a 429-ended ladder (`upstream_rate_limited`) are
+ * rebuilt without the page; every other status keeps its code, message, retry
+ * count, and the rest of `data`, and reaches the caller page-free the same way.
+ * Runs the real service — `fetchWithTimeout`'s status mapping, the retry ladder,
+ * its backoff, and `Retry-After` handling included — over a faked global fetch
+ * and fake timers.
  * @module tests/services/met/met-service-error-page.test
  */
 
@@ -45,6 +47,26 @@ const errorPage =
         },
       ),
     );
+
+/**
+ * A 400 whose page is read in full and whose read ends the caller's signal, so
+ * the catch that sees the HTTP error with its page finds the signal aborted.
+ */
+const abortingErrorPage = (controller: AbortController) => () => {
+  const page = new TextEncoder().encode(`<html>${PAGE_MARKER}</html>`);
+  return Promise.resolve(
+    new Response(
+      new ReadableStream<Uint8Array>({
+        pull(stream) {
+          stream.enqueue(page);
+          stream.close();
+          controller.abort();
+        },
+      }),
+      { status: 400 },
+    ),
+  );
+};
 
 /**
  * Each unclassified status the issue names, with the code `fetchWithTimeout`
@@ -114,7 +136,16 @@ function expectPageFree(error: { data?: Record<string, unknown>; message: string
   expect(error.message).not.toContain(PAGE_MARKER);
 }
 
-describe('no HTTP failure leaving MetService carries the upstream page (#45)', () => {
+/**
+ * The page rides the thrown error as `data.body` for the failure record, never
+ * in the message; the client envelope's lack of it is pinned per tool below.
+ */
+function expectPageServerSide(error: { data: Record<string, unknown>; message: string }) {
+  expect(error.data.body).toContain(PAGE_MARKER);
+  expect(error.message).not.toContain(PAGE_MARKER);
+}
+
+describe('no HTTP failure a Met tool returns carries the upstream page (#45)', () => {
   let fetchMock: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
@@ -132,7 +163,7 @@ describe('no HTTP failure leaving MetService carries the upstream page (#45)', (
 
   describe('MetService', () => {
     it.each(STATUSES)(
-      'HTTP $status: same code, message, and attempts, with the status and no page',
+      'HTTP $status: same code, message, and attempts, with the status and the page kept server-side',
       async ({ status, code, attempts }) => {
         fetchMock.mockImplementation(errorPage(status));
 
@@ -151,9 +182,7 @@ describe('no HTTP failure leaving MetService carries the upstream page (#45)', (
           errorSource: 'FetchHttpError',
         });
         expect(err.data.reason).toBeUndefined();
-        expectPageFree(err);
-        // The page stays on the original error, which rides as the cause for the log.
-        expect(JSON.stringify(err.cause?.data)).toContain(PAGE_MARKER);
+        expectPageServerSide(err);
       },
     );
 
@@ -195,7 +224,7 @@ describe('no HTTP failure leaving MetService carries the upstream page (#45)', (
         retryAttempts: 4,
         operation: 'MetService.getDepartments',
       });
-      expectPageFree(exhausted);
+      expectPageServerSide(exhausted);
     });
 
     it('keeps an honored Retry-After on a 429 that outlasts the backoff cap, page dropped', async () => {
@@ -214,7 +243,7 @@ describe('no HTTP failure leaving MetService carries the upstream page (#45)', (
       expectPageFree(err);
     });
 
-    it('runs the ladder past its first rung: a 429 then a 400 ends on the 400, page-free', async () => {
+    it('runs the ladder past its first rung: a 429 then a 400 ends on the 400, the page kept server-side', async () => {
       fetchMock.mockImplementationOnce(errorPage(429)).mockImplementationOnce(errorPage(400));
 
       const err = (await settle(() =>
@@ -226,7 +255,7 @@ describe('no HTTP failure leaving MetService carries the upstream page (#45)', (
       expect(fetchMock).toHaveBeenCalledTimes(2);
       expect(err.code).toBe(JsonRpcErrorCode.InvalidParams);
       expect(err.data.status).toBe(400);
-      expectPageFree(err);
+      expectPageServerSide(err);
     });
 
     it.each([
@@ -237,35 +266,19 @@ describe('no HTTP failure leaving MetService carries the upstream page (#45)', (
       ],
       ['getObject', () => getMetService().getObject(436535, ...call())],
       ['getValidDepartmentIds', () => getMetService().getValidDepartmentIds(...call())],
-    ])('%s drops the page from a 400 the same way', async (_name, run) => {
+    ])('%s keeps the page from a 400 server-side the same way', async (_name, run) => {
       fetchMock.mockImplementation(errorPage(400));
 
       const err = (await settle(() => run().catch((e: unknown) => e))) as ServiceError;
 
       expect(fetchMock).toHaveBeenCalledTimes(1);
       expect(err.code).toBe(JsonRpcErrorCode.InvalidParams);
-      expectPageFree(err);
+      expectPageServerSide(err);
     });
 
-    it('drops the page when a caller abort races an HTTP failure on the keyword-only count', async () => {
+    it('rethrows a caller abort racing an HTTP failure on the keyword-only count, the page kept server-side', async () => {
       const controller = new AbortController();
-      const page = new TextEncoder().encode(`<html>${PAGE_MARKER}</html>`);
-      // The page is read in full, and the caller goes away as the read ends — so the
-      // count's catch sees an HTTP error with its page while the signal is aborted.
-      fetchMock.mockImplementation(() =>
-        Promise.resolve(
-          new Response(
-            new ReadableStream<Uint8Array>({
-              pull(stream) {
-                stream.enqueue(page);
-                stream.close();
-                controller.abort();
-              },
-            }),
-            { status: 400 },
-          ),
-        ),
-      );
+      fetchMock.mockImplementation(abortingErrorPage(controller));
 
       const err = (await getMetService()
         .countKeywordMatches('horse', ...call(createMockContext({ signal: controller.signal })))
@@ -273,7 +286,7 @@ describe('no HTTP failure leaving MetService carries the upstream page (#45)', (
 
       expect(controller.signal.aborted).toBe(true);
       expect(err.code).toBe(JsonRpcErrorCode.InvalidParams);
-      expectPageFree(err);
+      expectPageServerSide(err);
     });
 
     it('leaves upstream_blocked and upstream_unavailable exactly as they were', async () => {
@@ -366,6 +379,96 @@ describe('no HTTP failure leaving MetService carries the upstream page (#45)', (
 
       expect(errorOf(result).data.reason).toBe('all_failed');
       expect(JSON.stringify(result)).not.toContain(PAGE_MARKER);
+    });
+
+    it('met_get_object, an HTTP 400 on one ID of a partial success: failed[] names the status, no page', async () => {
+      fetchMock.mockImplementation((request: unknown) =>
+        String(request).endsWith('/objects/1001')
+          ? Promise.resolve(
+              new Response(JSON.stringify({ objectID: 1001, title: 'Object 1001' }), {
+                headers: { 'content-type': 'application/json' },
+              }),
+            )
+          : errorPage(400)(),
+      );
+
+      const result = await settle(() => runToolContract(metGetObject, { objectIDs: [1001, 1002] }));
+
+      expect(result.isError).toBeFalsy();
+      const { failed } = result.structuredContent as {
+        failed: { objectID: number; error: string }[];
+      };
+      expect(failed).toHaveLength(1);
+      expect(failed[0]?.objectID).toBe(1002);
+      expect(failed[0]?.error).toContain('Status: 400');
+      expect(JSON.stringify(result)).not.toContain(PAGE_MARKER);
+      expect(textOf(result)).toContain('Status: 400');
+    });
+
+    it('met_search_collections, an HTTP 429 then a 400 on the search', async () => {
+      fetchMock.mockImplementationOnce(errorPage(429)).mockImplementationOnce(errorPage(400));
+
+      const result = await settle(() => runToolContract(metSearchCollections, { q: 'horse' }));
+
+      const error = errorOf(result);
+      expect(error.code).toBe(JsonRpcErrorCode.InvalidParams);
+      expect(error.data.status).toBe(400);
+      expect(JSON.stringify(result)).not.toContain(PAGE_MARKER);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it('met_search_collections, HTTP 400 on the departmentId lookup', async () => {
+      fetchMock.mockImplementation(errorPage(400));
+
+      const result = await settle(() =>
+        runToolContract(metSearchCollections, { q: 'horse', departmentId: 11 }),
+      );
+
+      expect(errorOf(result).code).toBe(JsonRpcErrorCode.InvalidParams);
+      expect(JSON.stringify(result)).not.toContain(PAGE_MARKER);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('met_list_objects, HTTP 400 on the ID list', async () => {
+      fetchMock.mockImplementation(errorPage(400));
+
+      const result = await settle(() =>
+        runToolContract(metListObjects, { updatedSince: '2026-09-01' }),
+      );
+
+      const error = errorOf(result);
+      expect(error.code).toBe(JsonRpcErrorCode.InvalidParams);
+      expect(error.data.status).toBe(400);
+      expect(JSON.stringify(result)).not.toContain(PAGE_MARKER);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('met_search_collections, a caller abort racing an HTTP failure on the keyword-only count', async () => {
+      const controller = new AbortController();
+      // A filtered search with no match asks for the keyword-only count; its page is
+      // read in full, and the caller goes away as the read ends.
+      fetchMock
+        .mockImplementationOnce(() =>
+          Promise.resolve(
+            new Response(JSON.stringify({ total: 0, objectIDs: null }), {
+              headers: { 'content-type': 'application/json' },
+            }),
+          ),
+        )
+        .mockImplementationOnce(abortingErrorPage(controller));
+
+      const result = await settle(() =>
+        runToolContract(
+          metSearchCollections,
+          { q: 'horse', hasImages: true },
+          { context: { signal: controller.signal } },
+        ),
+      );
+
+      expect(controller.signal.aborted).toBe(true);
+      expect(errorOf(result).code).toBe(JsonRpcErrorCode.RequestCancelled);
+      expect(JSON.stringify(result)).not.toContain(PAGE_MARKER);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
     });
   });
 });

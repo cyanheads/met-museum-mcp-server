@@ -109,20 +109,6 @@ function rateLimitMessage(retryAfter: unknown): string {
 }
 
 /**
- * `error` without the upstream page `fetchWithTimeout` attaches to an HTTP
- * failure — `data.body` and its alias `data.responseBody` — and otherwise as it
- * was: same code, message, and every other `data` key. The original, page
- * included, rides as the `cause`, which reaches the log and never the caller.
- * Any error carrying no page is returned untouched.
- */
-function withoutErrorPage(error: unknown): unknown {
-  if (!(error instanceof McpError) || error.data == null) return error;
-  if (!('body' in error.data) && !('responseBody' in error.data)) return error;
-  const { body: _body, responseBody: _responseBody, ...data } = error.data;
-  return new McpError(error.code, error.message, data, { cause: error });
-}
-
-/**
  * One tool call's wall-clock budget (`MET_CALL_DEADLINE_MS`), shared by every
  * Met API request the call makes. Fixed once per call rather than per ladder: a
  * per-ladder budget stacks, and `met_get_object` runs its ladders in waves.
@@ -777,8 +763,7 @@ export class MetService {
     try {
       return (await this.fetchSearch(url, ctx, { signal: deadline.signal, remainingMs })).total;
     } catch (error) {
-      // An HTTP failure can land just as the caller aborts; it leaves without its page too.
-      if (deadline.signal.aborted) throw withoutErrorPage(error);
+      if (deadline.signal.aborted) throw error;
       ctx.log.warning('Met keyword-only count failed', {
         q,
         error: error instanceof Error ? error.message : String(error),
@@ -853,7 +838,7 @@ export class MetService {
       }
       return { ok: true, data: arrayBufferToBase64(await response.arrayBuffer()), mimeType };
     } catch (error) {
-      if (deadline.signal.aborted) throw withoutErrorPage(error);
+      if (deadline.signal.aborted) throw error;
       return { ok: false, detail: error instanceof Error ? error.message : String(error) };
     }
   }
@@ -910,9 +895,10 @@ export class MetService {
    * ends it as `retry_deadline_exceeded`.
    *
    * Any other HTTP failure — a 501, a 505, a 4xx other than the 403 that
-   * `request()` classifies and the 429 — keeps its code, message, and `data`,
-   * minus the upstream page (`withoutErrorPage`), so no error leaving the
-   * service carries it.
+   * `request()` classifies and the 429 — is rethrown as it was. The upstream
+   * page it carries as `data.body`/`data.responseBody` stays on the server: the
+   * framework leaves both keys off every client envelope and logs them in the
+   * failure record.
    */
   private async retry<T>(
     operation: string,
@@ -954,7 +940,7 @@ export class MetService {
           { cause: error },
         );
       }
-      throw withoutErrorPage(error);
+      throw error;
     }
   }
 
